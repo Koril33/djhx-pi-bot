@@ -95,5 +95,11 @@ class Storage:
             (pi_session_file, sid),
         )
 
+    def rename_session(self, sid: str, name: str) -> None:
+        self._exec(
+            "UPDATE sessions SET name = ?, updated_at = datetime('now') WHERE id = ?",
+            (name, sid),
+        )
+
     def touch(self, sid: str) -> None:
         self._exec("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?", (sid,))

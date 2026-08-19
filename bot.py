@@ -264,6 +264,69 @@ def strip_markdown(text: str) -> str:
     return text
 
 
+# ================= 工具活动 / 错误友好化 =================
+
+_TOOL_ICONS = {
+    "read": "🔍 读取",
+    "bash": "⚙️ 执行",
+    "edit": "✏️ 编辑",
+    "write": "📝 写入",
+    "grep": "🔎 搜索",
+    "find": "🗂 查找",
+    "ls": "📂 列出",
+}
+
+
+def _tool_activity(tool_name: str, phase: str, args: dict | None) -> str | None:
+    """工具执行事件 → 友好活动描述；phase == "end" 返回 None（表示活动结束）。"""
+    if phase == "end":
+        return None
+    args = args or {}
+    target = ""
+    for key in ("path", "file", "filePath", "command", "pattern", "query"):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            target = v.strip()
+            break
+    if not target:
+        for v in args.values():
+            if isinstance(v, str) and v.strip():
+                target = v.strip()
+                break
+    label = _TOOL_ICONS.get(tool_name, f"🔧 {tool_name or '工具'}")
+    if target:
+        return f"{label}: {target[:60]}"
+    return label
+
+
+def _friendly_error(e: Exception) -> str:
+    """把内部异常映射成用户可读的友好文案。"""
+    msg = str(e)
+    if "超时" in msg or "timeout" in msg.lower():
+        return "⏱️ 处理超时，已中止当前任务，可重新发送"
+    if "熔断" in msg or "频繁崩溃" in msg:
+        return "⚠️ 推理服务暂时不可用（频繁崩溃已熔断），请稍后重试"
+    if "未运行" in msg or "未就绪" in msg or "未启动" in msg:
+        return "⚠️ 推理服务未就绪，请稍后重试"
+    return f"⚠️ {msg}"
+
+
+def _render(text: str, activity_holder: dict | None) -> str:
+    """正文 + 当前工具活动行（活动行附在末尾）。"""
+    if activity_holder and activity_holder.get("current"):
+        return f"{text}\n\n{activity_holder['current']}"
+    return text
+
+
+async def _auto_name_session(storage: Storage, user_id: int, text: str) -> None:
+    """用第一条消息给「默认会话」自动命名，便于 /session list 辨认。"""
+    active = storage.get_active_session(user_id)
+    if active and active["name"] == "默认会话" and text.strip():
+        short = text.strip().replace("\n", " ")[:20]
+        if short:
+            storage.rename_session(active["id"], short)
+
+
 async def _send(
     send_fn,
     text: str,
@@ -386,14 +449,22 @@ async def reply_text(update: Update, text: str, reply_markup=None) -> None:
             await _send(update.effective_chat.send_message, chunk, reply_markup=markup)
 
 
-async def stream_reply(update: Update, text_iter, interval: float) -> None:
-    """流式回复：增量编辑消息（节流），按 HTML 长度分段，不切断代码块。"""
+async def stream_reply(update: Update, text_iter, interval: float, placeholder: dict | None = None, activity_holder: dict | None = None) -> None:
+    """流式回复：增量编辑消息（节流），按 HTML 长度分段，不切断代码块。
+
+    placeholder：{"msg": Message|None}，思考占位消息 holder（流式期间异步产生，动态读取）。
+    activity_holder：当前工具活动状态（{"current": 描述}），渲染时附加到正文末尾。
+    """
     target = update.message or update.callback_query.message
     msg = None
     buf = ""
     last_edit = 0.0
     try:
         async for delta in text_iter:
+            # 思考占位若已发出且尚未采用，用它作为首条消息（避免重复发送）
+            if msg is None and placeholder is not None and placeholder.get("msg") is not None:
+                msg = placeholder["msg"]
+                last_edit = 0.0
             buf += delta
             now = time.monotonic()
             chunks = split_markdown(buf)
@@ -401,28 +472,29 @@ async def stream_reply(update: Update, text_iter, interval: float) -> None:
                 # 累积出多个完整段：先落地已闭合的段，保留最后一段继续累积
                 for chunk in chunks[:-1]:
                     if msg is None:
-                        msg = await _send(target.reply_text, chunk)
+                        msg = await _send(target.reply_text, _render(chunk, activity_holder))
                     else:
-                        await _send(None, chunk, edit=True, msg=msg)
+                        await _send(None, _render(chunk, activity_holder), edit=True, msg=msg)
                     msg = await _send(target.reply_text, "…")  # 新段占位
                 buf = chunks[-1]
                 last_edit = now
             elif msg is None:
                 # 首个增量：立即发首条消息，降低首字延迟
-                msg = await _send(target.reply_text, buf)
+                msg = await _send(target.reply_text, _render(buf, activity_holder))
                 last_edit = now
-            elif now - last_edit >= interval and len(buf) > 0:
-                if await _send(None, buf, edit=True, msg=msg):
+            elif (last_edit == 0.0 or now - last_edit >= interval) and len(buf) > 0:
+                # last_edit==0.0 表示占位消息尚未被正文替换，立即编辑
+                if await _send(None, _render(buf, activity_holder), edit=True, msg=msg):
                     last_edit = now
         # 收尾：确保用户看到完整内容（首段失败或最终编辑失败时兜底）
         if buf:
             if msg is None:
                 # 首段从未发出（网络抖动），现在重试整段发送
                 for chunk in split_markdown(buf):
-                    msg = await _send(target.reply_text, chunk)
+                    msg = await _send(target.reply_text, _render(chunk, activity_holder))
                     if msg is None:
                         break
-            elif not await _send(None, buf, edit=True, msg=msg):
+            elif not await _send(None, _render(buf, activity_holder), edit=True, msg=msg):
                 # 最终编辑失败，发一条新消息兜底
                 await _send(target.reply_text, buf)
         elif msg is None:
@@ -527,11 +599,11 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not rows:
             await reply_text(update, "还没有会话，用 /session new 创建")
             return
-        lines = ["📁 会话列表："]
+        buttons = []
         for r in rows:
-            marker = "▶ " if r["status"] == "active" else "  "
-            lines.append(f"{marker}`{r['id']}` {r['name']}  ({r['updated_at']})")
-        await reply_text(update, "\n".join(lines))
+            marker = "▶ " if r["status"] == "active" else ""
+            buttons.append([InlineKeyboardButton(f"{marker}{r['name']}", callback_data=f"session_use:{r['id']}")])
+        await reply_text(update, "📁 会话列表（点击切换）：", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif sub == "use":
         if len(args) < 2:
@@ -569,11 +641,11 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if sub == "list":
         try:
             models = await agent.client.get_available_models()
-            lines = ["🧠 可用模型："]
+            buttons = []
             for m in models:
-                images = "🖼" if "image" in (m.get("input") or []) else "  "
-                lines.append(f"{images} {m['id']}  (context={m.get('contextWindow','?')})")
-            await reply_text(update, "\n".join(lines))
+                images = "🖼 " if "image" in (m.get("input") or []) else ""
+                buttons.append([InlineKeyboardButton(f"{images}{m['id']}", callback_data=f"model_use:{m['id']}")])
+            await reply_text(update, "🧠 可用模型（点击切换）：", reply_markup=InlineKeyboardMarkup(buttons))
         except Exception as e:
             logger.error("模型列表失败", extra={"err": str(e)[:300]})
             await reply_text(update, f"获取模型列表失败: {e}")
@@ -618,6 +690,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"  当前会话: {active_name}",
         f"  默认模型: {agent.settings.pi_model}",
     ]
+    # 追加 pi 会话详情（消息数 / 压缩状态），拿不到不阻塞主状态展示
+    try:
+        state = await agent.client.get_state()
+        mc = state.get("messageCount")
+        if mc is not None:
+            pending = state.get("pendingMessageCount") or 0
+            lines.append(f"  消息数: {mc}" + (f" | 待处理: {pending}" if pending else ""))
+        if state.get("isCompacting"):
+            lines.append("  ⚠️ 上下文压缩中…")
+        sid = state.get("sessionId")
+        if sid:
+            lines.append(f"  session: {sid[:12]}")
+    except Exception:
+        pass
     await reply_text(update, "\n".join(lines))
 
 
@@ -633,7 +719,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "cmd:status": (cmd_status, []),
         "cmd:stop": (cmd_stop, []),
     }
-    entry = actions.get(query.data)
+    data = query.data or ""
+    # 列表按钮直接触发切换操作
+    if data.startswith("session_use:"):
+        context.args = ["use", data.split(":", 1)[1]]
+        await cmd_session(update, context)
+        return
+    if data.startswith("model_use:"):
+        context.args = ["use", data.split(":", 1)[1]]
+        await cmd_model(update, context)
+        return
+    entry = actions.get(data)
     if entry is None:
         await query.answer("未知操作", show_alert=False)
         return
@@ -677,21 +773,51 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await agent.ensure_client()
         except Exception as e:
             logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
-            await reply_text(update, f"⚠️ pi 进程启动失败: {e}")
+            await reply_text(update, f"⚠️ pi 进程启动失败: {_friendly_error(e)}")
             return
 
+        # 会话自动命名：默认会话的第一条消息作为会话名
+        await _auto_name_session(storage, user.id, text)
+
+        # 流式中途介入：pi 忙时插入 steer 而非拒绝
+        if agent.client.busy:
+            try:
+                await agent.client.steer(text)
+                await reply_text(update, "↩️ 已插入新指令，当前任务完成后将按新方向继续")
+            except Exception as e:
+                await reply_text(update, f"⚠️ 插入指令失败: {_friendly_error(e)}")
+            return
+
+        # 思考占位 + 工具活动状态
+        placeholder = {"msg": None}
+        activity = {"current": None}
+
+        async def on_thinking() -> None:
+            if placeholder["msg"] is None:
+                placeholder["msg"] = await _send(update.message.reply_text, "🤔 深度思考中…")
+
+        def on_tool(tool_name: str, phase: str, args: dict | None) -> None:
+            activity["current"] = _tool_activity(tool_name, phase, args)
+
         async def gen():
-            async for delta in agent.client.prompt(text):
+            async for delta in agent.client.prompt(
+                text,
+                on_thinking=on_thinking,
+                on_tool=on_tool,
+            ):
                 yield delta
 
-        await stream_reply(update, gen(), settings.stream_edit_interval)
+        await stream_reply(
+            update, gen(), settings.stream_edit_interval,
+            placeholder=placeholder, activity_holder=activity,
+        )
     except PiBusyError:
         await reply_text(update, "⏳ 我正在处理上一条消息，请稍等…")
     except PiError as e:
-        await reply_text(update, f"⚠️ {e}")
+        await reply_text(update, _friendly_error(e))
     except Exception as e:
         logger.error("处理消息异常", extra={"user_id": user.id, "err": str(e)[:500]})
-        await reply_text(update, f"⚠️ 处理出错: {e}")
+        await reply_text(update, f"⚠️ 处理出错: {_friendly_error(e)}")
     finally:
         stop_typing.set()
         keepalive.cancel()

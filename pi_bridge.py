@@ -14,10 +14,20 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger("pi_bridge")
+
+
+async def _invoke(cb: Callable[..., Any] | None, *args: Any) -> None:
+    """调用可能为同步或异步的回调；cb 为 None 时静默跳过。"""
+    if cb is None:
+        return
+    result = cb(*args)
+    if asyncio.iscoroutine(result):
+        await result
 
 # 单轮最长等待时间（秒）：DeepSeek 深度思考 + 工具循环可能较长
 TURN_TIMEOUT = 600
@@ -151,7 +161,21 @@ class PiRpcClient:
         raise PiError("等待 pi 响应超时")
 
     # ---------- 命令 ----------
-    async def prompt(self, text: str, images: list[dict] | None = None) -> AsyncIterator[str]:
+    async def prompt(
+        self,
+        text: str,
+        images: list[dict] | None = None,
+        on_thinking: Callable[[], Any] | None = None,
+        on_tool: Callable[[str, str, dict | None], Any] | None = None,
+    ) -> AsyncIterator[str]:
+        """发送用户消息并流式产出文本增量。
+
+        on_thinking：首次出现思考（thinking_delta）时回调一次（无参数），
+                     用于 bot 层发「思考中」占位；不展示思考内容本身。
+        on_tool(tool_name, phase, args)：工具执行开始/结束时回调，
+                     phase 为 "start"/"end"，end 时 args 为 None。
+                     回调须轻量（仅更新状态），避免阻塞流式循环。
+        """
         await self.ensure_running()
         if self.busy:
             raise PiBusyError("pi 正在处理上一条消息")
@@ -161,6 +185,7 @@ class PiRpcClient:
         if images:
             body["images"] = images
         t0 = time.monotonic()
+        thinking_fired = False
         try:
             await self._send(body)
             resp = await self._wait_response(cmd_id)
@@ -177,8 +202,16 @@ class PiRpcClient:
                 etype = event.get("type")
                 if etype == "message_update":
                     ev = event.get("assistantMessageEvent") or {}
-                    if ev.get("type") == "text_delta" and ev.get("delta"):
+                    evtype = ev.get("type")
+                    if evtype == "thinking_delta" and not thinking_fired:
+                        thinking_fired = True
+                        await _invoke(on_thinking)
+                    elif evtype == "text_delta" and ev.get("delta"):
                         yield ev["delta"]
+                elif etype == "tool_execution_start" and on_tool is not None:
+                    await _invoke(on_tool, event.get("toolName", ""), "start", event.get("args") or {})
+                elif etype == "tool_execution_end" and on_tool is not None:
+                    await _invoke(on_tool, event.get("toolName", ""), "end", None)
                 elif etype in ("error",):
                     raise PiError(str(event)[:300])
                 elif etype in ("agent_end", "agent_settled"):
@@ -248,3 +281,12 @@ class PiRpcClient:
 
     async def abort(self) -> None:
         await self._safe_abort()
+
+    async def steer(self, text: str) -> None:
+        """流式过程中插入新指令（fire-and-forget）。
+
+        不等待 response：steer 的响应会与正在进行的 prompt 流式循环竞争 _queue，
+        且 prompt 循环会静默忽略非本轮事件，故只发送、不读取。
+        """
+        await self.ensure_running()
+        await self._send({"id": f"st{uuid.uuid4().hex[:8]}", "type": "steer", "message": text})
