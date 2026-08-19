@@ -16,6 +16,11 @@ from pythonjsonlogger.json import JsonFormatter
 class ContextFormatter(JsonFormatter):
     """JSON 格式化器：统一补充 timestamp / level / logger，并保留 extra 字段。"""
 
+    def __init__(self, *args, **kwargs):
+        # 中文/emoji 直接存 UTF-8，避免日志里出现 \uXXXX 转义导致 less 无法阅读
+        kwargs.setdefault("json_ensure_ascii", False)
+        super().__init__(*args, **kwargs)
+
     def add_fields(self, log_record: dict[str, Any], record: logging.LogRecord, message_dict: dict[str, Any]) -> None:
         super().add_fields(log_record, record, message_dict)
         log_record.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
