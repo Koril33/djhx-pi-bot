@@ -66,7 +66,7 @@ class PiRpcClient:
         if self.model:
             args += ["--model", self.model]
 
-        logger.info("spawn pi rpc", extra={"args": args})
+        logger.info("spawn pi rpc", extra={"pi_args": args})
         env = os.environ.copy()
         self.proc = await asyncio.create_subprocess_exec(
             *args,
