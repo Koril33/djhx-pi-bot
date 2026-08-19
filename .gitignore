@@ -1,0 +1,77 @@
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ========== 虚拟环境 / 包管理 (uv) ==========
+.venv
+venv/
+env/
+ENV/
+.uv/
+
+# ========== 测试与覆盖率 ==========
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*,cover
+.hypothesis/
+.tox/
+.nox/
+.mutmut-cache/
+
+# ========== 环境变量与密钥 ==========
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!*.example
+
+# ========== 数据与运行时产物 ==========
+# 机器人运行时数据（会话、日志、状态文件等）
+data/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+bot.session
+*.session
+
+# ========== IDE / 编辑器 ==========
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ========== 系统 ==========
+desktop.ini
+$RECYCLE.BIN/
