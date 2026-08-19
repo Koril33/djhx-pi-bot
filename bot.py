@@ -35,33 +35,47 @@ from storage import Storage
 
 logger = get_logger("bot")
 
-MAX_MSG_LEN = 4000  # Telegram 单条消息上限（留余量）
+MAX_HTML_LEN = 3900  # Telegram 消息上限 4096，转义/标签会膨胀，留余量
 
 
 # ================= Markdown → Telegram HTML =================
 
 
+# Telegram 语法高亮支持的语言（白名单，超出则退化为无高亮 <pre>）
+_PRE_LANGS = {
+    "python", "py", "javascript", "js", "typescript", "ts", "java", "c", "cpp", "c++",
+    "csharp", "cs", "go", "rust", "rs", "ruby", "rb", "php", "swift", "kotlin", "kt",
+    "scala", "r", "dart", "lua", "perl", "haskell", "hs", "sql", "json", "yaml", "yml",
+    "toml", "xml", "html", "css", "scss", "bash", "sh", "shell", "zsh", "powershell",
+    "ps1", "dockerfile", "docker", "makefile", "cmake", "ini", "diff", "markdown", "md",
+    "latex", "tex", "graphql", "proto", "protobuf", "regex", "vim", "elixir", "erlang",
+    "clojure", "groovy", "julia", "nim", "ocaml", "pascal", "fortran", "objectivec",
+}
+
+
 def md_to_html(text: str) -> str:
     """标准 Markdown → Telegram HTML parse_mode 子集。
 
-    转换：粗体、行内代码、围栏代码块、表格（等宽块）、标题（转粗体）、链接。
-    列表与其余纯文本原样保留；分隔线 --- 转空行。
+    转换：粗体、斜体、删除线、行内代码、围栏代码块、表格（等宽块）、标题（转粗体）、
+    链接、引用块、无序列表（含嵌套缩进）、分隔线。
+    粗体/斜体/标题/链接等片段经 stash 暂存、最后统一恢复，避免与残余转义重复转义
+    （修复双重转义：**a & b** 曾被转成 &amp;amp;）。
     流式半截文本可能产生非法 HTML，调用方需对 BadRequest 降级纯文本重试。
     """
     if not text:
         return text
 
-    sentinel: list[str] = []  # 先暂存已转义的 HTML 片段，最后恢复
+    sentinel: list[str] = []  # 先暂存已渲染的 HTML 片段，最后恢复
 
     def stash(html: str) -> str:
         sentinel.append(html)
         return f"\x00S{len(sentinel) - 1}\x00"
 
-    # 1) 围栏代码块 ```lang\n...``` → <pre language="lang">…</pre>（Telegram 语法高亮）
+    # 1) 围栏代码块 ```lang\n...``` → <pre language="lang">…</pre>（语言白名单，Telegram 语法高亮）
     def _fence(m: re.Match) -> str:
         body = m.group(2).rstrip("\n")
-        lang = m.group(1).strip()
-        if lang:
+        lang = m.group(1).strip().lower()
+        if lang in _PRE_LANGS:
             return stash(f'<pre language="{lang}">{escape(body, quote=False)}</pre>')
         return stash(f"<pre>{escape(body, quote=False)}</pre>")
 
@@ -81,19 +95,31 @@ def md_to_html(text: str) -> str:
 
     text = re.sub(r"`([^`\n]+)`", _inline, text)
 
-    # 3) 粗体 **x** → <b>x</b>
+    # 4) 粗体 **x** → <b>x</b>（先于斜体处理，避免 * 冲突）
     def _bold(m: re.Match) -> str:
-        return f"<b>{escape(m.group(1))}</b>"
+        return stash(f"<b>{escape(m.group(1))}</b>")
 
     text = re.sub(r"\*\*([^*\n]+)\*\*", _bold, text)
 
-    # 4) 标题 # x → <b>x</b>（Telegram 无标题语义）
+    # 5) 斜体 *x* → <i>x</i>（排除 ** 残留；内容两端非空白，避免误判乘法）
+    def _italic(m: re.Match) -> str:
+        return stash(f"<i>{escape(m.group(1))}</i>")
+
+    text = re.sub(r"(?<!\*)\*([^\s*](?:[^*\n]*[^\s*])?)\*(?!\*)", _italic, text)
+
+    # 6) 删除线 ~~x~~ → <s>x</s>（GFM 双波浪，避免与 ~ 路径/home 误判）
+    def _strike(m: re.Match) -> str:
+        return stash(f"<s>{escape(m.group(1))}</s>")
+
+    text = re.sub(r"~~([^~\n]+?)~~", _strike, text)
+
+    # 7) 标题 # x → <b>x</b>（Telegram 无标题语义）
     def _heading(m: re.Match) -> str:
-        return f"<b>{escape(m.group(2))}</b>"
+        return stash(f"<b>{escape(m.group(2))}</b>")
 
     text = re.sub(r"(?m)^\s{0,3}(#{1,6})\s+(.+?)\s*$", _heading, text)
 
-    # 5) 表格 → <pre> 等宽块（去掉 | 分隔行，列对齐）
+    # 8) 表格 → <pre> 等宽块（去掉 | 分隔行，列对齐）
     def _table(m: re.Match) -> str:
         lines = m.group(0).rstrip("\n").splitlines()
         rows = [ln for ln in lines if not re.fullmatch(r"[\s|:\-]+", ln)]
@@ -112,22 +138,37 @@ def md_to_html(text: str) -> str:
 
     text = re.sub(r"(?m)(^\s*\|.*\|\s*$\n?){2,}", _table, text)
 
-    # 6) 链接 [text](url) → <a href="url">text</a>（仅 http/https/tg 协议）
+    # 9) 链接 [text](url) → <a href="url">text</a>（仅 http/https/tg 协议）
     def _link(m: re.Match) -> str:
         url, label = m.group(2), m.group(1)
-        return f'<a href="{escape(url, quote=False)}">{escape(label)}</a>'
+        return stash(f'<a href="{escape(url, quote=False)}">{escape(label)}</a>')
 
     text = re.sub(r"\[([^\[\]\n]+)\]\((https?://[^)\s]+|tg://[^)\s]+)\)", _link, text)
 
-    # 7) 分隔线 --- → 空行
+    # 10) 分隔线 --- → 空行
     text = re.sub(r"(?m)^\s*---+\s*$", "", text)
 
-    # 8) 无序列表：- / * → • bullet；复选框 → ✅/⬜（Telegram 无原生列表元素）
-    text = re.sub(r"(?m)^[ \t]*[-*][ \t]+\[[xX]\][ \t]+", "• ✅ ", text)
-    text = re.sub(r"(?m)^[ \t]*[-*][ \t]+\[ \][ \t]+", "• ⬜ ", text)
-    text = re.sub(r"(?m)^[ \t]*[-*][ \t]+", "• ", text)
+    # 11) 无序列表：- / * → • bullet；复选框 → ✅/⬜；保留嵌套缩进（全角空格防折叠）
+    def _indent(prefix: str) -> str:
+        return "　" * (len(prefix.expandtabs(2)) // 2)
 
-    # 9) 残余纯文本转义：仅保留 Telegram 合法标签，其余 <...> 一律转义
+    text = re.sub(
+        r"(?m)^([ \t]*)[-*][ \t]+\[[xX]\][ \t]+",
+        lambda m: _indent(m.group(1)) + "• ✅ ",
+        text,
+    )
+    text = re.sub(
+        r"(?m)^([ \t]*)[-*][ \t]+\[ \][ \t]+",
+        lambda m: _indent(m.group(1)) + "• ⬜ ",
+        text,
+    )
+    text = re.sub(
+        r"(?m)^([ \t]*)[-*][ \t]+",
+        lambda m: _indent(m.group(1)) + "• ",
+        text,
+    )
+
+    # 12) 残余纯文本转义：仅保留 Telegram 合法标签，其余 <...> 一律转义
     def _escape_residual(s: str) -> str:
         tag_re = re.compile(
             r"(</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|tg-spoiler|br|blockquote)(?:\s[^<>]*)?/?>)"
@@ -139,7 +180,7 @@ def md_to_html(text: str) -> str:
 
     text = _escape_residual(text)
 
-    # 10) 恢复暂存的代码/表格片段
+    # 13) 恢复暂存的代码/表格/粗体等片段
     for i, html in enumerate(sentinel):
         text = text.replace(f"\x00S{i}\x00", html)
     return text
@@ -147,6 +188,80 @@ def md_to_html(text: str) -> str:
 
 # Telegram API 网络类异常（服务器→TG 偶发抖动，AGENTS.md 已记载）：重试而非中断
 _TG_NET_EXC = (httpx.TransportError, asyncio.TimeoutError, TimeoutError)
+
+
+def _split_markdown_blocks(text: str) -> list[str]:
+    """把 markdown 切成原子块：普通单行，或完整围栏代码块（```…``` 不切开）。"""
+    blocks: list[str] = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("```"):
+            block = [lines[i]]
+            i += 1
+            while i < len(lines) and not lines[i].lstrip().startswith("```"):
+                block.append(lines[i])
+                i += 1
+            if i < len(lines):  # 闭合 fence
+                block.append(lines[i])
+                i += 1
+            blocks.append("\n".join(block))
+        else:
+            blocks.append(lines[i])
+            i += 1
+    return blocks
+
+
+def split_markdown(text: str, max_html_len: int = MAX_HTML_LEN) -> list[str]:
+    """按块切 markdown：每段 md_to_html 后 ≤ max_html_len，且不切断代码块。
+
+    切段基于「实际 HTML 长度」而非原始字符数，避免转义膨胀（< → &lt; 等）导致超限降级。
+    单个超长代码块（>max_html_len）无法再切，作为独立一段交由 _send 降级兜底。
+    """
+    if not text:
+        return [text]
+    blocks = _split_markdown_blocks(text)
+    chunks: list[str] = []
+    cur: list[str] = []
+    for block in blocks:
+        cur.append(block)
+        if len(cur) > 1 and len(md_to_html("\n".join(cur))) > max_html_len:
+            chunks.append("\n".join(cur[:-1]) + "\n")  # 补回段末换行
+            cur = [block]
+    if cur:
+        chunks.append("\n".join(cur))
+    # 去掉空白段
+    chunks = [c for c in chunks if c.strip()]
+    return chunks or [text]
+
+
+def strip_markdown(text: str) -> str:
+    """降级纯文本时剥离常见 markdown 标记，避免用户看到 ** 和 ` 等原始符号。"""
+    if not text:
+        return text
+    # 围栏代码块标记
+    text = re.sub(r"```\w*[ \t]*\n?", "", text)
+    # 粗体 / 斜体 / 删除线
+    text = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^\s*](?:[^*\n]*[^\s*])?)\*(?!\*)", r"\1", text)
+    text = re.sub(r"~~([^~\n]+?)~~", r"\1", text)
+    # 行内代码
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+    # 链接 [text](url) → text
+    text = re.sub(r"\[([^\[\]\n]+)\]\((?:https?://|tg://)[^)\s]+\)", r"\1", text)
+    # 标题标记
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
+    # 引用标记
+    text = re.sub(r"(?m)^[ \t]*>\s?", "", text)
+    # 无序列表标记
+    text = re.sub(r"(?m)^([ \t]*)[-*][ \t]+", r"\1• ", text)
+    # 复选框
+    text = re.sub(r"• \[[xX]\]", "• ✅", text)
+    text = re.sub(r"• \[ \]", "• ⬜", text)
+    # 表格分隔行与竖线
+    text = re.sub(r"(?m)^[\s|:\-]+\n", "", text)
+    text = text.replace("|", " ")
+    return text
 
 
 async def _send(
@@ -175,9 +290,9 @@ async def _send(
             logger.warning("HTML 渲染失败，降级纯文本", extra={"err": str(e)[:200]})
             try:
                 if edit:
-                    await msg.edit_text(text)
+                    await msg.edit_text(strip_markdown(text))
                     return True
-                return await send_fn(text, reply_markup=reply_markup)
+                return await send_fn(strip_markdown(text), reply_markup=reply_markup)
             except Exception:
                 return True if edit else None
         except _TG_NET_EXC as e:
@@ -257,11 +372,11 @@ def authorized(update: Update, settings: Settings) -> bool:
 
 
 async def reply_text(update: Update, text: str, reply_markup=None) -> None:
-    """按 4096 上限分段回复；reply_markup 仅附加在首段。"""
+    """按 Telegram 上限分段回复（基于 HTML 长度、不切断代码块）；reply_markup 仅首段。"""
     if not text:
         text = "(无内容)"
-    for i in range(0, len(text), MAX_MSG_LEN):
-        chunk = text[i : i + MAX_MSG_LEN]
+    chunks = split_markdown(text)
+    for i, chunk in enumerate(chunks):
         markup = reply_markup if i == 0 else None
         if update.callback_query is not None:
             await _send(update.callback_query.message.reply_text, chunk, reply_markup=markup)
@@ -272,9 +387,8 @@ async def reply_text(update: Update, text: str, reply_markup=None) -> None:
 
 
 async def stream_reply(update: Update, text_iter, interval: float) -> None:
-    """流式回复：增量编辑消息（节流），超过上限分段新开消息。"""
+    """流式回复：增量编辑消息（节流），按 HTML 长度分段，不切断代码块。"""
     target = update.message or update.callback_query.message
-    first = True
     msg = None
     buf = ""
     last_edit = 0.0
@@ -282,40 +396,42 @@ async def stream_reply(update: Update, text_iter, interval: float) -> None:
         async for delta in text_iter:
             buf += delta
             now = time.monotonic()
-            if len(buf) >= MAX_MSG_LEN:
-                if msg is not None:
-                    await _send(None, buf[:MAX_MSG_LEN], edit=True, msg=msg)
-                elif first:
-                    msg = await _send(target.reply_text, buf[:MAX_MSG_LEN])
-                    first = False
-                buf = buf[MAX_MSG_LEN:]
-                msg = await target.reply_text("…")
+            chunks = split_markdown(buf)
+            if len(chunks) > 1:
+                # 累积出多个完整段：先落地已闭合的段，保留最后一段继续累积
+                for chunk in chunks[:-1]:
+                    if msg is None:
+                        msg = await _send(target.reply_text, chunk)
+                    else:
+                        await _send(None, chunk, edit=True, msg=msg)
+                    msg = await _send(target.reply_text, "…")  # 新段占位
+                buf = chunks[-1]
                 last_edit = now
-            elif first:
+            elif msg is None:
+                # 首个增量：立即发首条消息，降低首字延迟
                 msg = await _send(target.reply_text, buf)
-                first = False
                 last_edit = now
-            elif msg is not None and now - last_edit >= interval and 0 < len(buf) <= MAX_MSG_LEN:
+            elif now - last_edit >= interval and len(buf) > 0:
                 if await _send(None, buf, edit=True, msg=msg):
                     last_edit = now
         # 收尾：确保用户看到完整内容（首段失败或最终编辑失败时兜底）
         if buf:
             if msg is None:
                 # 首段从未发出（网络抖动），现在重试整段发送
-                for i in range(0, len(buf), MAX_MSG_LEN):
-                    msg = await _send(target.reply_text, buf[i : i + MAX_MSG_LEN])
+                for chunk in split_markdown(buf):
+                    msg = await _send(target.reply_text, chunk)
                     if msg is None:
                         break
             elif not await _send(None, buf, edit=True, msg=msg):
                 # 最终编辑失败，发一条新消息兜底
                 await _send(target.reply_text, buf)
         elif msg is None:
-            await target.reply_text("(无输出)")
+            await _send(target.reply_text, "(无输出)")
     except Exception as e:
         logger.error("流式回复异常", extra={"err": str(e)[:200]})
         try:
             if msg is not None:
-                await msg.edit_text(f"{buf}\n\n[输出中断: {e}]")
+                await _send(None, f"{buf}\n\n[输出中断: {e}]", edit=True, msg=msg)
             elif buf:
                 await _send(target.reply_text, f"{buf}\n\n[输出中断: {e}]")
         except Exception:
@@ -535,23 +651,35 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     manager = context.bot_data["manager"]
     agent = manager.get(user.id)
     text = update.message.text or ""
+    chat = update.effective_chat
 
     storage.ensure_user(user.id, user.username)
-    logger.info("收到消息", extra={"user_id": user.id, "chat_id": update.effective_chat.id, "text_len": len(text)})
+    logger.info("收到消息", extra={"user_id": user.id, "chat_id": chat.id, "text_len": len(text)})
+
+    # typing 持续刷新：Telegram 的 typing 约 5 秒过期，深度思考期长时保持反馈
+    stop_typing = asyncio.Event()
+
+    async def typing_keepalive() -> None:
+        while not stop_typing.is_set():
+            try:
+                await chat.send_chat_action(ChatAction.TYPING)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(stop_typing.wait(), timeout=4)
+            except asyncio.TimeoutError:
+                pass
+
+    keepalive = asyncio.create_task(typing_keepalive())
 
     try:
-        await update.effective_chat.send_chat_action(ChatAction.TYPING)
-    except Exception:
-        pass  # typing 状态失败不阻断主流程
+        try:
+            await agent.ensure_client()
+        except Exception as e:
+            logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
+            await reply_text(update, f"⚠️ pi 进程启动失败: {e}")
+            return
 
-    try:
-        await agent.ensure_client()
-    except Exception as e:
-        logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
-        await reply_text(update, f"⚠️ pi 进程启动失败: {e}")
-        return
-
-    try:
         async def gen():
             async for delta in agent.client.prompt(text):
                 yield delta
@@ -564,6 +692,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error("处理消息异常", extra={"user_id": user.id, "err": str(e)[:500]})
         await reply_text(update, f"⚠️ 处理出错: {e}")
+    finally:
+        stop_typing.set()
+        keepalive.cancel()
+        try:
+            await keepalive
+        except (asyncio.CancelledError, Exception):
+            pass
     try:
         storage.touch(agent.storage.get_active_session(user.id)["id"])
     except Exception:
