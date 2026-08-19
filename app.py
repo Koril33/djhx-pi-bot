@@ -30,7 +30,16 @@ async def lifespan(app: FastAPI):
     manager = AgentManager(settings, storage)
     tg_app = build_application(settings, storage, manager)
     await tg_app.initialize()
-    await tg_app.start()
+    # start() 内部会调 getMe；服务器→api.telegram.org 偶发网络错误会导致整个服务退出，加重试
+    for attempt in range(5):
+        try:
+            await tg_app.start()
+            break
+        except Exception as e:
+            logger.warning("tg_app.start 失败，重试", extra={"attempt": attempt + 1, "err": str(e)[:200]})
+            await asyncio.sleep(3)
+    else:
+        raise RuntimeError("tg_app.start 多次失败")
     app.state.storage = storage
     app.state.manager = manager
     app.state.tg_app = tg_app
