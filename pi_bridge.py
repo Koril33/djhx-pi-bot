@@ -209,13 +209,23 @@ class PiRpcClient:
             raise PiError(f"new_session 失败: {resp}")
         return resp.get("data") or {}
 
-    async def get_session_info(self) -> dict:
+    async def get_state(self) -> dict:
         await self.ensure_running()
         cmd_id = f"i{uuid.uuid4().hex[:8]}"
-        await self._send({"id": cmd_id, "type": "get_session_info"})
+        await self._send({"id": cmd_id, "type": "get_state"})
         resp = await self._wait_response(cmd_id, timeout=60)
         if not resp.get("success"):
-            raise PiError(f"get_session_info 失败: {resp}")
+            raise PiError(f"get_state 失败: {resp}")
+        return resp.get("data") or {}
+
+    async def switch_session(self, session_path: str) -> dict:
+        """进程内切换到指定会话文件（无需重启进程）。"""
+        await self.ensure_running()
+        cmd_id = f"w{uuid.uuid4().hex[:8]}"
+        await self._send({"id": cmd_id, "type": "switch_session", "sessionPath": session_path})
+        resp = await self._wait_response(cmd_id, timeout=60)
+        if not resp.get("success"):
+            raise PiError(f"switch_session 失败: {resp}")
         return resp.get("data") or {}
 
     async def get_available_models(self) -> list[dict]:

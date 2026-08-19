@@ -62,9 +62,9 @@ class AgentSession:
         # 首次同步 pi 侧会话文件路径
         if active and not active["pi_session_file"]:
             try:
-                info = await self.client.get_session_info()
-                if info.get("sessionFile"):
-                    self.storage.set_pi_session_file(active["id"], info["sessionFile"])
+                state = await self.client.get_state()
+                if state.get("sessionFile"):
+                    self.storage.set_pi_session_file(active["id"], state["sessionFile"])
             except Exception as e:
                 logger.warning("同步会话文件失败", extra={"err": str(e)})
 
@@ -218,9 +218,10 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             sid = storage.create_session(user.id, name)
             storage.set_active(sid)
             await agent.ensure_client()  # 确保进程在跑
-            info = await agent.client.new_session(name)
-            if info.get("sessionFile"):
-                storage.set_pi_session_file(sid, info["sessionFile"])
+            await agent.client.new_session(name)
+            state = await agent.client.get_state()
+            if state.get("sessionFile"):
+                storage.set_pi_session_file(sid, state["sessionFile"])
             await reply_text(update, f"✅ 已新建会话「{name}」\nID: {sid}")
         except Exception as e:
             logger.error("新建会话失败", extra={"user_id": user.id, "err": str(e)[:300]})
@@ -246,11 +247,18 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if row is None or row["user_id"] != user.id:
             await reply_text(update, f"找不到会话 {sid}")
             return
-        # 停止当前进程，换挂目标会话文件（V1 接受 ~1s 重启成本）
-        await agent.client.stop()
-        storage.set_active(sid)
-        await agent.ensure_client()
-        await reply_text(update, f"✅ 已切换到会话「{row['name']}」({sid})")
+        if not row["pi_session_file"]:
+            await reply_text(update, "该会话没有关联的 pi 会话文件，无法切换（请用 /session new 创建）")
+            return
+        try:
+            # 进程内切换会话，无需重启（避免冷启动）
+            await agent.ensure_client()
+            await agent.client.switch_session(row["pi_session_file"])
+            storage.set_active(sid)
+            await reply_text(update, f"✅ 已切换到会话「{row['name']}」({sid})")
+        except Exception as e:
+            logger.error("切换会话失败", extra={"err": str(e)[:300]})
+            await reply_text(update, f"切换会话失败: {e}")
 
     else:
         await reply_text(update, "用法：/session new [名称] | /session list | /session use <id>")
