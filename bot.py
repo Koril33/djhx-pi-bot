@@ -413,24 +413,30 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ================= Application 组装 =================
 
+COMMAND_MENU = [
+    ("start", "开始使用"),
+    ("help", "帮助"),
+    ("env", "环境管理"),
+    ("session", "会话管理"),
+    ("model", "模型管理"),
+    ("status", "运行状态"),
+    ("stop", "中止任务"),
+]
+
+
+async def register_command_menu(bot) -> None:
+    """把命令注册到 Telegram：用户输入 / 即弹出补全菜单（幂等，可重复调用）。"""
+    try:
+        await bot.set_my_commands(COMMAND_MENU)
+        logger.info("命令菜单已注册")
+    except Exception as e:
+        logger.warning("命令菜单注册失败", extra={"err": str(e)[:300]})
+
+
 def build_application(settings: Settings, storage: Storage, manager: AgentManager) -> Application:
     async def post_init(application: Application) -> None:
-        """启动时把命令注册到 Telegram：用户输入 / 即弹出补全菜单。"""
-        try:
-            await application.bot.set_my_commands(
-                [
-                    ("start", "开始使用"),
-                    ("help", "帮助"),
-                    ("env", "环境管理"),
-                    ("session", "会话管理"),
-                    ("model", "模型管理"),
-                    ("status", "运行状态"),
-                    ("stop", "中止任务"),
-                ]
-            )
-            logger.info("命令菜单已注册")
-        except Exception as e:
-            logger.warning("命令菜单注册失败", extra={"err": str(e)[:300]})
+        """run_polling / run_webhook 模式下的启动钩子（当前 app.py 手动启动，另行调用）。"""
+        await register_command_menu(application.bot)
 
     # 放宽网络超时：服务器到 api.telegram.org 偶发慢连接，默认 5s 太短
     app = (

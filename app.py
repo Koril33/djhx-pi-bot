@@ -12,7 +12,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response, status
 from telegram import Update
 
-from bot import AgentManager, build_application
+from bot import AgentManager, build_application, register_command_menu
 from config import get_settings
 from logging_conf import get_logger, setup_logging
 
@@ -40,11 +40,8 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(3)
     else:
         raise RuntimeError("tg_app.start 多次失败")
-    # post_init 只被 run_polling/run_webhook 自动调用，手动模式需显式执行（注册命令菜单等）
-    try:
-        await tg_app.post_init(tg_app)
-    except Exception as e:
-        logger.warning("post_init 执行失败", extra={"err": str(e)[:300]})
+    # 手动启动模式不会触发 post_init，需显式注册命令菜单
+    await register_command_menu(tg_app.bot)
     app.state.storage = storage
     app.state.manager = manager
     app.state.tg_app = tg_app
