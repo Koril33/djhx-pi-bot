@@ -14,6 +14,8 @@ import re
 import time
 from html import escape
 
+import httpx
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
@@ -127,6 +129,10 @@ def md_to_html(text: str) -> str:
     return text
 
 
+# Telegram API 网络类异常（服务器→TG 偶发抖动，AGENTS.md 已记载）：重试而非中断
+_TG_NET_EXC = (httpx.TransportError, asyncio.TimeoutError, TimeoutError)
+
+
 async def _send(
     send_fn,
     text: str,
@@ -134,29 +140,38 @@ async def _send(
     edit: bool = False,
     msg=None,
     reply_markup=None,
-) -> None:
-    """发送/编辑消息：优先 HTML 渲染；BadRequest（非法 HTML）降级纯文本。"""
+):
+    """发送/编辑消息：优先 HTML 渲染；网络异常重试 3 次；BadRequest 降级纯文本。
+
+    返回：编辑成功 → True；编辑失败 → False；发送成功 → Message；发送失败 → None。
+    """
     html = md_to_html(text)
-    try:
-        if edit:
-            return await msg.edit_text(html, parse_mode=ParseMode.HTML)
-        return await send_fn(html, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-    except BadRequest as e:
-        logger.warning("HTML 渲染失败，降级纯文本", extra={"err": str(e)[:200]})
-        if edit:
-            try:
-                return await msg.edit_text(text)
-            except Exception:
-                return None
+    for attempt in range(3):
         try:
-            return await send_fn(text, reply_markup=reply_markup)
+            if edit:
+                await msg.edit_text(html, parse_mode=ParseMode.HTML)
+                return True
+            return await send_fn(html, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                # 内容未变化（流式中途停顿），无需更新，视为成功
+                return True if edit else None
+            logger.warning("HTML 渲染失败，降级纯文本", extra={"err": str(e)[:200]})
+            try:
+                if edit:
+                    await msg.edit_text(text)
+                    return True
+                return await send_fn(text, reply_markup=reply_markup)
+            except Exception:
+                return True if edit else None
+        except _TG_NET_EXC as e:
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            logger.warning("Telegram API 网络异常，重试耗尽", extra={"err": str(e)[:200]})
+            return True if edit else None
         except Exception:
-            return None
-    except Exception:
-        # 非 BadRequest（网络抖动等）：编辑场景静默，发送场景交由上层处理
-        if edit:
-            return None
-        raise
+            return True if edit else None
 
 
 class AgentSession:
@@ -264,18 +279,29 @@ async def stream_reply(update: Update, text_iter, interval: float) -> None:
                 msg = await _send(target.reply_text, buf)
                 first = False
                 last_edit = now
-            elif now - last_edit >= interval and 0 < len(buf) <= MAX_MSG_LEN:
-                await _send(None, buf, edit=True, msg=msg)
-                last_edit = now
-        if msg is None and not buf:
-            msg = await target.reply_text("(无输出)")
-        elif msg is not None:
-            await _send(None, buf or "(无输出)", edit=True, msg=msg)
+            elif msg is not None and now - last_edit >= interval and 0 < len(buf) <= MAX_MSG_LEN:
+                if await _send(None, buf, edit=True, msg=msg):
+                    last_edit = now
+        # 收尾：确保用户看到完整内容（首段失败或最终编辑失败时兜底）
+        if buf:
+            if msg is None:
+                # 首段从未发出（网络抖动），现在重试整段发送
+                for i in range(0, len(buf), MAX_MSG_LEN):
+                    msg = await _send(target.reply_text, buf[i : i + MAX_MSG_LEN])
+                    if msg is None:
+                        break
+            elif not await _send(None, buf, edit=True, msg=msg):
+                # 最终编辑失败，发一条新消息兜底
+                await _send(target.reply_text, buf)
+        elif msg is None:
+            await target.reply_text("(无输出)")
     except Exception as e:
         logger.error("流式回复异常", extra={"err": str(e)[:200]})
         try:
             if msg is not None:
                 await msg.edit_text(f"{buf}\n\n[输出中断: {e}]")
+            elif buf:
+                await _send(target.reply_text, f"{buf}\n\n[输出中断: {e}]")
         except Exception:
             pass
 
