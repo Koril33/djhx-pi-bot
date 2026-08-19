@@ -57,9 +57,12 @@ def md_to_html(text: str) -> str:
         sentinel.append(html)
         return f"\x00S{len(sentinel) - 1}\x00"
 
-    # 1) 围栏代码块 ```lang\n...``` → <pre>...</pre>
+    # 1) 围栏代码块 ```lang\n...``` → <pre language="lang">…</pre>（Telegram 语法高亮）
     def _fence(m: re.Match) -> str:
         body = m.group(2).rstrip("\n")
+        lang = m.group(1).strip()
+        if lang:
+            return stash(f'<pre language="{lang}">{escape(body, quote=False)}</pre>')
         return stash(f"<pre>{escape(body, quote=False)}</pre>")
 
     text = re.sub(r"```(\w*)[ \t]*\n(.*?)```", _fence, text, flags=re.S)
