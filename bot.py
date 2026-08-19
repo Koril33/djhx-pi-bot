@@ -10,10 +10,13 @@ V1 拓扑：单个环境（服务器本机），每用户一个常驻 pi RPC 进
 普通文本：转发给 pi（常驻 RPC，流式回复）。
 """
 import asyncio
+import re
 import time
+from html import escape
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -31,6 +34,129 @@ from storage import Storage
 logger = get_logger("bot")
 
 MAX_MSG_LEN = 4000  # Telegram 单条消息上限（留余量）
+
+
+# ================= Markdown → Telegram HTML =================
+
+
+def md_to_html(text: str) -> str:
+    """标准 Markdown → Telegram HTML parse_mode 子集。
+
+    转换：粗体、行内代码、围栏代码块、表格（等宽块）、标题（转粗体）、链接。
+    列表与其余纯文本原样保留；分隔线 --- 转空行。
+    流式半截文本可能产生非法 HTML，调用方需对 BadRequest 降级纯文本重试。
+    """
+    if not text:
+        return text
+
+    sentinel: list[str] = []  # 先暂存已转义的 HTML 片段，最后恢复
+
+    def stash(html: str) -> str:
+        sentinel.append(html)
+        return f"\x00S{len(sentinel) - 1}\x00"
+
+    # 1) 围栏代码块 ```lang\n...``` → <pre>...</pre>
+    def _fence(m: re.Match) -> str:
+        body = m.group(2).rstrip("\n")
+        return stash(f"<pre>{escape(body, quote=False)}</pre>")
+
+    text = re.sub(r"```(\w*)[ \t]*\n(.*?)```", _fence, text, flags=re.S)
+
+    # 2) 行内代码 `x` → <code>x</code>
+    def _inline(m: re.Match) -> str:
+        return stash(f"<code>{escape(m.group(1), quote=False)}</code>")
+
+    text = re.sub(r"`([^`\n]+)`", _inline, text)
+
+    # 3) 粗体 **x** → <b>x</b>
+    def _bold(m: re.Match) -> str:
+        return f"<b>{escape(m.group(1))}</b>"
+
+    text = re.sub(r"\*\*([^*\n]+)\*\*", _bold, text)
+
+    # 4) 标题 # x → <b>x</b>（Telegram 无标题语义）
+    def _heading(m: re.Match) -> str:
+        return f"<b>{escape(m.group(2))}</b>"
+
+    text = re.sub(r"(?m)^\s{0,3}(#{1,6})\s+(.+?)\s*$", _heading, text)
+
+    # 5) 表格 → <pre> 等宽块（去掉 | 分隔行，列对齐）
+    def _table(m: re.Match) -> str:
+        lines = m.group(0).rstrip("\n").splitlines()
+        rows = [ln for ln in lines if not re.fullmatch(r"[\s|:\-]+", ln)]
+        if not rows:
+            return ""
+        cells = [[c.strip() for c in ln.strip().strip("|").split("|")] for ln in rows]
+        max_cols = max(len(r) for r in cells)
+        widths = [max(len(r[i]) for r in cells if i < len(r)) for i in range(max_cols)]
+        out = []
+        for r in cells:
+            line = "  ".join(
+                (c.ljust(widths[i]) if i < len(widths) else c) for i, c in enumerate(r)
+            )
+            out.append(line.rstrip())
+        return stash(f"<pre>{escape(chr(10).join(out))}</pre>")
+
+    text = re.sub(r"(?m)(^\s*\|.*\|\s*$\n?){2,}", _table, text)
+
+    # 6) 链接 [text](url) → <a href="url">text</a>（仅 http/https/tg 协议）
+    def _link(m: re.Match) -> str:
+        url, label = m.group(2), m.group(1)
+        return f'<a href="{escape(url, quote=False)}">{escape(label)}</a>'
+
+    text = re.sub(r"\[([^\[\]\n]+)\]\((https?://[^)\s]+|tg://[^)\s]+)\)", _link, text)
+
+    # 7) 分隔线 --- → 空行
+    text = re.sub(r"(?m)^\s*---+\s*$", "", text)
+
+    # 8) 残余纯文本转义：仅保留 Telegram 合法标签，其余 <...> 一律转义
+    def _escape_residual(s: str) -> str:
+        tag_re = re.compile(
+            r"(</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|tg-spoiler|br|blockquote)(?:\s[^<>]*)?/?>)"
+        )
+        parts = tag_re.split(s)
+        return "".join(
+            p if tag_re.fullmatch(p) else escape(p, quote=False) for p in parts
+        )
+
+    text = _escape_residual(text)
+
+    # 9) 恢复暂存的代码/表格片段
+    for i, html in enumerate(sentinel):
+        text = text.replace(f"\x00S{i}\x00", html)
+    return text
+
+
+async def _send(
+    send_fn,
+    text: str,
+    *,
+    edit: bool = False,
+    msg=None,
+    reply_markup=None,
+) -> None:
+    """发送/编辑消息：优先 HTML 渲染；BadRequest（非法 HTML）降级纯文本。"""
+    html = md_to_html(text)
+    try:
+        if edit:
+            return await msg.edit_text(html, parse_mode=ParseMode.HTML)
+        return await send_fn(html, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except BadRequest as e:
+        logger.warning("HTML 渲染失败，降级纯文本", extra={"err": str(e)[:200]})
+        if edit:
+            try:
+                return await msg.edit_text(text)
+            except Exception:
+                return None
+        try:
+            return await send_fn(text, reply_markup=reply_markup)
+        except Exception:
+            return None
+    except Exception:
+        # 非 BadRequest（网络抖动等）：编辑场景静默，发送场景交由上层处理
+        if edit:
+            return None
+        raise
 
 
 class AgentSession:
@@ -107,11 +233,11 @@ async def reply_text(update: Update, text: str, reply_markup=None) -> None:
         chunk = text[i : i + MAX_MSG_LEN]
         markup = reply_markup if i == 0 else None
         if update.callback_query is not None:
-            await update.callback_query.message.reply_text(chunk, reply_markup=markup)
+            await _send(update.callback_query.message.reply_text, chunk, reply_markup=markup)
         elif update.message is not None:
-            await update.message.reply_text(chunk, reply_markup=markup)
+            await _send(update.message.reply_text, chunk, reply_markup=markup)
         else:
-            await update.effective_chat.send_message(chunk, reply_markup=markup)
+            await _send(update.effective_chat.send_message, chunk, reply_markup=markup)
 
 
 async def stream_reply(update: Update, text_iter, interval: float) -> None:
@@ -127,33 +253,24 @@ async def stream_reply(update: Update, text_iter, interval: float) -> None:
             now = time.monotonic()
             if len(buf) >= MAX_MSG_LEN:
                 if msg is not None:
-                    try:
-                        await msg.edit_text(buf[:MAX_MSG_LEN])
-                    except Exception:
-                        pass
+                    await _send(None, buf[:MAX_MSG_LEN], edit=True, msg=msg)
                 elif first:
-                    msg = await target.reply_text(buf[:MAX_MSG_LEN])
+                    msg = await _send(target.reply_text, buf[:MAX_MSG_LEN])
                     first = False
                 buf = buf[MAX_MSG_LEN:]
                 msg = await target.reply_text("…")
                 last_edit = now
             elif first:
-                msg = await target.reply_text(buf)
+                msg = await _send(target.reply_text, buf)
                 first = False
                 last_edit = now
             elif now - last_edit >= interval and 0 < len(buf) <= MAX_MSG_LEN:
-                try:
-                    await msg.edit_text(buf)
-                    last_edit = now
-                except Exception:
-                    pass
+                await _send(None, buf, edit=True, msg=msg)
+                last_edit = now
         if msg is None and not buf:
             msg = await target.reply_text("(无输出)")
         elif msg is not None:
-            try:
-                await msg.edit_text(buf or "(无输出)")
-            except Exception:
-                pass
+            await _send(None, buf or "(无输出)", edit=True, msg=msg)
     except Exception as e:
         logger.error("流式回复异常", extra={"err": str(e)[:200]})
         try:
