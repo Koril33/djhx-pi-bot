@@ -64,7 +64,15 @@ def md_to_html(text: str) -> str:
 
     text = re.sub(r"```(\w*)[ \t]*\n(.*?)```", _fence, text, flags=re.S)
 
-    # 2) 行内代码 `x` → <code>x</code>
+    # 2) 引用块 > 行 → <blockquote>…</blockquote>（内容递归渲染，支持嵌套）
+    def _quote(m: re.Match) -> str:
+        lines = m.group(0).rstrip("\n").splitlines()
+        inner = "\n".join(re.sub(r"^[ \t]*>\s?", "", ln) for ln in lines)
+        return stash(f"<blockquote>{md_to_html(inner)}</blockquote>")
+
+    text = re.sub(r"(?m)(^[ \t]*>[^\n]*\n?)+", _quote, text)
+
+    # 3) 行内代码 `x` → <code>x</code>
     def _inline(m: re.Match) -> str:
         return stash(f"<code>{escape(m.group(1), quote=False)}</code>")
 
@@ -111,7 +119,12 @@ def md_to_html(text: str) -> str:
     # 7) 分隔线 --- → 空行
     text = re.sub(r"(?m)^\s*---+\s*$", "", text)
 
-    # 8) 残余纯文本转义：仅保留 Telegram 合法标签，其余 <...> 一律转义
+    # 8) 无序列表：- / * → • bullet；复选框 → ✅/⬜（Telegram 无原生列表元素）
+    text = re.sub(r"(?m)^[ \t]*[-*][ \t]+\[[xX]\][ \t]+", "• ✅ ", text)
+    text = re.sub(r"(?m)^[ \t]*[-*][ \t]+\[ \][ \t]+", "• ⬜ ", text)
+    text = re.sub(r"(?m)^[ \t]*[-*][ \t]+", "• ", text)
+
+    # 9) 残余纯文本转义：仅保留 Telegram 合法标签，其余 <...> 一律转义
     def _escape_residual(s: str) -> str:
         tag_re = re.compile(
             r"(</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|tg-spoiler|br|blockquote)(?:\s[^<>]*)?/?>)"
@@ -123,7 +136,7 @@ def md_to_html(text: str) -> str:
 
     text = _escape_residual(text)
 
-    # 9) 恢复暂存的代码/表格片段
+    # 10) 恢复暂存的代码/表格片段
     for i, html in enumerate(sentinel):
         text = text.replace(f"\x00S{i}\x00", html)
     return text
