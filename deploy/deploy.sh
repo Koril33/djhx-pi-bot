@@ -11,6 +11,20 @@ flock -n 9 || { echo "[deploy] $(date -Is) 已有部署在运行，跳过"; exit
 cd "$(dirname "$0")/.."
 echo "[deploy] $(date -Is) 开始部署 (branch: $(git branch --show-current))"
 
+# 护栏：工作区不干净或有未推送提交时中止（常见于服务器 pi 直接改代码未推送）
+if [ -n "$(git status --porcelain)" ]; then
+  echo "[deploy] 中止：工作区有未提交改动，部署会覆盖它们："
+  git status --porcelain | head -10
+  echo "[deploy] 提示：先在服务器上 git add/commit/push，再触发部署"
+  exit 1
+fi
+if [ "$(git rev-list --count HEAD..@{u} 2>/dev/null)" -gt 0 ]; then
+  echo "[deploy] 中止：本地有未推送的提交，pull 将无法 fast-forward："
+  git log --oneline @{u}..HEAD | head -5
+  echo "[deploy] 提示：先 git push origin main 推送这些提交"
+  exit 1
+fi
+
 echo "[deploy] git pull --ff-only"
 git pull --ff-only
 
