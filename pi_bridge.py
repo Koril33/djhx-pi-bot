@@ -177,8 +177,8 @@ class PiRpcClient:
                 etype = event.get("type")
                 if etype == "message_update":
                     ev = event.get("assistantMessageEvent") or {}
-                    if ev.get("type") == "text_delta" and ev.get("text"):
-                        yield ev["text"]
+                    if ev.get("type") == "text_delta" and ev.get("delta"):
+                        yield ev["delta"]
                 elif etype in ("error",):
                     raise PiError(str(event)[:300])
                 elif etype in ("agent_end", "agent_settled"):
