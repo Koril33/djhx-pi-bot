@@ -331,7 +331,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     storage.ensure_user(user.id, user.username)
     logger.info("收到消息", extra={"user_id": user.id, "chat_id": update.effective_chat.id, "text_len": len(text)})
 
-    await update.effective_chat.send_chat_action(ChatAction.TYPING)
+    try:
+        await update.effective_chat.send_chat_action(ChatAction.TYPING)
+    except Exception:
+        pass  # typing 状态失败不阻断主流程
+
     try:
         await agent.ensure_client()
     except Exception as e:
@@ -339,11 +343,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_text(update, f"⚠️ pi 进程启动失败: {e}")
         return
 
-    async def gen():
-        async for delta in agent.client.prompt(text):
-            yield delta
+    try:
+        async def gen():
+            async for delta in agent.client.prompt(text):
+                yield delta
 
-    await stream_reply(update, gen(), settings.stream_edit_interval)
+        await stream_reply(update, gen(), settings.stream_edit_interval)
+    except PiBusyError:
+        await reply_text(update, "⏳ 我正在处理上一条消息，请稍等…")
+    except PiError as e:
+        await reply_text(update, f"⚠️ {e}")
+    except Exception as e:
+        logger.error("处理消息异常", extra={"user_id": user.id, "err": str(e)[:500]})
+        await reply_text(update, f"⚠️ 处理出错: {e}")
     try:
         storage.touch(agent.storage.get_active_session(user.id)["id"])
     except Exception:
