@@ -373,7 +373,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ================= Application 组装 =================
 
 def build_application(settings: Settings, storage: Storage, manager: AgentManager) -> Application:
-    app = Application.builder().token(settings.bot_token).build()
+    # 放宽网络超时：服务器到 api.telegram.org 偶发慢连接，默认 5s 太短
+    app = (
+        Application.builder()
+        .token(settings.bot_token)
+        .connect_timeout(20)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(20)
+        .build()
+    )
     app.bot_data["settings"] = settings
     app.bot_data["storage"] = storage
     app.bot_data["manager"] = manager
