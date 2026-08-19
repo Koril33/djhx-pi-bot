@@ -4,7 +4,10 @@
 webhook 只做快速 ack，真正的消息处理放到后台任务（避免占用 Telegram 回执超时）。
 """
 import asyncio
+import os
+import subprocess
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, Response, status
 from telegram import Update
@@ -71,6 +74,34 @@ async def webhook(secret: str, request: Request) -> Response:
 
     # 后台处理，快速 ack（Telegram 等待响应约 60s）
     asyncio.create_task(app.state.tg_app.process_update(update))
+    return Response(status_code=status.HTTP_200_OK)
+
+
+@app.post("/deploy-webhook/{secret}")
+async def deploy_webhook(secret: str) -> Response:
+    """Gitea Push webhook 入口：验证密钥后，后台 detached 执行 deploy.sh 并立即返回。
+
+    deploy.sh 会 git pull + uv sync + systemctl restart（重启会杀掉本进程），
+    所以必须用 start_new_session 分离出独立进程，且先返回 200。
+    """
+    if secret != settings.deploy_secret:
+        logger.warning("deploy webhook 密钥不匹配")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+
+    repo_root = Path(__file__).resolve().parent
+    deploy_script = repo_root / "deploy" / "deploy.sh"
+    if not deploy_script.exists():
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    os.makedirs(repo_root / "logs", exist_ok=True)
+    log_file = open(repo_root / "logs" / "deploy.log", "ab")
+    subprocess.Popen(
+        ["bash", str(deploy_script)],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        cwd=str(repo_root),
+    )
+    logger.info("收到 Gitea push，已触发部署")
     return Response(status_code=status.HTTP_200_OK)
 
 

@@ -39,6 +39,20 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 | `/stop` | 中止当前任务 |
 | `/status` | 运行状态 |
 
-## 部署
+## 部署（Gitea 驱动）
 
-见 `deploy/` 下的 systemd 与 nginx 配置（部署脚本 + 服务器侧 post-receive hook）。
+```
+本地 push ──► Gitea (git@git.djhx.site:koril/djhx-pi-bot.git)
+                  │ Push Webhook
+                  ▼
+        https://pi.djhx.site/deploy-webhook/<DEPLOY_SECRET>
+                  │ 后台执行
+                  ▼
+        deploy/deploy.sh: git pull → uv sync → systemctl restart
+```
+
+- 单一事实源：Gitea；服务器通过 webhook 自动部署
+- `deploy/deploy.sh` 与 `deploy/djhx-pi-bot.service` 随仓库版本化
+- Gitea 仓库 → 设置 → Web 钩子 → 添加：URL 填 `https://pi.djhx.site/deploy-webhook/<secret>`（Gitea 类型，Push 事件，Secret 填 DEPLOY_SECRET）
+- 部署日志：`logs/deploy.log`；服务日志：`journalctl -u djhx-pi-bot -f`
+- 回滚：`git push gitea <上一commit>:main`

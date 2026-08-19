@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     webhook_secret: str = ""
     webhook_url: str = ""  # 形如 https://pi.djhx.site/webhook/<secret>
 
+    # Gitea 部署 webhook 密钥（Push 事件触发自动部署）
+    deploy_secret: str = ""
+
     # pi
     pi_cmd: str = "pi"                     # pi 可执行文件路径
     pi_provider: str = "deepseek"          # 默认 provider（透传给 pi）
