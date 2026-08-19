@@ -1,15 +1,44 @@
 # djhx-pi-bot
 
-> 通过 Telegram Bot 与多个环境（Windows / Debian / 公网服务器）中的 pi 交互的桥接服务。
+通过 Telegram Bot 与多个环境（Windows / Debian / 公网服务器）中的 [pi](https://pi.dev) 编码代理交互的桥接服务。
 
-## 状态
+## 架构（V1）
 
-项目初始化中，README 待完善。
+```
+Telegram ←→ nginx(TLS) ←→ FastAPI webhook ←→ python-telegram-bot
+                                              └→ 常驻 pi --mode rpc 子进程 (JSONL over stdio)
+                                              └→ SQLite (用户/会话映射)
+```
 
-## 规划要点
+- V1 单环境（服务器本机）：bot 进程直接管理常驻 pi RPC 子进程
+- 常驻 RPC 消除每次对话的冷启动成本，支持流式输出
+- 多环境（Windows/Debian worker）规划在后续版本引入
 
-- 通过一个 Telegram Bot 控制多个环境的 pi
-- 支持 Session 切换、记忆持久化等 Agent 操作
-- 工程化：可靠性、鲁棒性、性能
+## 快速开始
 
-（详细设计与使用文档将在后续迭代中补充。）
+```bash
+uv sync
+cp .env.example .env   # 填入 BOT_TOKEN / ALLOWED_USER_IDS / WEBHOOK_SECRET
+uv run uvicorn app:app --host 127.0.0.1 --port 8128
+```
+
+设置 webhook：
+
+```bash
+curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhook/<WEBHOOK_SECRET>"
+```
+
+## 命令
+
+| 命令 | 说明 |
+|---|---|
+| `/help` | 帮助 |
+| `/env list` / `/env use <name>` | 环境（V1 仅 server） |
+| `/session new [name]` / `list` / `use <id>` | 会话管理 |
+| `/model list` / `/model use <id>` | 模型切换 |
+| `/stop` | 中止当前任务 |
+| `/status` | 运行状态 |
+
+## 部署
+
+见 `deploy/` 下的 systemd 与 nginx 配置（部署脚本 + 服务器侧 post-receive hook）。

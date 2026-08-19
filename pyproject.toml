@@ -1,7 +1,16 @@
 [project]
 name = "djhx-pi-bot"
 version = "0.1.0"
-description = "Add your description here"
+description = "Telegram Bot 桥接多个环境中的 pi (coding agent)"
 readme = "README.md"
-requires-python = ">=3.14"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-telegram-bot>=22.0",
+    "python-json-logger>=2.0",
+    "pydantic-settings>=2.0",
+]
+
+[tool.uv]
+package = false
