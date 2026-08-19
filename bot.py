@@ -12,10 +12,11 @@ V1 拓扑：单个环境（服务器本机），每用户一个常驻 pi RPC 进
 import asyncio
 import time
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -98,18 +99,19 @@ def authorized(update: Update, settings: Settings) -> bool:
     return update.effective_user is not None and update.effective_user.id in settings.allowed_ids
 
 
-async def reply_text(update: Update, text: str) -> None:
-    """按 4096 上限分段回复。"""
+async def reply_text(update: Update, text: str, reply_markup=None) -> None:
+    """按 4096 上限分段回复；reply_markup 仅附加在首段。"""
     if not text:
         text = "(无内容)"
     for i in range(0, len(text), MAX_MSG_LEN):
         chunk = text[i : i + MAX_MSG_LEN]
+        markup = reply_markup if i == 0 else None
         if update.callback_query is not None:
-            await update.callback_query.message.reply_text(chunk)
+            await update.callback_query.message.reply_text(chunk, reply_markup=markup)
         elif update.message is not None:
-            await update.message.reply_text(chunk)
+            await update.message.reply_text(chunk, reply_markup=markup)
         else:
-            await update.effective_chat.send_message(chunk)
+            await update.effective_chat.send_message(chunk, reply_markup=markup)
 
 
 async def stream_reply(update: Update, text_iter, interval: float) -> None:
@@ -161,6 +163,24 @@ async def stream_reply(update: Update, text_iter, interval: float) -> None:
             pass
 
 
+# ================= 快捷菜单 =================
+
+def quick_menu() -> InlineKeyboardMarkup:
+    """/start 与 /help 附带的内联快捷键盘。"""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📁 会话列表", callback_data="cmd:session_list"),
+                InlineKeyboardButton("🧠 模型列表", callback_data="cmd:model_list"),
+            ],
+            [
+                InlineKeyboardButton("📊 状态", callback_data="cmd:status"),
+                InlineKeyboardButton("⏹ 中止任务", callback_data="cmd:stop"),
+            ],
+        ]
+    )
+
+
 # ================= 命令处理器 =================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -170,7 +190,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🤖 djhx-pi-bot — 通过 Telegram 控制 pi 编码代理\n\n"
-        "直接发消息即可与 pi 对话。\n\n"
+        "直接发消息即可与 pi 对话，或点击下方快捷按钮。\n\n"
         "命令：\n"
         "/env list — 查看可用环境\n"
         "/env use <name> — 切换环境（V1 仅 server）\n"
@@ -183,7 +203,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — 查看运行状态\n"
         "/help — 帮助"
     )
-    await reply_text(update, text)
+    await reply_text(update, text, reply_markup=quick_menu())
 
 
 async def cmd_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -326,6 +346,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await reply_text(update, "\n".join(lines))
 
 
+# ================= 快捷按钮回调 =================
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """内联键盘按钮点击：映射到对应命令处理器。"""
+    query = update.callback_query
+    await query.answer()
+    actions = {
+        "cmd:session_list": (cmd_session, ["list"]),
+        "cmd:model_list": (cmd_model, ["list"]),
+        "cmd:status": (cmd_status, []),
+        "cmd:stop": (cmd_stop, []),
+    }
+    entry = actions.get(query.data)
+    if entry is None:
+        await query.answer("未知操作", show_alert=False)
+        return
+    handler, args = entry
+    context.args = args
+    await handler(update, context)
+
+
 # ================= 普通消息 =================
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -373,6 +414,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ================= Application 组装 =================
 
 def build_application(settings: Settings, storage: Storage, manager: AgentManager) -> Application:
+    async def post_init(application: Application) -> None:
+        """启动时把命令注册到 Telegram：用户输入 / 即弹出补全菜单。"""
+        try:
+            await application.bot.set_my_commands(
+                [
+                    ("start", "开始使用"),
+                    ("help", "帮助"),
+                    ("env", "环境管理"),
+                    ("session", "会话管理"),
+                    ("model", "模型管理"),
+                    ("status", "运行状态"),
+                    ("stop", "中止任务"),
+                ]
+            )
+            logger.info("命令菜单已注册")
+        except Exception as e:
+            logger.warning("命令菜单注册失败", extra={"err": str(e)[:300]})
+
     # 放宽网络超时：服务器到 api.telegram.org 偶发慢连接，默认 5s 太短
     app = (
         Application.builder()
@@ -381,6 +440,7 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         .read_timeout(60)
         .write_timeout(60)
         .pool_timeout(20)
+        .post_init(post_init)
         .build()
     )
     app.bot_data["settings"] = settings
@@ -394,6 +454,8 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
                 "拒绝未授权用户",
                 extra={"user_id": update.effective_user.id if update.effective_user else None},
             )
+            if update.callback_query is not None:
+                await update.callback_query.answer("你没有权限", show_alert=True)
             if update.message and update.message.chat.type == "private":
                 await update.message.reply_text("你没有使用该 bot 的权限。")
             return
@@ -407,6 +469,7 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         CommandHandler("model", cmd_model),
         CommandHandler("stop", cmd_stop),
         CommandHandler("status", cmd_status),
+        CallbackQueryHandler(on_callback),
     ]
     for h in handlers:
         inner = h.callback
