@@ -271,20 +271,25 @@ class PiRpcClient:
         return (resp.get("data") or {}).get("models", [])
 
     async def set_model(self, model_id: str) -> dict:
+        """切换模型。pi RPC 的 set_model 需要 provider+modelId 同时匹配。
+
+        支持两种输入："provider/modelId" 或纯 "modelId"；
+        纯 id 时优先按 id 从可用模型列表反查 provider（多 provider 场景下比
+        直接使用默认 provider 更可靠），查不到再退回默认 provider。
+        """
         await self.ensure_running()
         cmd_id = f"x{uuid.uuid4().hex[:8]}"
-        # pi RPC 的 set_model 需要 provider + modelId 同时匹配，缺 provider 会报
-        # "Model not found: undefined/<model>"（当前 provider 为 None 时按 id 反查兜底）
-        provider = self.provider
-        if not provider:
-            try:
-                for m in await self.get_available_models():
-                    if m.get("id") == model_id:
-                        provider = m.get("provider")
-                        break
-            except Exception:
-                pass
-        await self._send({"id": cmd_id, "type": "set_model", "provider": provider, "modelId": model_id})
+        provider, _, bare_id = model_id.partition("/")
+        if not bare_id:
+            bare_id, provider = provider, self.provider
+        try:
+            for m in await self.get_available_models():
+                if m.get("id") == bare_id:
+                    provider = m.get("provider")
+                    break
+        except Exception:
+            pass
+        await self._send({"id": cmd_id, "type": "set_model", "provider": provider, "modelId": bare_id})
         resp = await self._wait_response(cmd_id, timeout=60)
         if not resp.get("success"):
             raise PiError(f"set_model 失败: {resp}")
