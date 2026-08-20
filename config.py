@@ -36,8 +36,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_dir: str = "logs"
 
-    # 流式回复节流（秒）
-    stream_edit_interval: float = 1.0
+    # 流式回复：首批文本先短暂聚合，后续按固定频率编辑 Telegram 消息
+    stream_edit_interval: float = 0.6
+    stream_initial_delay: float = 0.25
+    stream_initial_chars: int = 16
 
     @property
     def allowed_ids(self) -> set[int]:

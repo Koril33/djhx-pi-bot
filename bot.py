@@ -454,56 +454,146 @@ async def reply_text(update: Update, text: str, reply_markup=None) -> None:
             await _send(update.effective_chat.send_message, chunk, reply_markup=markup)
 
 
-async def stream_reply(update: Update, text_iter, interval: float, placeholder: dict | None = None, activity_holder: dict | None = None) -> None:
-    """流式回复：增量编辑消息（节流），按 HTML 长度分段，不切断代码块。
+async def stream_reply(
+    update: Update,
+    text_iter,
+    interval: float,
+    placeholder: dict | None = None,
+    activity_holder: dict | None = None,
+    initial_delay: float = 0.25,
+    initial_chars: int = 16,
+) -> None:
+    """流式回复：合并增量后定时编辑，按 HTML 长度分段，不切断代码块。
 
     placeholder：{"msg": Message|None}，思考占位消息 holder（流式期间异步产生，动态读取）。
     activity_holder：当前工具活动状态（{"current": 描述}），渲染时附加到正文末尾。
+
+    delta 生产者只追加文本并标记 dirty；渲染循环在到达刷新截止时间后才执行
+    Markdown 解析和 Telegram API 编辑。首批文本等待短暂窗口或达到字符阈值，
+    避免先显示一两个字再大段跳变。
     """
     target = update.message or update.callback_query.message
     msg = None
     buf = ""
+    dirty = False
+    done = False
+    producer_error: Exception | None = None
+    first_delta_at: float | None = None
+    first_text_rendered = False
     last_edit = 0.0
+
+    events: asyncio.Queue[tuple[str, object | None]] = asyncio.Queue()
+
+    async def produce() -> None:
+        try:
+            async for delta in text_iter:
+                events.put_nowait(("delta", delta))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            events.put_nowait(("error", e))
+        finally:
+            events.put_nowait(("done", None))
+
+    producer = asyncio.create_task(produce())
+
+    def consume_event(kind: str, value: object | None) -> None:
+        nonlocal buf, dirty, done, producer_error, first_delta_at
+        if kind == "delta":
+            if first_delta_at is None:
+                first_delta_at = time.monotonic()
+            buf += str(value or "")
+            dirty = True
+        elif kind == "error" and isinstance(value, Exception):
+            producer_error = value
+        elif kind == "done":
+            done = True
+
+    async def flush(*, force: bool = False) -> None:
+        """把当前 dirty 快照刷新到 Telegram；仅此处执行 Markdown 分段。"""
+        nonlocal msg, buf, dirty, first_text_rendered, last_edit
+        if (not dirty and not force) or not buf:
+            return
+
+        # 思考占位若已发出，直接编辑它，避免多发一条消息。
+        if msg is None and placeholder is not None and placeholder.get("msg") is not None:
+            msg = placeholder["msg"]
+
+        chunks = split_markdown(buf)
+        if len(chunks) > 1:
+            # 已闭合的段落地后从 buf 移除，后续只重新解析未完成的尾段。
+            for chunk in chunks[:-1]:
+                rendered = _render(chunk, activity_holder)
+                if msg is None:
+                    msg = await _send(target.reply_text, rendered)
+                else:
+                    await _send(None, rendered, edit=True, msg=msg)
+                msg = await _send(target.reply_text, "…")
+            buf = chunks[-1]
+
+        rendered = _render(buf, activity_holder)
+        if msg is None:
+            msg = await _send(target.reply_text, rendered)
+        else:
+            await _send(None, rendered, edit=True, msg=msg)
+
+        dirty = False
+        first_text_rendered = True
+        last_edit = time.monotonic()
+
     try:
-        async for delta in text_iter:
-            # 思考占位若已发出且尚未采用，用它作为首条消息（避免重复发送）
-            if msg is None and placeholder is not None and placeholder.get("msg") is not None:
-                msg = placeholder["msg"]
-                last_edit = 0.0
-            buf += delta
+        while not done:
             now = time.monotonic()
-            chunks = split_markdown(buf)
-            if len(chunks) > 1:
-                # 累积出多个完整段：先落地已闭合的段，保留最后一段继续累积
-                for chunk in chunks[:-1]:
-                    if msg is None:
-                        msg = await _send(target.reply_text, _render(chunk, activity_holder))
-                    else:
-                        await _send(None, _render(chunk, activity_holder), edit=True, msg=msg)
-                    msg = await _send(target.reply_text, "…")  # 新段占位
-                buf = chunks[-1]
-                last_edit = now
-            elif msg is None:
-                # 首个增量：立即发首条消息，降低首字延迟
-                msg = await _send(target.reply_text, _render(buf, activity_holder))
-                last_edit = now
-            elif (last_edit == 0.0 or now - last_edit >= interval) and len(buf) > 0:
-                # last_edit==0.0 表示占位消息尚未被正文替换，立即编辑
-                if await _send(None, _render(buf, activity_holder), edit=True, msg=msg):
-                    last_edit = now
-        # 收尾：确保用户看到完整内容（首段失败或最终编辑失败时兜底）
-        if buf:
-            if msg is None:
-                # 首段从未发出（网络抖动），现在重试整段发送
-                for chunk in split_markdown(buf):
-                    msg = await _send(target.reply_text, _render(chunk, activity_holder))
-                    if msg is None:
-                        break
-            elif not await _send(None, _render(buf, activity_holder), edit=True, msg=msg):
-                # 最终编辑失败，发一条新消息兜底
-                await _send(target.reply_text, buf)
-        elif msg is None:
-            await _send(target.reply_text, "(无输出)")
+            timeout: float | None = None
+
+            if dirty:
+                if not first_text_rendered:
+                    initial_ready = len(buf) >= max(1, initial_chars) or "\n" in buf
+                    if initial_ready:
+                        await flush()
+                        continue
+                    deadline = (first_delta_at or now) + max(0.0, initial_delay)
+                else:
+                    deadline = last_edit + max(0.0, interval)
+
+                timeout = max(0.0, deadline - now)
+                if timeout == 0.0:
+                    await flush()
+                    continue
+
+            try:
+                if timeout is None:
+                    kind, value = await events.get()
+                else:
+                    kind, value = await asyncio.wait_for(events.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                await flush()
+                continue
+
+            consume_event(kind, value)
+            # 合并已到达的 delta，避免事件循环自身成为每 token 开销。
+            while not events.empty():
+                queued_kind, queued_value = events.get_nowait()
+                consume_event(queued_kind, queued_value)
+
+        # 回合结束时立即刷新 dirty 内容，不等待下一个定时周期。
+        await flush()
+
+        if producer_error is not None:
+            logger.error("流式回复异常", extra={"err": str(producer_error)[:200]})
+            interrupted = f"{buf}\n\n[输出中断: {producer_error}]" if buf else f"[输出中断: {producer_error}]"
+            if msg is not None:
+                await _send(None, interrupted, edit=True, msg=msg)
+            else:
+                await _send(target.reply_text, interrupted)
+        elif not buf:
+            # 工具型回合可能没有文本；若已发思考占位，不要将它永久留在聊天中。
+            if msg is None and placeholder is not None:
+                msg = placeholder.get("msg")
+            if msg is not None:
+                await _send(None, "(无输出)", edit=True, msg=msg)
+            else:
+                await _send(target.reply_text, "(无输出)")
     except Exception as e:
         logger.error("流式回复异常", extra={"err": str(e)[:200]})
         try:
@@ -512,6 +602,13 @@ async def stream_reply(update: Update, text_iter, interval: float, placeholder: 
             elif buf:
                 await _send(target.reply_text, f"{buf}\n\n[输出中断: {e}]")
         except Exception:
+            pass
+    finally:
+        if not producer.done():
+            producer.cancel()
+        try:
+            await producer
+        except asyncio.CancelledError:
             pass
 
 
@@ -815,6 +912,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await stream_reply(
             update, gen(), settings.stream_edit_interval,
             placeholder=placeholder, activity_holder=activity,
+            initial_delay=settings.stream_initial_delay,
+            initial_chars=settings.stream_initial_chars,
         )
     except PiBusyError:
         await reply_text(update, "⏳ 我正在处理上一条消息，请稍等…")
