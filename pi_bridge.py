@@ -273,7 +273,18 @@ class PiRpcClient:
     async def set_model(self, model_id: str) -> dict:
         await self.ensure_running()
         cmd_id = f"x{uuid.uuid4().hex[:8]}"
-        await self._send({"id": cmd_id, "type": "set_model", "modelId": model_id})
+        # pi RPC 的 set_model 需要 provider + modelId 同时匹配，缺 provider 会报
+        # "Model not found: undefined/<model>"（当前 provider 为 None 时按 id 反查兜底）
+        provider = self.provider
+        if not provider:
+            try:
+                for m in await self.get_available_models():
+                    if m.get("id") == model_id:
+                        provider = m.get("provider")
+                        break
+            except Exception:
+                pass
+        await self._send({"id": cmd_id, "type": "set_model", "provider": provider, "modelId": model_id})
         resp = await self._wait_response(cmd_id, timeout=60)
         if not resp.get("success"):
             raise PiError(f"set_model 失败: {resp}")
