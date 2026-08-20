@@ -180,9 +180,14 @@ def md_to_html(text: str) -> str:
 
     text = _escape_residual(text)
 
-    # 13) 恢复暂存的代码/表格/粗体等片段
-    for i, html in enumerate(sentinel):
-        text = text.replace(f"\x00S{i}\x00", html)
+    # 13) 恢复暂存的代码/表格/粗体等片段（可能嵌套，需迭代到无残留：
+    #     表格/粗体可能包裹行内代码的占位符，单遍顺序替换会漏掉内层）
+    while True:
+        prev = text
+        for i, html in enumerate(sentinel):
+            text = text.replace(f"\x00S{i}\x00", html)
+        if text == prev:
+            break
     return text
 
 
