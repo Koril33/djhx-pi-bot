@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # pi
     pi_cmd: str = "pi"                     # pi 可执行文件路径
     pi_provider: str = "deepseek"          # 默认 provider（透传给 pi）
-    pi_model: str = "deepseek-v4-flash"    # 默认模型
+    pi_model: str = "deepseek-flash"       # 默认模型（DeepSeek V4.1 Flash）
     pi_session_dir: str = "data/pi-sessions"  # pi 会话文件目录
 
     # 存储
