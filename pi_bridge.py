@@ -481,6 +481,9 @@ class PiRpcClient:
     async def abort(self) -> None:
         await self._command("abort")
 
-    async def steer(self, text: str) -> None:
-        """流式过程中插入新指令，并确认 pi 已接受。"""
-        await self._command("steer", message=text)
+    async def steer(self, text: str, images: list[dict] | None = None) -> None:
+        """流式过程中插入新指令（可附图片），并确认 pi 已接受。"""
+        fields: dict[str, Any] = {"message": text}
+        if images:
+            fields["images"] = images
+        await self._command("steer", **fields)

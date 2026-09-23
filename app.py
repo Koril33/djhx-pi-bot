@@ -126,16 +126,17 @@ async def process_queued_updates(
 
 
 def _update_priority(update: Update, manager: AgentManager | None) -> int:
-    """/stop 独占保留槽；忙碌会话里的新文本使用 steer 保留槽。"""
+    """/stop 独占保留槽；忙碌会话里的新文本或图片使用 steer 保留槽。"""
     message = update.message
     text = (message.text or "") if message is not None else ""
+    has_image = bool(message and (message.photo or message.document))
     callback = update.callback_query
     if text.strip() and text.split(maxsplit=1)[0].split("@", 1)[0] == "/stop":
         return 2
     if callback is not None and callback.data == "cmd:stop":
         return 2
     user = update.effective_user
-    if text and user is not None and manager is not None:
+    if (text or has_image) and user is not None and manager is not None:
         agent = manager._agents.get(user.id)
         if agent is not None and (agent.client.busy or getattr(agent, "prompt_pending", False)):
             return 1

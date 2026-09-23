@@ -7,9 +7,10 @@ V1 拓扑：单个环境（服务器本机），每用户一个常驻 pi RPC 进
   /session new [name] /session list /session use <id>
   /model list /model use <model_id>
   /stop
-普通文本：转发给 pi（常驻 RPC，流式回复）。
+普通文本与单张图片：转发给 pi（常驻 RPC，流式回复）。
 """
 import asyncio
+import base64
 import re
 import time
 from html import escape
@@ -36,6 +37,8 @@ from storage import Storage
 logger = get_logger("bot")
 
 MAX_HTML_LEN = 3900  # Telegram 消息上限 4096，转义/标签会膨胀，留余量
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 8192  # DeepSeek 单张图片的长/宽上限
 
 
 # ================= Markdown → Telegram HTML =================
@@ -734,7 +737,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🤖 djhx-pi-bot — 通过 Telegram 控制 pi 编码代理\n\n"
-        "直接发消息即可与 pi 对话，或点击下方快捷按钮。\n\n"
+        "直接发文字或单张图片即可与 pi 对话；图片可附说明文字。\n"
+        "图片支持 JPEG、PNG、GIF、WebP，最大 10 MiB；当前模型须支持图片输入。\n\n"
         "命令：\n"
         "/env list — 查看可用环境\n"
         "/env use <name> — 切换环境（V1 仅 server）\n"
@@ -1000,18 +1004,142 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ================= 普通消息 =================
 
+def _image_mime_type(data: bytes | bytearray) -> str | None:
+    """只根据实际文件头判断 pi 支持的图片格式，不信任 Telegram 元数据。"""
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR":
+        return "image/png"
+    if len(data) >= 4 and data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if len(data) >= 13 and data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 16 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _image_dimensions(data: bytes | bytearray, mime_type: str) -> tuple[int, int] | None:
+    """只读图片头中的宽高，不解码用户提供的像素数据。"""
+    if mime_type == "image/png" and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if mime_type == "image/gif" and len(data) >= 10:
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if mime_type == "image/webp":
+        if data[12:16] == b"VP8X" and len(data) >= 30:
+            return 1 + int.from_bytes(data[24:27], "little"), 1 + int.from_bytes(data[27:30], "little")
+        if data[12:16] == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
+            return int.from_bytes(data[26:28], "little") & 0x3fff, int.from_bytes(data[28:30], "little") & 0x3fff
+        if data[12:16] == b"VP8L" and len(data) >= 25 and data[20] == 0x2f:
+            return (
+                1 + data[21] + ((data[22] & 0x3f) << 8),
+                1 + (data[22] >> 6) + (data[23] << 2) + ((data[24] & 0x0f) << 10),
+            )
+    if mime_type == "image/jpeg":
+        pos = 2
+        sof_markers = {0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf}
+        while pos + 1 < len(data):
+            if data[pos] != 0xff:
+                return None
+            while pos < len(data) and data[pos] == 0xff:
+                pos += 1
+            if pos >= len(data):
+                return None
+            marker = data[pos]
+            pos += 1
+            if marker == 0xda or marker == 0xd9:
+                return None
+            if marker == 0x01 or 0xd0 <= marker <= 0xd8:
+                continue
+            if pos + 2 > len(data):
+                return None
+            length = int.from_bytes(data[pos:pos + 2], "big")
+            if length < 2 or pos + length > len(data):
+                return None
+            if marker in sof_markers:
+                if length < 7:
+                    return None
+                return int.from_bytes(data[pos + 5:pos + 7], "big"), int.from_bytes(data[pos + 3:pos + 5], "big")
+            pos += length
+    return None
+
+
+async def _download_image(message, *, user_id: int | None = None) -> dict[str, str]:
+    """下载一张 Telegram 图片，验证字节数及文件头后组装 pi RPC 请求。"""
+    media = message.photo[-1] if message.photo else message.document
+    if media is None:
+        raise ValueError("消息中没有图片")
+    if media.file_size is not None and media.file_size > MAX_IMAGE_BYTES:
+        raise ValueError("图片超过 10 MiB 限制，请压缩后重发")
+    try:
+        file = await media.get_file()
+        if file.file_size is not None and file.file_size > MAX_IMAGE_BYTES:
+            raise ValueError("图片超过 10 MiB 限制，请压缩后重发")
+        data = await file.download_as_bytearray()
+    except ValueError:
+        raise
+    except Exception as exc:
+        logger.warning("Telegram 图片下载失败", extra={"user_id": user_id, "err_type": type(exc).__name__})
+        raise ValueError("图片下载失败，请稍后重发") from None
+    if not data or len(data) > MAX_IMAGE_BYTES:
+        raise ValueError("图片为空或超过 10 MiB 限制，请重发")
+    mime_type = _image_mime_type(data)
+    if mime_type is None:
+        raise ValueError("图片格式无效；仅支持 JPEG、PNG、GIF、WebP")
+    dimensions = _image_dimensions(data, mime_type)
+    if dimensions is None or min(dimensions) < 1:
+        raise ValueError("无法读取图片尺寸，文件可能已损坏")
+    if max(dimensions) > MAX_IMAGE_DIMENSION:
+        raise ValueError("图片宽或高超过 8192 像素，请缩小后重发")
+    return {"type": "image", "data": base64.b64encode(data).decode("ascii"), "mimeType": mime_type}
+
+
+async def _model_accepts_images(client: PiRpcClient) -> bool:
+    """从 pi 当前模型的能力元数据确认图片支持，避免图片被静默丢弃。"""
+    state = await client.get_state()
+    model = state.get("model")
+    if isinstance(model, dict) and isinstance(model.get("input"), list):
+        return "image" in model["input"]
+    raise ValueError("无法确认当前模型的图片能力，请用 /model list 选择带 🖼 标记的模型后重发")
+
+
+async def _prepare_images(client: PiRpcClient, message, *, user_id: int | None = None) -> list[dict[str, str]]:
+    if not await _model_accepts_images(client):
+        raise ValueError("当前模型不支持图片输入，请用 /model list 选择带 🖼 标记的模型后重发")
+    return [await _download_image(message, user_id=user_id)]
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     settings = context.bot_data["settings"]
     storage = context.bot_data["storage"]
     manager = context.bot_data["manager"]
-    agent = manager.get(user.id)
-    text = update.message.text or ""
+    message = update.message
+    has_image = bool(message.photo or message.document)
+    text = message.text or message.caption or ""
+    if has_image and not text.strip():
+        text = "请分析这张图片。"
     chat = update.effective_chat
     owns_prompt = False
 
+    # 相册由多条独立 Update 组成；逐条提交会丢失图片顺序或让后续图片撞上忙碌状态。
+    # 当前明确要求单张发送，并在同一相册内只提示一次。
+    if has_image and message.media_group_id:
+        notices = context.bot_data.setdefault("image_album_notices", {})
+        now = time.monotonic()
+        for key, seen_at in list(notices.items()):
+            if now - seen_at > 300:
+                del notices[key]
+        key = (user.id, message.media_group_id)
+        if key not in notices:
+            notices[key] = now
+            try:
+                await reply_text(update, "⚠️ 暂不支持相册合并处理，请将图片逐张发送")
+            except Exception:
+                notices.pop(key, None)
+                raise
+        return
+
+    agent = manager.get(user.id)
     storage.ensure_user(user.id, user.username)
-    logger.info("收到消息", extra={"user_id": user.id, "chat_id": chat.id, "text_len": len(text)})
+    logger.info("收到消息", extra={"user_id": user.id, "chat_id": chat.id, "text_len": len(text), "has_image": has_image})
 
     # typing 持续刷新：Telegram 的 typing 约 5 秒过期，深度思考期长时保持反馈
     stop_typing = asyncio.Event()
@@ -1030,43 +1158,55 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keepalive = asyncio.create_task(typing_keepalive())
 
     try:
-        try:
-            await agent.ensure_client()
-        except Exception as e:
-            logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
-            await reply_text(update, f"⚠️ pi 进程启动失败: {_friendly_error(e)}")
-            return
-
         if agent.control_lock.locked():
-            await reply_text(update, "⏳ 会话或模型正在切换，请稍后再发")
+            await reply_text(update, "⏳ 正在准备上一条消息或切换会话/模型，请稍后再发")
             return
 
-        # 会话自动命名：默认会话的第一条消息作为会话名
-        await _auto_name_session(storage, user.id, text)
-
-        # 流式中途介入：pi 忙时插入 steer 而非拒绝
-        if agent.prompt_pending and not agent.client.busy:
-            for _ in range(100):
-                if agent.client.busy or not agent.prompt_pending:
-                    break
-                await asyncio.sleep(0.05)
-        if agent.client.busy:
+        # 与 /model、/session 共用锁，保证图片能力检查和下载期间模型、会话不切换。
+        # 在锁内依据最新 busy 状态选择 steer 或保留下一次 prompt。
+        async with agent.control_lock:
             try:
-                await agent.client.steer(text)
-                await reply_text(update, "↩️ pi 已收到新指令，将在当前任务中处理")
+                await agent.ensure_client()
             except Exception as e:
-                logger.exception("插入指令失败", extra={"user_id": user.id})
-                await reply_text(update, f"⚠️ 插入指令失败: {_friendly_error(e)}")
-            return
-        if agent.prompt_pending:
-            await reply_text(update, "⏳ 当前任务正在启动，请稍后再发")
-            return
-        if agent.control_lock.locked():
-            await reply_text(update, "⏳ 会话或模型正在切换，请稍后再发")
-            return
-        # 此处到设置标记没有 await；同一事件循环里的两条消息不会同时占用 prompt。
-        agent.prompt_pending = True
-        owns_prompt = True
+                logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
+                await reply_text(update, f"⚠️ pi 进程启动失败: {_friendly_error(e)}")
+                return
+
+            # 图片下载可能耗时，先完成校验，再依据最新的 busy 状态选择 steer 或 prompt。
+            # 否则当前回合可能在下载期间结束，图片被提交到空闲 steer 队列。
+            images = None
+            if has_image:
+                try:
+                    images = await _prepare_images(agent.client, message, user_id=user.id)
+                except ValueError as exc:
+                    await reply_text(update, f"⚠️ {exc}")
+                    return
+
+            # 会话自动命名：默认会话的第一条消息作为会话名
+            await _auto_name_session(storage, user.id, text)
+
+            # 流式中途介入：pi 忙时插入 steer 而非拒绝
+            if agent.prompt_pending and not agent.client.busy:
+                for _ in range(100):
+                    if agent.client.busy or not agent.prompt_pending:
+                        break
+                    await asyncio.sleep(0.05)
+            if agent.client.busy:
+                try:
+                    if has_image:
+                        await agent.client.steer(text, images=images)
+                    else:
+                        await agent.client.steer(text)
+                    await reply_text(update, "↩️ pi 已收到新指令，将在当前任务中处理")
+                except Exception as e:
+                    logger.exception("插入指令失败", extra={"user_id": user.id})
+                    await reply_text(update, f"⚠️ 插入指令失败: {_friendly_error(e)}")
+                return
+            if agent.prompt_pending:
+                await reply_text(update, "⏳ 当前任务正在启动，请稍后再发")
+                return
+            agent.prompt_pending = True
+            owns_prompt = True
 
         # 思考占位 + 工具活动状态
         placeholder = {"msg": None}
@@ -1085,6 +1225,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         async def gen():
             async for delta in agent.client.prompt(
                 text,
+                images=images,
                 on_thinking=on_thinking,
                 on_tool=on_tool,
             ):
@@ -1194,6 +1335,10 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         await reply_text(update, "未知命令，/help 查看帮助")
 
     app.add_handler(MessageHandler(filters.COMMAND, lambda u, c: auth_guard(u, c, unknown_command)))
+    app.add_handler(MessageHandler(
+        filters.PHOTO | filters.Document.ALL,
+        lambda u, c: auth_guard(u, c, on_text),
+    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: auth_guard(u, c, on_text)))
 
     return app

@@ -285,6 +285,24 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         data["message"]["text"] = "/stop"
         self.assertEqual(bot_app._update_priority(Update.de_json(data, self.tg_app.bot), manager), 2)
 
+    async def test_busy_user_photo_uses_reserved_steer_capacity(self):
+        data = {
+            "update_id": 8,
+            "message": {
+                "message_id": 2,
+                "date": 0,
+                "chat": {"id": 1, "type": "private"},
+                "from": {"id": 1, "is_bot": False, "first_name": "User"},
+                "photo": [{"file_id": "photo-id", "file_unique_id": "unique", "width": 32, "height": 32}],
+                "caption": "看看这张图片",
+            },
+        }
+        update = Update.de_json(data, self.tg_app.bot)
+        manager = SimpleNamespace(
+            _agents={1: SimpleNamespace(client=SimpleNamespace(busy=True), prompt_pending=False)}
+        )
+        self.assertEqual(bot_app._update_priority(update, manager), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

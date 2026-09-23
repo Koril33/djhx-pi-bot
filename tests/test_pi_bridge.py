@@ -105,11 +105,17 @@ class PiRpcClientTests(unittest.IsolatedAsyncioTestCase):
             prompt_task = asyncio.create_task(consume())
             await asyncio.wait_for(first_delta.wait(), 1)
             state, _ = await asyncio.wait_for(
-                asyncio.gather(self.client.get_state(), self.client.steer("change")), 1
+                asyncio.gather(
+                    self.client.get_state(),
+                    self.client.steer("change", images=[{"type": "image", "data": "YWJj", "mimeType": "image/png"}]),
+                ), 1
             )
             result = await asyncio.wait_for(prompt_task, 1)
         self.assertEqual(state["sessionId"], "s1")
         self.assertEqual(result, "AB")
+        self.assertEqual(outstanding["steer"]["images"], [
+            {"type": "image", "data": "YWJj", "mimeType": "image/png"}
+        ])
 
     async def test_stdout_eof_fails_request_immediately_and_next_command_restarts(self) -> None:
         def on_first(command):
