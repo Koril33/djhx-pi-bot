@@ -7,7 +7,7 @@
 ```
 Telegram ←→ nginx(TLS) ←→ FastAPI webhook ←→ python-telegram-bot
                                               └→ 常驻 pi --mode rpc 子进程 (JSONL over stdio)
-                                              └→ SQLite (用户/会话映射)
+                                              └→ SQLite (用户/会话映射、Telegram 更新队列)
 ```
 
 - V1 单环境（服务器本机）：bot 进程直接管理常驻 pi RPC 子进程
@@ -56,3 +56,10 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 - Gitea 仓库 → 设置 → Web 钩子 → 添加：URL 填 `https://pi.djhx.site/deploy-webhook/<secret>`（Gitea 类型，Push 事件，Secret 填 DEPLOY_SECRET）
 - 部署日志：`logs/deploy.log`；服务日志：`journalctl -u djhx-pi-bot -f`
 - 回滚：`git push gitea <上一commit>:main`
+
+## 故障排查
+
+- `curl http://127.0.0.1:8128/healthz` 查看更新队列的待处理、处理中和失败数量。`degraded: true` 表示有更新需要检查。
+- `journalctl -u djhx-pi-bot --since '1 hour ago' --no-pager` 查看 bot、pi RPC 和 Telegram 发送错误；`logs/deploy.log` 记录部署过程。
+- 已开始处理的 Telegram 更新若因服务重启或异常而中断，会记录为失败，不会自动重放可能已执行工具的请求。确认结果后由用户重新发送。
+- 推送到 Gitea `main` 后，查看部署日志中的目标提交和 `systemctl restart`，再核对 `/healthz`。服务器上直接修改代码时，先提交并推送，保持部署工作区干净。

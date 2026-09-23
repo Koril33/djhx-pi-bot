@@ -18,7 +18,7 @@ import httpx
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -192,7 +192,7 @@ def md_to_html(text: str) -> str:
 
 
 # Telegram API 网络类异常（服务器→TG 偶发抖动，AGENTS.md 已记载）：重试而非中断
-_TG_NET_EXC = (httpx.TransportError, asyncio.TimeoutError, TimeoutError)
+_TG_NET_EXC = (NetworkError, httpx.TransportError, asyncio.TimeoutError, TimeoutError)
 
 
 def _split_markdown_blocks(text: str) -> list[str]:
@@ -218,20 +218,71 @@ def _split_markdown_blocks(text: str) -> list[str]:
 
 
 def split_markdown(text: str, max_html_len: int = MAX_HTML_LEN) -> list[str]:
-    """按块切 markdown：每段 md_to_html 后 ≤ max_html_len，且不切断代码块。
-
-    切段基于「实际 HTML 长度」而非原始字符数，避免转义膨胀（< → &lt; 等）导致超限降级。
-    单个超长代码块（>max_html_len）无法再切，作为独立一段交由 _send 降级兜底。
-    """
+    """按渲染后的 HTML 长度分段；超长单行和代码块也必须拆开。"""
     if not text:
         return [text]
-    blocks = _split_markdown_blocks(text)
+
+    def fits(part: str) -> bool:
+        return (
+            len(md_to_html(part)) <= max_html_len
+            and len(part.encode("utf-16-le")) // 2 <= 4096
+        )
+
+    def split_long_line(line: str, prefix: str = "", suffix: str = "") -> list[str]:
+        """将单行拆成可发送片段，代码块可通过 prefix/suffix 逐段闭合。"""
+        parts = []
+        while line:
+            low, high = 1, len(line)
+            best = 0
+            while low <= high:
+                mid = (low + high) // 2
+                if fits(prefix + line[:mid] + suffix):
+                    best = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            if not best:
+                raise ValueError("Telegram 消息长度上限不足以容纳一个字符")
+            parts.append(prefix + line[:best] + suffix)
+            line = line[best:]
+        return parts
+
+    blocks: list[str] = []
+    for block in _split_markdown_blocks(text):
+        if fits(block):
+            blocks.append(block)
+            continue
+        if block.lstrip().startswith("```") and "\n" in block:
+            opening, _, rest = block.partition("\n")
+            body = rest.rsplit("```", 1)[0] if rest.rstrip().endswith("```") else rest
+            # 重新闭合每一段，确保 Telegram HTML 的 <pre> 标签合法。
+            prefix, suffix = opening + "\n", "\n```"
+            if fits(prefix + "x" + suffix):
+                pending: str | None = None
+                for line in body.split("\n"):
+                    candidate = pending + "\n" + line if pending is not None else line
+                    if fits(prefix + candidate + suffix):
+                        pending = candidate
+                        continue
+                    if pending is not None:
+                        blocks.append(prefix + pending + suffix)
+                        pending = None
+                    if fits(prefix + line + suffix):
+                        pending = line
+                    else:
+                        blocks.extend(split_long_line(line, prefix, suffix))
+                if pending is not None:
+                    blocks.append(prefix + pending + suffix)
+                continue
+        for line in block.split("\n"):
+            blocks.extend(split_long_line(line) if line else [""])
+
     chunks: list[str] = []
     cur: list[str] = []
     for block in blocks:
         cur.append(block)
-        if len(cur) > 1 and len(md_to_html("\n".join(cur))) > max_html_len:
-            chunks.append("\n".join(cur[:-1]) + "\n")  # 补回段末换行
+        if len(cur) > 1 and not fits("\n".join(cur)):
+            chunks.append("\n".join(cur[:-1]))
             cur = [block]
     if cur:
         chunks.append("\n".join(cur))
@@ -307,19 +358,19 @@ def _tool_activity(tool_name: str, phase: str, args: dict | None) -> str | None:
 def _friendly_error(e: Exception) -> str:
     """把内部异常映射成用户可读的友好文案。"""
     msg = str(e)
-    if "超时" in msg or "timeout" in msg.lower():
-        return "⏱️ 处理超时，已中止当前任务，可重新发送"
+    if isinstance(e, (TimeoutError, asyncio.TimeoutError)) or "超时" in msg or "timeout" in msg.lower():
+        return "⏱️ 处理超时，请重新发送；如持续出现请联系管理员"
     if "熔断" in msg or "频繁崩溃" in msg:
         return "⚠️ 推理服务暂时不可用（频繁崩溃已熔断），请稍后重试"
     if "未运行" in msg or "未就绪" in msg or "未启动" in msg:
         return "⚠️ 推理服务未就绪，请稍后重试"
-    return f"⚠️ {msg}"
+    return f"⚠️ {msg}" if msg else "⚠️ 处理失败，请稍后重试"
 
 
 def _render(text: str, activity_holder: dict | None) -> str:
     """正文 + 当前工具活动行（活动行附在末尾）。"""
     if activity_holder and activity_holder.get("current"):
-        return f"{text}\n\n{activity_holder['current']}"
+        return f"{text}\n\n{activity_holder['current']}" if text else activity_holder["current"]
     return text
 
 
@@ -340,37 +391,45 @@ async def _send(
     msg=None,
     reply_markup=None,
 ):
-    """发送/编辑消息：优先 HTML 渲染；网络异常重试 3 次；BadRequest 降级纯文本。
-
-    返回：编辑成功 → True；编辑失败 → False；发送成功 → Message；发送失败 → None。
-    """
+    """发送/编辑消息；格式错误降级纯文本，网络错误重试，失败向调用者抛出。"""
     html = md_to_html(text)
+    plain = strip_markdown(text)
+    use_html = True
     for attempt in range(3):
         try:
             if edit:
-                await msg.edit_text(html, parse_mode=ParseMode.HTML)
+                if use_html:
+                    await msg.edit_text(html, parse_mode=ParseMode.HTML)
+                else:
+                    await msg.edit_text(plain)
                 return True
-            return await send_fn(html, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            if use_html:
+                return await send_fn(html, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            return await send_fn(plain, reply_markup=reply_markup)
         except BadRequest as e:
-            if "Message is not modified" in str(e):
+            if edit and "Message is not modified" in str(e):
                 # 内容未变化（流式中途停顿），无需更新，视为成功
-                return True if edit else None
+                return True
+            if not use_html:
+                logger.error("Telegram 纯文本发送失败", extra={"err": str(e)[:300], "edit": edit})
+                raise
             logger.warning("HTML 渲染失败，降级纯文本", extra={"err": str(e)[:200]})
-            try:
-                if edit:
-                    await msg.edit_text(strip_markdown(text))
-                    return True
-                return await send_fn(strip_markdown(text), reply_markup=reply_markup)
-            except Exception:
-                return True if edit else None
+            use_html = False
+        except RetryAfter as e:
+            if attempt == 2:
+                logger.error("Telegram 限流重试耗尽", extra={"err": str(e)[:300], "edit": edit})
+                raise
+            delay = e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds") else float(e.retry_after)
+            await asyncio.sleep(max(0.5, delay))
         except _TG_NET_EXC as e:
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            logger.warning("Telegram API 网络异常，重试耗尽", extra={"err": str(e)[:200]})
-            return True if edit else None
+            if attempt == 2:
+                logger.error("Telegram API 网络异常，重试耗尽", extra={"err": str(e)[:300], "edit": edit})
+                raise
+            await asyncio.sleep(0.5 * (attempt + 1))
         except Exception:
-            return True if edit else None
+            logger.exception("Telegram 消息发送失败", extra={"edit": edit})
+            raise
+    raise RuntimeError("Telegram 消息发送失败：重试次数耗尽")
 
 
 class AgentSession:
@@ -380,6 +439,8 @@ class AgentSession:
         self.user_id = user_id
         self.settings = settings
         self.storage = storage
+        self.prompt_pending = False
+        self.control_lock = asyncio.Lock()
         self.client = PiRpcClient(
             pi_cmd=settings.pi_cmd,
             session_dir=settings.pi_session_dir,
@@ -398,8 +459,8 @@ class AgentSession:
         await self.ensure_default_session()
         active = self.storage.get_active_session(self.user_id)
         session_file = active["pi_session_file"] if active else None
-        if self.client.proc is None or self.client.proc.returncode is not None:
-            await self.client.ensure_running(session_file)
+        # 进程仍存活但 stdout reader 已失效时，也必须按当前会话文件重启。
+        await self.client.ensure_running(session_file)
         # 首次同步 pi 侧会话文件路径
         if active and not active["pi_session_file"]:
             try:
@@ -436,7 +497,12 @@ class AgentManager:
 def authorized(update: Update, settings: Settings) -> bool:
     if not settings.allowed_ids:
         return False
-    return update.effective_user is not None and update.effective_user.id in settings.allowed_ids
+    return (
+        update.effective_user is not None
+        and update.effective_user.id in settings.allowed_ids
+        and update.effective_chat is not None
+        and update.effective_chat.type == "private"
+    )
 
 
 async def reply_text(update: Update, text: str, reply_markup=None) -> None:
@@ -483,6 +549,8 @@ async def stream_reply(
     last_edit = 0.0
 
     events: asyncio.Queue[tuple[str, object | None]] = asyncio.Queue()
+    if activity_holder is not None:
+        activity_holder["notify"] = lambda: events.put_nowait(("activity", None))
 
     async def produce() -> None:
         try:
@@ -504,6 +572,10 @@ async def stream_reply(
                 first_delta_at = time.monotonic()
             buf += str(value or "")
             dirty = True
+        elif kind == "activity":
+            if first_delta_at is None:
+                first_delta_at = time.monotonic()
+            dirty = True
         elif kind == "error" and isinstance(value, Exception):
             producer_error = value
         elif kind == "done":
@@ -512,14 +584,16 @@ async def stream_reply(
     async def flush(*, force: bool = False) -> None:
         """把当前 dirty 快照刷新到 Telegram；仅此处执行 Markdown 分段。"""
         nonlocal msg, buf, dirty, first_text_rendered, last_edit
-        if (not dirty and not force) or not buf:
+        if not dirty and not force:
+            return
+        if not buf and (not activity_holder or not activity_holder.get("current")) and not first_text_rendered:
             return
 
         # 思考占位若已发出，直接编辑它，避免多发一条消息。
         if msg is None and placeholder is not None and placeholder.get("msg") is not None:
             msg = placeholder["msg"]
 
-        chunks = split_markdown(buf)
+        chunks = split_markdown(buf) if buf else []
         if len(chunks) > 1:
             # 已闭合的段落地后从 buf 移除，后续只重新解析未完成的尾段。
             for chunk in chunks[:-1]:
@@ -531,7 +605,7 @@ async def stream_reply(
                 msg = await _send(target.reply_text, "…")
             buf = chunks[-1]
 
-        rendered = _render(buf, activity_holder)
+        rendered = _render(buf, activity_holder) or "🤔 正在处理…"
         if msg is None:
             msg = await _send(target.reply_text, rendered)
         else:
@@ -548,7 +622,11 @@ async def stream_reply(
 
             if dirty:
                 if not first_text_rendered:
-                    initial_ready = len(buf) >= max(1, initial_chars) or "\n" in buf
+                    initial_ready = (
+                        len(buf) >= max(1, initial_chars)
+                        or "\n" in buf
+                        or bool(activity_holder and activity_holder.get("current"))
+                    )
                     if initial_ready:
                         await flush()
                         continue
@@ -577,12 +655,22 @@ async def stream_reply(
                 consume_event(queued_kind, queued_value)
 
         # 回合结束时立即刷新 dirty 内容，不等待下一个定时周期。
+        if activity_holder is not None and activity_holder.get("current"):
+            activity_holder["current"] = None
+            dirty = True
         await flush()
 
         if producer_error is not None:
-            logger.error("流式回复异常", extra={"err": str(producer_error)[:200]})
-            interrupted = f"{buf}\n\n[输出中断: {producer_error}]" if buf else f"[输出中断: {producer_error}]"
-            if msg is not None:
+            logger.error(
+                "流式回复异常",
+                exc_info=(type(producer_error), producer_error, producer_error.__traceback__),
+                extra={"err_type": type(producer_error).__name__, "err": str(producer_error)[:200]},
+            )
+            reason = _friendly_error(producer_error)
+            interrupted = f"[输出中断：{reason}]"
+            if msg is None and placeholder is not None:
+                msg = placeholder.get("msg")
+            if msg is not None and not buf:
                 await _send(None, interrupted, edit=True, msg=msg)
             else:
                 await _send(target.reply_text, interrupted)
@@ -595,15 +683,22 @@ async def stream_reply(
             else:
                 await _send(target.reply_text, "(无输出)")
     except Exception as e:
-        logger.error("流式回复异常", extra={"err": str(e)[:200]})
+        logger.exception("流式回复发送异常", extra={"err_type": type(e).__name__, "err": str(e)[:200]})
+        if isinstance(e, (*_TG_NET_EXC, RetryAfter)):
+            raise
+        reason = _friendly_error(e)
+        interrupted = f"[输出中断：{reason}]"
         try:
-            if msg is not None:
-                await _send(None, f"{buf}\n\n[输出中断: {e}]", edit=True, msg=msg)
-            elif buf:
-                await _send(target.reply_text, f"{buf}\n\n[输出中断: {e}]")
+            if msg is not None and not buf:
+                await _send(None, interrupted, edit=True, msg=msg)
+            else:
+                await _send(target.reply_text, interrupted)
         except Exception:
-            pass
+            logger.exception("流式错误提示发送失败")
+            raise
     finally:
+        if activity_holder is not None:
+            activity_holder.pop("notify", None)
         if not producer.done():
             producer.cancel()
         try:
@@ -672,7 +767,7 @@ async def cmd_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_text(update, "用法：/env list | /env use <name>")
 
 
-async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     settings = context.bot_data["settings"]
     storage = context.bot_data["storage"]
@@ -681,20 +776,41 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = context.args
     sub = args[0] if args else ""
 
+    if sub in {"new", "use"} and (agent.client.busy or agent.prompt_pending):
+        await reply_text(update, "⏳ 当前任务仍在运行，请完成或 /stop 后再切换会话")
+        return
+
     if sub == "new":
         name = " ".join(args[1:]).strip() or f"会话-{len(storage.list_sessions(user.id)) + 1}"
+        previous_file = None
+        switched = False
         try:
-            sid = storage.create_session(user.id, name)
-            storage.set_active(sid)
-            await agent.ensure_client()  # 确保进程在跑
+            await agent.ensure_client()
+            previous = storage.get_active_session(user.id)
+            previous_file = previous["pi_session_file"] if previous else None
+            if not previous_file:
+                previous_file = (await agent.client.get_state()).get("sessionFile")
+                if previous and previous_file:
+                    storage.set_pi_session_file(previous["id"], previous_file)
+            if not previous_file:
+                raise PiError("无法确认当前 pi 会话文件，请稍后重试")
             await agent.client.new_session(name)
+            switched = True
             state = await agent.client.get_state()
-            if state.get("sessionFile"):
-                storage.set_pi_session_file(sid, state["sessionFile"])
-            await reply_text(update, f"✅ 已新建会话「{name}」\nID: {sid}")
+            session_file = state.get("sessionFile")
+            if not session_file:
+                raise PiError("pi 未返回新会话文件")
+            sid = storage.create_session_with_file_and_activate(user.id, name, session_file)
         except Exception as e:
-            logger.error("新建会话失败", extra={"user_id": user.id, "err": str(e)[:300]})
-            await reply_text(update, f"新建会话失败: {e}")
+            logger.exception("新建会话失败", extra={"user_id": user.id, "err": str(e)[:300]})
+            if switched and previous_file:
+                try:
+                    await agent.client.switch_session(previous_file)
+                except Exception:
+                    logger.exception("恢复旧 pi 会话失败", extra={"user_id": user.id})
+            await reply_text(update, f"新建会话失败：{_friendly_error(e)}")
+        else:
+            await reply_text(update, f"✅ 已新建会话「{name}」\nID: {sid}")
 
     elif sub == "list":
         rows = storage.list_sessions(user.id)
@@ -733,15 +849,30 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await reply_text(update, "用法：/session new [名称] | /session list | /session use <id>")
 
 
-async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sub = context.args[0] if context.args else ""
+    if sub not in {"new", "use"}:
+        await _cmd_session_unlocked(update, context)
+        return
+    agent = context.bot_data["manager"].get(update.effective_user.id)
+    async with agent.control_lock:
+        await _cmd_session_unlocked(update, context)
+
+
+async def _cmd_model_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     manager = context.bot_data["manager"]
     agent = manager.get(user.id)
     args = context.args
     sub = args[0] if args else ""
 
+    if sub == "use" and (agent.client.busy or agent.prompt_pending):
+        await reply_text(update, "⏳ 当前任务仍在运行，请完成或 /stop 后再切换模型")
+        return
+
     if sub == "list":
         try:
+            await agent.ensure_client()
             models = await agent.client.get_available_models()
             buttons = []
             for m in models:
@@ -757,6 +888,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await reply_text(update, "用法：/model use <model_id>")
             return
         try:
+            await agent.ensure_client()
             await agent.client.set_model(args[1])
             await reply_text(update, f"✅ 已切换模型: {args[1]}")
         except Exception as e:
@@ -767,12 +899,35 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_text(update, "用法：/model list | /model use <model_id>")
 
 
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sub = context.args[0] if context.args else ""
+    if sub != "use":
+        await _cmd_model_unlocked(update, context)
+        return
+    agent = context.bot_data["manager"].get(update.effective_user.id)
+    async with agent.control_lock:
+        await _cmd_model_unlocked(update, context)
+
+
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     manager = context.bot_data["manager"]
     agent = manager.get(user.id)
-    await agent.client.abort()
-    await reply_text(update, "⏹ 已发送中止指令")
+    if agent.prompt_pending and not agent.client.busy:
+        for _ in range(100):
+            if agent.client.busy or not agent.prompt_pending:
+                break
+            await asyncio.sleep(0.05)
+    if not agent.client.busy:
+        await reply_text(update, "当前没有正在运行的任务")
+        return
+    try:
+        await agent.client.abort()
+    except Exception as e:
+        logger.exception("中止任务失败", extra={"user_id": user.id})
+        await reply_text(update, f"中止任务失败：{_friendly_error(e)}")
+        return
+    await reply_text(update, "⏹ pi 已确认中止指令")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -794,6 +949,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ]
     # 追加 pi 会话详情（消息数 / 压缩状态），拿不到不阻塞主状态展示
     try:
+        if not proc or proc.returncode is not None:
+            raise PiError("pi 进程未运行")
+        await agent.ensure_client()
         state = await agent.client.get_state()
         mc = state.get("messageCount")
         if mc is not None:
@@ -850,6 +1008,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     agent = manager.get(user.id)
     text = update.message.text or ""
     chat = update.effective_chat
+    owns_prompt = False
 
     storage.ensure_user(user.id, user.username)
     logger.info("收到消息", extra={"user_id": user.id, "chat_id": chat.id, "text_len": len(text)})
@@ -878,17 +1037,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await reply_text(update, f"⚠️ pi 进程启动失败: {_friendly_error(e)}")
             return
 
+        if agent.control_lock.locked():
+            await reply_text(update, "⏳ 会话或模型正在切换，请稍后再发")
+            return
+
         # 会话自动命名：默认会话的第一条消息作为会话名
         await _auto_name_session(storage, user.id, text)
 
         # 流式中途介入：pi 忙时插入 steer 而非拒绝
+        if agent.prompt_pending and not agent.client.busy:
+            for _ in range(100):
+                if agent.client.busy or not agent.prompt_pending:
+                    break
+                await asyncio.sleep(0.05)
         if agent.client.busy:
             try:
                 await agent.client.steer(text)
-                await reply_text(update, "↩️ 已插入新指令，当前任务完成后将按新方向继续")
+                await reply_text(update, "↩️ pi 已收到新指令，将在当前任务中处理")
             except Exception as e:
+                logger.exception("插入指令失败", extra={"user_id": user.id})
                 await reply_text(update, f"⚠️ 插入指令失败: {_friendly_error(e)}")
             return
+        if agent.prompt_pending:
+            await reply_text(update, "⏳ 当前任务正在启动，请稍后再发")
+            return
+        if agent.control_lock.locked():
+            await reply_text(update, "⏳ 会话或模型正在切换，请稍后再发")
+            return
+        # 此处到设置标记没有 await；同一事件循环里的两条消息不会同时占用 prompt。
+        agent.prompt_pending = True
+        owns_prompt = True
 
         # 思考占位 + 工具活动状态
         placeholder = {"msg": None}
@@ -900,6 +1078,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         def on_tool(tool_name: str, phase: str, args: dict | None) -> None:
             activity["current"] = _tool_activity(tool_name, phase, args)
+            notify = activity.get("notify")
+            if notify is not None:
+                notify()
 
         async def gen():
             async for delta in agent.client.prompt(
@@ -923,6 +1104,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("处理消息异常", extra={"user_id": user.id, "err": str(e)[:500]})
         await reply_text(update, f"⚠️ 处理出错: {_friendly_error(e)}")
     finally:
+        if owns_prompt:
+            agent.prompt_pending = False
         stop_typing.set()
         keepalive.cancel()
         try:
@@ -1006,9 +1189,11 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         h.callback = lambda u, c, inner=inner: auth_guard(u, c, inner)
         app.add_handler(h)
 
-    # 未知命令提示
-    app.add_handler(MessageHandler(filters.COMMAND, lambda u, c: reply_text(u, "未知命令，/help 查看帮助")))
-    # 普通文本
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # 未知命令与普通文本走同一鉴权入口。
+    async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await reply_text(update, "未知命令，/help 查看帮助")
+
+    app.add_handler(MessageHandler(filters.COMMAND, lambda u, c: auth_guard(u, c, unknown_command)))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: auth_guard(u, c, on_text)))
 
     return app

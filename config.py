@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     # 服务
     host: str = "127.0.0.1"
     port: int = 8128
+    webhook_queue_capacity: int = 1000
+    webhook_worker_concurrency: int = 8
+    webhook_steer_concurrency: int = 4
+    webhook_max_bytes: int = 2 * 1024 * 1024
+    shutdown_drain_seconds: float = 30.0
+    deploy_require_signature: bool = False  # 旧 Gitea hook 仅配置 URL 密钥时保持兼容
+    deploy_repo_full_name: str = ""         # 可设为 koril/djhx-pi-bot，校验 payload 来源仓库
 
     # 日志
     log_level: str = "INFO"
@@ -44,6 +51,29 @@ class Settings(BaseSettings):
     @property
     def allowed_ids(self) -> set[int]:
         return {int(x) for x in self.allowed_user_ids.split(",") if x.strip().isdigit()}
+
+    def validate_runtime(self) -> None:
+        """启动时尽早暴露会令所有请求失效的配置错误。"""
+        missing = [
+            name for name, value in (
+                ("BOT_TOKEN", self.bot_token),
+                ("WEBHOOK_SECRET", self.webhook_secret),
+            ) if not value
+        ]
+        if missing:
+            raise ValueError(f"缺少必要配置: {', '.join(missing)}")
+        ids = [part.strip() for part in self.allowed_user_ids.split(",") if part.strip()]
+        if not ids or any(not part.isdigit() for part in ids):
+            raise ValueError("ALLOWED_USER_IDS 必须是非空、逗号分隔的 Telegram 用户 ID")
+        if (
+            self.webhook_queue_capacity < 1
+            or self.webhook_worker_concurrency < 1
+            or self.webhook_steer_concurrency < 1
+            or self.webhook_max_bytes < 1024
+        ):
+            raise ValueError("Webhook 队列容量或请求大小限制无效")
+        if self.shutdown_drain_seconds <= 0:
+            raise ValueError("SHUTDOWN_DRAIN_SECONDS 必须大于 0")
 
 
 @lru_cache
