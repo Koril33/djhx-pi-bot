@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from pi_bridge import PiError, PiRpcClient
+from pi_bridge import PiBusyError, PiError, PiRpcClient
 
 
 class FakeStdin:
@@ -196,6 +196,51 @@ class PiRpcClientTests(unittest.IsolatedAsyncioTestCase):
                 await self.client.new_session("test")
             with self.assertRaisesRegex(PiError, "取消"):
                 await self.client.switch_session("/tmp/session.jsonl")
+
+    async def test_named_new_session_sends_name_field_without_argument_collision(self) -> None:
+        def on_command(command):
+            proc.emit({"id": command["id"], "type": "response", "command": command["type"],
+                       "success": True, "data": {}})
+
+        proc = FakeProc(on_command)
+        with patch("pi_bridge.asyncio.create_subprocess_exec", return_value=proc):
+            await self.client.new_session("回归测试")
+        self.assertEqual([command["type"] for command in proc.commands], ["new_session", "set_session_name"])
+        self.assertEqual(proc.commands[1]["name"], "回归测试")
+
+    async def test_live_process_reconnects_when_requested_session_differs(self) -> None:
+        first = FakeProc()
+        second = FakeProc()
+        starts = []
+
+        async def spawn(*args, **kwargs):
+            starts.append(args)
+            return (first, second)[len(starts) - 1]
+
+        with patch("pi_bridge.asyncio.create_subprocess_exec", side_effect=spawn):
+            await self.client.ensure_running("/sessions/old.jsonl")
+            self.client._session_file = None  # pi 已创建新会话，但 DB 仍指向旧会话。
+            self.client.busy = True
+            with self.assertRaises(PiBusyError):
+                await self.client.ensure_running("/sessions/old.jsonl")
+            self.assertIsNone(first.returncode)
+            self.client.busy = False
+            await self.client.ensure_running("/sessions/old.jsonl")
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(starts[1][starts[1].index("--session") + 1], "/sessions/old.jsonl")
+
+    async def test_session_name_failure_does_not_report_created_session_as_failed(self) -> None:
+        def on_command(command):
+            success = command["type"] != "set_session_name"
+            proc.emit({"id": command["id"], "type": "response", "command": command["type"],
+                       "success": success, "error": "naming unavailable" if not success else None,
+                       "data": {"sessionFile": "/new.jsonl"} if success else {}})
+
+        proc = FakeProc(on_command)
+        with patch("pi_bridge.asyncio.create_subprocess_exec", return_value=proc):
+            data = await self.client.new_session("name")
+        self.assertEqual(data["sessionFile"], "/new.jsonl")
 
     async def test_provider_error_reported_after_settled(self) -> None:
         def on_command(command):

@@ -144,18 +144,21 @@ class PiRpcClient:
 
     async def ensure_running(self, session_file: str | None = None) -> None:
         async with self._lock:
-            if session_file:
-                self._session_file = session_file
-            if (
+            healthy = (
                 self.proc
                 and self.proc.returncode is None
                 and self._transport_error is None
                 and self._reader_task
                 and not self._reader_task.done()
-            ):
+            )
+            if healthy and (not session_file or session_file == self._session_file):
                 return
+            if healthy and session_file and (self.busy or self._pending):
+                raise PiBusyError("pi 正在处理请求，暂不能切换会话文件")
             if self.proc:
                 await self._stop_unlocked()
+            if session_file:
+                self._session_file = session_file
             now = time.monotonic()
             self._restart_times = [t for t in self._restart_times if now - t < RESTART_WINDOW]
             if len(self._restart_times) >= MAX_RESTARTS:
@@ -319,11 +322,11 @@ class PiRpcClient:
             if not future.done():
                 future.cancel()
 
-    async def _command(self, name: str, timeout: float = 60, **fields: Any) -> dict:
+    async def _command(self, command_type: str, timeout: float = 60, **fields: Any) -> dict:
         await self.ensure_running()
-        response = await self._request({"id": uuid.uuid4().hex, "type": name, **fields}, timeout)
+        response = await self._request({"id": uuid.uuid4().hex, "type": command_type, **fields}, timeout)
         if not response.get("success"):
-            raise PiError(f"pi {name} 失败: {response.get('error') or '未知错误'}")
+            raise PiError(f"pi {command_type} 失败: {response.get('error') or '未知错误'}")
         return response.get("data") or {}
 
     # ---------- 命令 ----------
@@ -434,7 +437,7 @@ class PiRpcClient:
         if name:
             try:
                 await self._command("set_session_name", name=name)
-            except PiError:
+            except Exception:
                 # 会话已经创建；名称设置失败不能让上层误以为切换未发生。
                 logger.exception("pi 会话创建成功，但设置名称失败", extra={"session_name": name})
         return data

@@ -802,8 +802,8 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
                     storage.set_pi_session_file(previous["id"], previous_file)
             if not previous_file:
                 raise PiError("无法确认当前 pi 会话文件，请稍后重试")
-            await agent.client.new_session(name)
             switched = True
+            await agent.client.new_session(name)
             state = await agent.client.get_state()
             session_file = state.get("sessionFile")
             if not session_file:
@@ -816,6 +816,8 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
                     await agent.client.switch_session(previous_file)
                 except Exception:
                     logger.exception("恢复旧 pi 会话失败", extra={"user_id": user.id})
+                    # 不能保留可能指向错误会话的健康进程；下次从 DB 的 active 文件重连。
+                    await agent.client.stop()
             await reply_text(update, f"新建会话失败：{_friendly_error(e)}")
         else:
             await reply_text(update, f"✅ 已新建会话「{name}」\nID: {sid}")
@@ -843,15 +845,28 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
         if not row["pi_session_file"]:
             await reply_text(update, "该会话没有关联的 pi 会话文件，无法切换（请用 /session new 创建）")
             return
+        previous = storage.get_active_session(user.id)
+        previous_file = previous["pi_session_file"] if previous else None
+        switch_attempted = False
         try:
             # 进程内切换会话，无需重启（避免冷启动）
             await agent.ensure_client()
+            switch_attempted = True
             await agent.client.switch_session(row["pi_session_file"])
             storage.set_active(sid)
-            await reply_text(update, f"✅ 已切换到会话「{row['name']}」({sid})")
         except Exception as e:
-            logger.error("切换会话失败", extra={"err": str(e)[:300]})
-            await reply_text(update, f"切换会话失败: {e}")
+            logger.exception("切换会话失败", extra={"user_id": user.id, "err": str(e)[:300]})
+            if switch_attempted:
+                try:
+                    if not previous_file:
+                        raise PiError("无法确认旧会话文件")
+                    await agent.client.switch_session(previous_file)
+                except Exception:
+                    logger.exception("恢复旧 pi 会话失败", extra={"user_id": user.id})
+                    await agent.client.stop()
+            await reply_text(update, f"切换会话失败: {_friendly_error(e)}")
+        else:
+            await reply_text(update, f"✅ 已切换到会话「{row['name']}」({sid})")
 
     else:
         await reply_text(update, "用法：/session new [名称] | /session list | /session use <id>")
@@ -909,7 +924,7 @@ async def _cmd_model_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sub = context.args[0] if context.args else ""
-    if sub != "use":
+    if sub not in {"use", "list"}:
         await _cmd_model_unlocked(update, context)
         return
     agent = context.bot_data["manager"].get(update.effective_user.id)
@@ -938,7 +953,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_text(update, "⏹ pi 已确认中止指令")
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     manager = context.bot_data["manager"]
     storage = context.bot_data["storage"]
@@ -973,6 +988,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception:
         pass
     await reply_text(update, "\n".join(lines))
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    agent = context.bot_data["manager"].get(update.effective_user.id)
+    async with agent.control_lock:
+        await _cmd_status_unlocked(update, context)
 
 
 # ================= 快捷按钮回调 =================
