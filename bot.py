@@ -837,6 +837,90 @@ async def cmd_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_text(update, "用法：/env list | /env use <name>")
 
 
+async def create_user_session(agent: AgentSession, storage: Storage, user_id: int, name: str) -> str:
+    """供 Telegram 和后台共用的建会话流程；失败时恢复旧 Pi 会话。"""
+    if agent.client.busy or agent.prompt_pending:
+        raise PiBusyError("当前任务仍在运行")
+    await agent.ensure_client()
+    previous = storage.get_active_session(user_id)
+    previous_file = previous["pi_session_file"] if previous else None
+    if not previous_file:
+        previous_file = (await agent.client.get_state()).get("sessionFile")
+        if previous and previous_file:
+            storage.set_pi_session_file(previous["id"], previous_file)
+    if not previous_file:
+        raise PiError("无法确认当前 pi 会话文件，请稍后重试")
+    try:
+        await agent.client.new_session(name)
+        state = await agent.client.get_state()
+        session_file = state.get("sessionFile")
+        if not session_file:
+            raise PiError("pi 未返回新会话文件")
+        return storage.create_session_with_file_and_activate(user_id, name, session_file)
+    except Exception:
+        try:
+            await agent.client.switch_session(previous_file)
+        except Exception:
+            logger.exception("恢复旧 pi 会话失败", extra={"user_id": user_id})
+            await agent.client.stop()
+        raise
+
+
+async def switch_user_session(agent: AgentSession, storage: Storage, user_id: int, sid: str) -> str | None:
+    """供 Telegram 和后台共用的切换流程，含 JSONL 缺失恢复和失败回滚。"""
+    if agent.client.busy or agent.prompt_pending:
+        raise PiBusyError("当前任务仍在运行")
+    row = storage.get_session(sid)
+    if row is None or row["user_id"] != user_id:
+        raise ValueError("会话不存在")
+    await agent.ensure_client()
+    # ensure_client 已处理当前会话的 JSONL 缺失；再次 reset 会把刚恢复的文件覆盖掉。
+    previous = storage.get_active_session(user_id)
+    if previous is not None and "id" in previous and previous["id"] == sid:
+        notice = getattr(agent, "recovery_notice", None)
+        agent.recovery_notice = None
+        return notice
+    row = storage.get_session(sid)
+    memory_service = getattr(agent, "memory", None)
+    missing_file = memory_service is not None and (
+        not row["pi_session_file"] or (
+            not Path(row["pi_session_file"]).is_file()
+            and not agent.client.has_live_session(row["pi_session_file"])
+        )
+    )
+    if not row["pi_session_file"] and memory_service is None:
+        raise PiError("该会话没有可用的 pi 会话文件")
+    previous_file = previous["pi_session_file"] if previous else None
+    switch_attempted = False
+    try:
+        switch_attempted = True
+        if missing_file:
+            recovery = memory_service.build_recovery(sid)
+            state = await agent.client.reset_session()
+            new_file = state.get("sessionFile")
+            if not new_file:
+                raise PiError("pi 未返回新会话文件")
+            storage.set_session_recovery(sid, new_file, recovery)
+            notice = ("已从 SQLite 摘要恢复主要内容；旧 JSONL 未迁移"
+                      if recovery else "旧 JSONL 不存在，SQLite 也没有可用摘要；已创建空白会话")
+        else:
+            await agent.client.switch_session(row["pi_session_file"])
+            notice = None
+        storage.set_active(sid)
+    except Exception:
+        if switch_attempted:
+            try:
+                if not previous_file:
+                    raise PiError("无法确认旧会话文件")
+                await agent.client.switch_session(previous_file)
+            except Exception:
+                logger.exception("恢复旧 pi 会话失败", extra={"user_id": user_id})
+                await agent.client.stop()
+        raise
+    agent.recovery_notice = None
+    return notice
+
+
 async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     settings = context.bot_data["settings"]
@@ -852,34 +936,10 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
 
     if sub == "new":
         name = " ".join(args[1:]).strip() or f"会话-{len(storage.list_sessions(user.id)) + 1}"
-        previous_file = None
-        switched = False
         try:
-            await agent.ensure_client()
-            previous = storage.get_active_session(user.id)
-            previous_file = previous["pi_session_file"] if previous else None
-            if not previous_file:
-                previous_file = (await agent.client.get_state()).get("sessionFile")
-                if previous and previous_file:
-                    storage.set_pi_session_file(previous["id"], previous_file)
-            if not previous_file:
-                raise PiError("无法确认当前 pi 会话文件，请稍后重试")
-            switched = True
-            await agent.client.new_session(name)
-            state = await agent.client.get_state()
-            session_file = state.get("sessionFile")
-            if not session_file:
-                raise PiError("pi 未返回新会话文件")
-            sid = storage.create_session_with_file_and_activate(user.id, name, session_file)
+            sid = await create_user_session(agent, storage, user.id, name)
         except Exception as e:
             logger.exception("新建会话失败", extra={"user_id": user.id, "err": str(e)[:300]})
-            if switched and previous_file:
-                try:
-                    await agent.client.switch_session(previous_file)
-                except Exception:
-                    logger.exception("恢复旧 pi 会话失败", extra={"user_id": user.id})
-                    # 不能保留可能指向错误会话的健康进程；下次从 DB 的 active 文件重连。
-                    await agent.client.stop()
             await reply_text(update, f"新建会话失败：{_friendly_error(e)}")
         else:
             await reply_text(update, f"✅ 已新建会话「{name}」\nID: {sid}")
@@ -904,50 +964,14 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
         if row is None or row["user_id"] != user.id:
             await reply_text(update, f"找不到会话 {sid}")
             return
-        memory_service = getattr(agent, "memory", None)
-        missing_file = memory_service is not None and (
-            not row["pi_session_file"] or (
-                not Path(row["pi_session_file"]).is_file()
-                and not agent.client.has_live_session(row["pi_session_file"])
-            )
-        )
-        if not row["pi_session_file"] and memory_service is None:
-            await reply_text(update, "该会话没有可用的 pi 会话文件")
-            return
-        previous = storage.get_active_session(user.id)
-        previous_file = previous["pi_session_file"] if previous else None
-        switch_attempted = False
         try:
-            # 进程内切换会话，无需重启（避免冷启动）
-            await agent.ensure_client()
-            switch_attempted = True
-            if missing_file:
-                recovery = memory_service.build_recovery(sid)
-                state = await agent.client.reset_session()
-                new_file = state.get("sessionFile")
-                if not new_file:
-                    raise PiError("pi 未返回新会话文件")
-                storage.set_session_recovery(sid, new_file, recovery)
-                agent.recovery_notice = ("已从 SQLite 摘要恢复主要内容；旧 JSONL 未迁移"
-                                         if recovery else "旧 JSONL 不存在，SQLite 也没有可用摘要；已创建空白会话")
-            else:
-                await agent.client.switch_session(row["pi_session_file"])
-            storage.set_active(sid)
+            notice = await switch_user_session(agent, storage, user.id, sid)
         except Exception as e:
             logger.exception("切换会话失败", extra={"user_id": user.id, "err": str(e)[:300]})
-            if switch_attempted:
-                try:
-                    if not previous_file:
-                        raise PiError("无法确认旧会话文件")
-                    await agent.client.switch_session(previous_file)
-                except Exception:
-                    logger.exception("恢复旧 pi 会话失败", extra={"user_id": user.id})
-                    await agent.client.stop()
             await reply_text(update, f"切换会话失败: {_friendly_error(e)}")
         else:
             await reply_text(update, f"✅ 已切换到会话「{row['name']}」({sid})"
-                             + (f"\n{agent.recovery_notice}" if missing_file else ""))
-            agent.recovery_notice = None
+                             + (f"\n{notice}" if notice else ""))
 
     else:
         await reply_text(update, "用法：/session new [名称] | /session list | /session use <id>")

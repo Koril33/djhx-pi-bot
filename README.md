@@ -51,7 +51,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 - 自动摘要固定使用 DeepSeek Flash，不受 `/model use` 影响。若服务意外中断，未完成回合会在启动时标为不完整；下一条普通消息会提醒用户，不会自动重放可能已经执行工具的请求。
 - 会话 JSONL 没有迁移时，bot 会为原会话 ID 新建 pi 会话，并从 SQLite 摘要和近期文字回合恢复主要背景。无法恢复旧图片、工具输出或逐字历史；没有摘要时会明确提示为空白历史。
 - `MEMORY_*` 环境变量控制自动提取周期、原始回合保留数量、单条记忆长度和注入字节预算；维护模型不提供可覆盖项，见 [.env.example](.env.example)。完整设计及限制见 [产品设计文档](docs/memory-product.md)。
-- 单管理员后台位于 `/admin`，可管理记忆、会话摘要和记忆预算。账号密码由 `.env` 的 `ADMIN_USERNAME`、`ADMIN_PASSWORD` 配置；后台保存的参数持久化到同一个 SQLite，并优先于相应的环境变量。见 [后台产品设计](docs/admin-product.md) 与 [开发运维文档](docs/admin-development.md)。
+- 单管理员后台位于 `/admin`，可查看运行概览、管理会话与记忆、查看用量费用、调整记忆预算。账号密码由 `.env` 的 `ADMIN_USERNAME`、`ADMIN_PASSWORD` 配置；后台保存的参数持久化到同一个 SQLite，并优先于相应的环境变量。见 [后台产品设计](docs/admin-product.md) 与 [开发运维文档](docs/admin-development.md)。
 - 使用 `uv run python -m scripts.backup_db backup.db` 可生成一致的单文件 SQLite 备份。迁移记忆时拷贝这个数据库；新服务器仍需另行配置 bot 和模型凭证。
 
 ## 用量和费用

@@ -58,6 +58,26 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_using_active_session_does_not_repeat_missing_jsonl_recovery(self) -> None:
+        storage = Mock()
+        storage.get_session.return_value = {
+            "id": "current", "user_id": 1, "pi_session_file": "/missing.jsonl",
+        }
+        storage.get_active_session.return_value = {"id": "current", "pi_session_file": "/restored.jsonl"}
+        client = SimpleNamespace(
+            busy=False, reset_session=AsyncMock(), switch_session=AsyncMock(),
+        )
+        agent = SimpleNamespace(
+            client=client, prompt_pending=False, memory=Mock(),
+            ensure_client=AsyncMock(), recovery_notice="已从 SQLite 恢复",
+        )
+        notice = await bot.switch_user_session(agent, storage, 1, "current")
+        self.assertEqual(notice, "已从 SQLite 恢复")
+        self.assertIsNone(agent.recovery_notice)
+        client.reset_session.assert_not_awaited()
+        client.switch_session.assert_not_awaited()
+        storage.set_active.assert_not_called()
+
     async def test_read_only_commands_wait_for_session_change_before_syncing_client(self) -> None:
         for command, args in ((bot.cmd_model, ["list"]), (bot.cmd_status, [])):
             with self.subTest(command=command.__name__):

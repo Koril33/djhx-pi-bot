@@ -499,6 +499,21 @@ class Storage:
     def get_usage_events(self, run_id: str) -> list[sqlite3.Row]:
         return self._query("SELECT * FROM usage_events WHERE run_id = ? ORDER BY seq", (run_id,))
 
+    def get_usage_events_since(self, user_id: int, since: float) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT e.*, r.origin, r.started_at, r.status AS run_status "
+            "FROM usage_events AS e JOIN usage_runs AS r ON r.id = e.run_id "
+            "WHERE r.user_id = ? AND r.started_at >= ? ORDER BY r.started_at DESC, e.seq",
+            (user_id, since),
+        )
+
+    def get_recent_usage_runs(self, user_id: int, limit: int = 8) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT id, session_id, started_at, status, origin, memory_context_bytes "
+            "FROM usage_runs WHERE user_id = ? ORDER BY started_at DESC LIMIT ?",
+            (user_id, limit),
+        )
+
     # ---------- Telegram webhook inbox ----------
     # 更新先持久化再 ACK；重启后未处理记录仍可重放。
     def enqueue_update(
@@ -599,6 +614,13 @@ class Storage:
                 round(time.time() - row["oldest"], 1) if row["oldest"] is not None else None
             ),
         }
+
+    def get_recent_failed_updates(self, limit: int = 5) -> list[sqlite3.Row]:
+        """后台只取故障元数据；不读取 Telegram 原始消息载荷。"""
+        return self._query(
+            "SELECT update_id, processed_at, attempts, last_error FROM telegram_updates "
+            "WHERE state = 'failed' ORDER BY processed_at DESC LIMIT ?", (limit,),
+        )
 
     def prune_updates(self, *, keep_done_days: int = 7, keep_failed_days: int = 30) -> None:
         self._exec(

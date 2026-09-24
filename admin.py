@@ -10,6 +10,8 @@ import re
 import secrets
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode
@@ -18,8 +20,11 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import Settings
+from bot import create_user_session, switch_user_session
+from costs import format_usd
 from logging_conf import get_logger
 from memory import looks_secret
+from pi_bridge import PiBusyError, PiError
 from storage import Storage
 
 logger = get_logger("admin")
@@ -230,9 +235,9 @@ def _layout(title: str, active: str, body: str, csrf: str, user_id: int | None, 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{_e(title)} · Pi 管理</title>
 {_STYLE_TAG}</head><body>
-<div class="app-shell"><aside class="sidebar"><a class="brand" href="/admin/memories">
+<div class="app-shell"><aside class="sidebar"><a class="brand" href="/admin/overview">
 <span class="brand-mark">P<span>·</span></span><span>PI<span class="brand-muted"> / ADMIN</span></span></a>
-<nav aria-label="主导航">{nav('memories', '长期记忆', 'memories')}{nav('summaries', '会话摘要', 'summaries')}{nav('settings', '记忆设置', 'settings')}</nav>
+<nav aria-label="主导航">{nav('overview', '概览', 'overview')}{nav('sessions', '会话管理', 'sessions')}{nav('usage', '用量费用', 'usage')}{nav('memories', '长期记忆', 'memories')}{nav('summaries', '会话摘要', 'summaries')}{nav('settings', '记忆设置', 'settings')}</nav>
 <div class="sidebar-bottom"><span class="admin-name">{_e(settings.admin_username)}</span>
 <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{_e(csrf)}">
 <button class="text-button" type="submit">退出</button></form></div></aside>
@@ -280,9 +285,170 @@ def _user_picker(storage: Storage, settings: Settings, user_id: int | None, path
 
 
 def _notice(request: Request) -> str:
-    labels = {"saved": "已保存", "deleted": "已删除", "pinned": "已更新", "cleared": "已清空"}
+    labels = {"saved": "已保存", "deleted": "已删除", "pinned": "已更新", "cleared": "已清空",
+              "created": "会话已创建", "switched": "会话已切换", "recovered": "会话已从 SQLite 恢复"}
     value = labels.get(request.query_params.get("status", ""))
     return f'<p class="notice" role="status">{value}</p>' if value else ""
+
+
+_CST = timezone(timedelta(hours=8))
+
+
+def _time_label(value: float | str | None) -> str:
+    if value is None:
+        return "—"
+    try:
+        moment = (datetime.fromtimestamp(value, timezone.utc) if isinstance(value, (int, float))
+                  else datetime.fromisoformat(value).replace(tzinfo=timezone.utc))
+        return moment.astimezone(_CST).strftime("%m-%d %H:%M")
+    except (ValueError, OverflowError):
+        return "—"
+
+
+def _overview_page(request: Request, csrf: str, user_id: int | None) -> HTMLResponse:
+    storage, settings = _storage(request), _settings(request)
+    picker = _user_picker(storage, settings, user_id, "overview")
+    stats = storage.update_stats()
+    worker = getattr(request.app.state, "update_worker", None)
+    service = "正常" if worker is not None and not worker.done() else ("未读取" if worker is None else "异常")
+    agent = request.app.state.manager._agents.get(user_id) if user_id is not None else None
+    proc = agent.client.proc if agent is not None else None
+    pi_state = ("运行中" if proc is not None and proc.returncode is None else
+                ("待重连" if proc is not None else "按需启动"))
+    busy = bool(agent and (agent.client.busy or agent.prompt_pending))
+    active = storage.get_active_session(user_id) if user_id is not None else None
+    model = (agent.client.model if agent is not None else None) or settings.pi_model
+    session_name = active["name"] if active else "暂无会话"
+    cards = (
+        ("BOT", service), ("PI", "处理中" if busy else pi_state),
+        ("当前会话", session_name), ("当前模型", model),
+        ("待处理更新", str(stats["pending"])), ("失败更新", str(stats["failed"])),
+    )
+    cards_html = "".join(f'<div class="metric-card"><span>{_e(label)}</span><strong>{_e(value)}</strong></div>'
+                         for label, value in cards)
+    failed = []
+    for row in storage.get_recent_failed_updates():
+        reason = (row["last_error"] or "").split(":", 1)[0].strip()[:64]
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", reason):
+            reason = "处理失败"
+        failed.append(f'<div class="list-row"><span class="mono">#{_e(row["update_id"])}</span>'
+                      f'<span>{_e(reason)}</span><span class="muted">{_e(_time_label(row["processed_at"]))}</span></div>')
+    failure_html = "".join(failed) or '<p class="empty small">没有失败更新</p>'
+    body = (f'<div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1>概览</h1></div>{picker}</div>'
+            f'<div class="metric-grid">{cards_html}</div>'
+            f'<section class="section-block"><div class="section-head"><h2>最近失败更新</h2>'
+            f'<span class="muted">仅展示故障类型，不自动重放</span></div><div class="simple-list">{failure_html}</div></section>')
+    return _html(_layout("概览", "overview", body, csrf, user_id, settings))
+
+
+def _session_page(request: Request, csrf: str, user_id: int | None, error: str = "") -> HTMLResponse:
+    storage, settings = _storage(request), _settings(request)
+    picker = _user_picker(storage, settings, user_id, "sessions")
+    if user_id is None:
+        content = '<p class="empty">暂无用户</p>'
+    else:
+        add = (f'<form method="post" action="/admin/sessions/new" class="compact-form">'
+               f'<input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}">'
+               '<label class="sr-only" for="session-name">会话名称</label>'
+               '<input id="session-name" name="name" maxlength="60" placeholder="新会话名称" required>'
+               '<button class="button primary" type="submit">新建会话</button></form>')
+        agent = request.app.state.manager._agents.get(user_id)
+        cards = []
+        for row in storage.list_sessions(user_id):
+            sid = _e(row["id"])
+            session_file = row["pi_session_file"]
+            exists = bool(session_file and Path(session_file).is_file())
+            live = bool(agent and session_file and agent.client.has_live_session(session_file))
+            file_state = ("JSONL 正常" if exists else
+                          ("会话运行中" if live else ("JSONL 缺失" if session_file else "JSONL 未关联")))
+            summary = storage.get_summary(row["id"])
+            has_summary = bool(summary and summary["summary_text"])
+            if not exists and not live and has_summary:
+                file_state += " · SQLite 有摘要"
+            active = row["status"] == "active"
+            switch = ('<span class="badge">当前</span>' if active else
+                      f'<form method="post" action="/admin/sessions/{sid}/use">'
+                      f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                      f'<input type="hidden" name="user_id" value="{user_id}">'
+                      '<button class="text-button" type="submit">切换</button></form>')
+            rename = (f'<details><summary>重命名</summary><form method="post" action="/admin/sessions/{sid}/rename" class="inline-edit">'
+                      f'<input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}">'
+                      f'<input name="name" value="{_e(row["name"])}" maxlength="60" required>'
+                      '<button class="button primary" type="submit">保存</button></form></details>')
+            cards.append(f'<article class="summary-card"><div class="summary-head"><div>'
+                         f'<span class="session-state">{_e(file_state)}</span><h2>{_e(row["name"])}</h2></div>'
+                         f'<span class="mono">{sid}</span></div><div class="session-foot">'
+                         f'<span class="muted">{_e(_time_label(row["updated_at"]))}</span>'
+                         f'<div class="card-actions">{switch}{rename}</div></div></article>')
+        content = add + ('<div class="card-list">' + "".join(cards) + '</div>' if cards else '<p class="empty">暂无会话</p>')
+    alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
+    body = f'<div class="page-heading"><div><p class="eyebrow">SESSIONS</p><h1>会话管理</h1></div>{picker}</div>{alert}{content}'
+    return _html(_layout("会话管理", "sessions", body, csrf, user_id, settings), status_code=400 if error else 200)
+
+
+def _usage_page(request: Request, csrf: str, user_id: int | None, period: str) -> HTMLResponse:
+    storage, settings = _storage(request), _settings(request)
+    picker = _user_picker(storage, settings, user_id, "usage")
+    periods = {"today": ("今天", 0), "7d": ("近 7 天", 6), "30d": ("近 30 天", 29)}
+    label, days_back = periods[period]
+    midnight = datetime.now(_CST).replace(hour=0, minute=0, second=0, microsecond=0)
+    since = (midnight - timedelta(days=days_back)).timestamp()
+    runs = storage.get_usage_runs_since(user_id, since) if user_id is not None else []
+    events = storage.get_usage_events_since(user_id, since) if user_id is not None else []
+    counts = {key: sum(row[key] for row in events) for key in
+              ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")}
+    total = sum((Decimal(row["estimated_usd"]) for row in events if row["estimated_usd"] is not None), Decimal(0))
+    maintenance = sum((Decimal(row["estimated_usd"]) for row in events
+                       if row["origin"] == "memory_maintenance" and row["estimated_usd"] is not None), Decimal(0))
+    cache_base = counts["input_tokens"] + counts["cache_read_tokens"]
+    cache_rate = f'{counts["cache_read_tokens"] / cache_base:.0%}' if cache_base else "—"
+    range_links = "".join(
+        f'<a class="range-link{" active" if key == period else ""}" href="/admin/usage?{urlencode({"range": key, **({"user_id": user_id} if user_id is not None else {})})}">{title}</a>'
+        for key, (title, _) in periods.items()
+    )
+    metrics = (("估算费用", format_usd(total)), ("聊天轮次", str(sum(r["origin"] == "chat" for r in runs))),
+               ("缓存命中", cache_rate), ("记忆维护", format_usd(maintenance)))
+    metric_html = "".join(f'<div class="metric-card"><span>{_e(name)}</span><strong>{_e(value)}</strong></div>'
+                          for name, value in metrics)
+    by_model: dict[str, dict[str, object]] = {}
+    for row in events:
+        key = f'{row["provider"]}/{row["model"]}'
+        item = by_model.setdefault(key, {"calls": 0, "tokens": 0, "cost": Decimal(0)})
+        item["calls"] += 1
+        item["tokens"] += row["total_tokens"]
+        if row["estimated_usd"] is not None:
+            item["cost"] += Decimal(row["estimated_usd"])
+    model_rows = "".join(
+        f'<div class="list-row"><span>{_e(model)}</span><span>{entry["calls"]} 次 · {entry["tokens"]:,} tokens</span>'
+        f'<strong>{_e(format_usd(entry["cost"]))}</strong></div>'
+        for model, entry in sorted(by_model.items())
+    ) or '<p class="empty small">暂无用量事件</p>'
+    issues = []
+    unpriced = sum(row["estimated_usd"] is None for row in events)
+    if unpriced:
+        issues.append(f'{unpriced} 次调用未计价')
+    if any(row["price_status"] == "stale_price" for row in events):
+        issues.append("价格待复核")
+    if any(row["status"] != "complete" for row in runs):
+        issues.append("存在未完成回合")
+    issue_html = f'<p class="form-error">{_e("；".join(issues))}</p>' if issues else ""
+    token_line = (f'未命中 {counts["input_tokens"]:,} · 缓存读取 {counts["cache_read_tokens"]:,} · '
+                  f'缓存写入 {counts["cache_write_tokens"]:,} · 输出 {counts["output_tokens"]:,}')
+    recent = []
+    for run in storage.get_recent_usage_runs(user_id) if user_id is not None else []:
+        amount = sum((Decimal(event["estimated_usd"]) for event in storage.get_usage_events(run["id"])
+                      if event["estimated_usd"] is not None), Decimal(0))
+        origin = "记忆维护" if run["origin"] == "memory_maintenance" else "聊天"
+        recent.append(f'<div class="list-row"><span>{_e(_time_label(run["started_at"]))}</span>'
+                      f'<span>{origin} · {_e(run["status"])}</span><strong>{_e(format_usd(amount))}</strong></div>')
+    body = (f'<div class="page-heading"><div><p class="eyebrow">USAGE</p><h1>用量费用</h1></div>{picker}</div>'
+            f'<div class="range-links">{range_links}</div>{issue_html}<div class="metric-grid">{metric_html}</div>'
+            f'<p class="usage-caption">{_e(label)} · {token_line}</p>'
+            f'<section class="section-block"><div class="section-head"><h2>模型</h2><span class="muted">按公开费率估算</span></div>'
+            f'<div class="simple-list">{model_rows}</div></section>'
+            f'<section class="section-block"><div class="section-head"><h2>最近记录</h2></div>'
+            f'<div class="simple-list">{"".join(recent) or "<p class=\"empty small\">暂无记录</p>"}</div></section>')
+    return _html(_layout("用量费用", "usage", body, csrf, user_id, settings))
 
 
 def _memory_page(request: Request, csrf: str, user_id: int | None, error: str = "") -> HTMLResponse:
@@ -373,7 +539,7 @@ def _refresh_memory(request: Request, user_id: int) -> None:
 @router.get("")
 @router.get("/")
 async def home(request: Request):
-    return _redirect("/admin/memories" if _session(request) else "/admin/login")
+    return _redirect("/admin/overview" if _session(request) else "/admin/login")
 
 
 @router.get("/login")
@@ -382,7 +548,7 @@ async def login_page(request: Request):
     if not settings.admin_username or not settings.admin_password:
         return _html('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>未配置</title><body>后台未配置</body></html>', status_code=503)
     if _session(request):
-        return _redirect("/admin/memories")
+        return _redirect("/admin/overview")
     csrf = secrets.token_urlsafe(24)
     response = _html(_login_page(csrf))
     _cookie(response, _PRELOGIN_COOKIE, _seal(settings, "pre", csrf), _PRELOGIN_SECONDS)
@@ -415,7 +581,7 @@ async def login(request: Request):
         return response
     _LOGIN_FAILURES.pop(ip, None)
     csrf = secrets.token_urlsafe(24)
-    response = _redirect("/admin/memories")
+    response = _redirect("/admin/overview")
     _cookie(response, _SESSION_COOKIE, _seal(settings, "auth", csrf), _SESSION_SECONDS)
     response.delete_cookie(_PRELOGIN_COOKIE, path="/admin")
     logger.info("后台登录成功", extra={"client_ip": ip})
@@ -428,6 +594,104 @@ async def logout(request: Request):
     response = _redirect("/admin/login")
     response.delete_cookie(_SESSION_COOKIE, path="/admin")
     return response
+
+
+@router.get("/overview")
+async def overview(request: Request):
+    csrf = _session(request)
+    if not csrf:
+        return _redirect("/admin/login")
+    user_id = _selected_user(request.query_params.get("user_id"), _storage(request), _settings(request))
+    return _overview_page(request, csrf, user_id)
+
+
+@router.get("/sessions")
+async def sessions(request: Request):
+    csrf = _session(request)
+    if not csrf:
+        return _redirect("/admin/login")
+    user_id = _selected_user(request.query_params.get("user_id"), _storage(request), _settings(request))
+    return _session_page(request, csrf, user_id)
+
+
+def _session_name(raw: str | None) -> str:
+    name = (raw or "").strip()
+    if not 1 <= len(name) <= 60 or any(ord(char) < 32 for char in name):
+        raise ValueError("会话名称须为 1–60 个字符，且不能包含换行")
+    return name
+
+
+@router.post("/sessions/new")
+async def new_session(request: Request):
+    csrf, form = await _authorized_form(request)
+    storage, settings = _storage(request), _settings(request)
+    user_id = _form_user(form, storage, settings)
+    try:
+        name = _session_name(form.get("name"))
+    except ValueError as exc:
+        return _session_page(request, csrf, user_id, str(exc))
+    agent = request.app.state.manager.get(user_id)
+    try:
+        async with agent.control_lock:
+            sid = await create_user_session(agent, storage, user_id, name)
+    except (PiError, ValueError) as exc:
+        return _session_page(request, csrf, user_id, str(exc))
+    except Exception:
+        logger.exception("后台新建会话失败", extra={"user_id": user_id})
+        return _session_page(request, csrf, user_id, "新建失败，请查看服务日志")
+    logger.info("后台新建会话", extra={"user_id": user_id, "session_id": sid})
+    return _redirect(f"/admin/sessions?{urlencode({'user_id': user_id, 'status': 'created'})}")
+
+
+@router.post("/sessions/{session_id}/use")
+async def use_session(session_id: str, request: Request):
+    csrf, form = await _authorized_form(request)
+    storage, settings = _storage(request), _settings(request)
+    user_id = _form_user(form, storage, settings)
+    row = storage.get_session(session_id)
+    if row is None or row["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    agent = request.app.state.manager.get(user_id)
+    try:
+        async with agent.control_lock:
+            notice = await switch_user_session(agent, storage, user_id, session_id)
+    except (PiError, ValueError) as exc:
+        return _session_page(request, csrf, user_id, str(exc))
+    except Exception:
+        logger.exception("后台切换会话失败", extra={"user_id": user_id, "session_id": session_id})
+        return _session_page(request, csrf, user_id, "切换失败，请查看服务日志")
+    logger.info("后台切换会话", extra={"user_id": user_id, "session_id": session_id, "recovered": bool(notice)})
+    status = "recovered" if notice else "switched"
+    return _redirect(f"/admin/sessions?{urlencode({'user_id': user_id, 'status': status})}")
+
+
+@router.post("/sessions/{session_id}/rename")
+async def rename_session(session_id: str, request: Request):
+    csrf, form = await _authorized_form(request)
+    storage, settings = _storage(request), _settings(request)
+    user_id = _form_user(form, storage, settings)
+    row = storage.get_session(session_id)
+    if row is None or row["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    try:
+        name = _session_name(form.get("name"))
+    except ValueError as exc:
+        return _session_page(request, csrf, user_id, str(exc))
+    storage.rename_session(session_id, name)
+    logger.info("后台重命名会话", extra={"user_id": user_id, "session_id": session_id})
+    return _redirect(f"/admin/sessions?{urlencode({'user_id': user_id, 'status': 'saved'})}")
+
+
+@router.get("/usage")
+async def usage(request: Request):
+    csrf = _session(request)
+    if not csrf:
+        return _redirect("/admin/login")
+    user_id = _selected_user(request.query_params.get("user_id"), _storage(request), _settings(request))
+    period = request.query_params.get("range", "today")
+    if period not in {"today", "7d", "30d"}:
+        raise HTTPException(status_code=400, detail="时间范围无效")
+    return _usage_page(request, csrf, user_id, period)
 
 
 @router.get("/memories")

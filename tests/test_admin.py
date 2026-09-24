@@ -1,14 +1,17 @@
 import re
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from admin import _FIELDS, apply_runtime_settings, router
 from config import Settings
+from costs import PriceResult
 from storage import Storage
 
 
@@ -27,7 +30,8 @@ class AdminTests(unittest.TestCase):
         app.include_router(router)
         app.state.settings = self.settings
         app.state.storage = self.storage
-        app.state.manager = SimpleNamespace(memory=None, _agents={})
+        self.manager = SimpleNamespace(memory=None, _agents={})
+        app.state.manager = self.manager
         self.client = TestClient(app, base_url="https://testserver")
 
     def tearDown(self):
@@ -127,6 +131,78 @@ class AdminTests(unittest.TestCase):
         self.assertNotIn('href="/admin/style.css"', response.text)
         self.assertIn("style-src 'sha256-", response.headers["content-security-policy"])
         self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
+
+    def test_overview_hides_failed_payload_and_usage_uses_ledger(self):
+        self.storage.enqueue_update(99, '{"update_id":99,"message":"private"}')
+        self.storage.claim_updates(1)
+        self.storage.fail_update(99, "RuntimeError: private diagnostic")
+        run = self.storage.start_usage_run(7, None, None, None)
+        self.storage.record_usage_event(run, 1, {
+            "kind": "assistant", "occurred_at": 1, "provider": "deepseek", "model": "deepseek-flash",
+            "usage": {"input": 20, "cacheRead": 80, "output": 10},
+        }, PriceResult("priced", usd="0.0002"))
+        self.storage.finish_usage_run(run, "complete", None)
+        self.login()
+        overview = self.client.get("/admin/overview?user_id=7")
+        self.assertEqual(overview.status_code, 200)
+        self.assertIn("RuntimeError", overview.text)
+        self.assertNotIn("private diagnostic", overview.text)
+        self.assertNotIn("private\"", overview.text)
+        usage = self.client.get("/admin/usage?user_id=7&range=today")
+        self.assertEqual(usage.status_code, 200)
+        self.assertIn("deepseek/deepseek-flash", usage.text)
+        self.assertIn("80%", usage.text)
+        self.assertIn("$0.0002", usage.text)
+        self.assertEqual(self.client.get("/admin/usage?user_id=8").text.count("$0.0002"), 0)
+
+    def test_session_manage_uses_shared_flow_and_checks_ownership(self):
+        old = self.storage.create_session(7, "旧会话")
+        self.storage.set_pi_session_file(old, "/old.jsonl")
+        self.storage.set_active(old)
+        other = self.storage.create_session(8, "别人的会话")
+        client = SimpleNamespace(
+            busy=False, proc=None, model="deepseek-flash", has_live_session=Mock(return_value=False),
+            new_session=AsyncMock(), get_state=AsyncMock(return_value={"sessionFile": "/new.jsonl"}),
+            switch_session=AsyncMock(), stop=AsyncMock(),
+        )
+        agent = SimpleNamespace(
+            client=client, ensure_client=AsyncMock(), prompt_pending=False,
+            control_lock=asyncio.Lock(), memory=None, recovery_notice=None,
+        )
+        self.manager._agents[7] = agent
+        self.manager.get = lambda user_id: agent if user_id == 7 else None
+        self.login()
+        page = self.client.get("/admin/sessions?user_id=7")
+        self.assertIn("JSONL 缺失", page.text)
+        self.storage.apply_summary(7, old, 0, 0, "旧讨论摘要", [], memory_limit=10, turn_retention=10)
+        self.assertIn("SQLite 有摘要", self.client.get("/admin/sessions?user_id=7").text)
+        csrf = self.csrf(page)
+        self.assertEqual(self.client.post(f"/admin/sessions/{other}/use", data={
+            "csrf": csrf, "user_id": "7",
+        }).status_code, 404)
+        created = self.client.post("/admin/sessions/new", data={
+            "csrf": csrf, "user_id": "7", "name": "新会话",
+        }, follow_redirects=False)
+        self.assertEqual(created.status_code, 303)
+        new = self.storage.get_active_session(7)
+        self.assertEqual(new["name"], "新会话")
+        self.assertEqual(new["pi_session_file"], "/new.jsonl")
+        self.assertEqual(self.client.post(f"/admin/sessions/{old}/rename", data={
+            "csrf": csrf, "user_id": "7", "name": "改名",
+        }, follow_redirects=False).status_code, 303)
+        self.assertEqual(self.storage.get_session(old)["name"], "改名")
+        switched = self.client.post(f"/admin/sessions/{old}/use", data={
+            "csrf": csrf, "user_id": "7",
+        }, follow_redirects=False)
+        self.assertEqual(switched.status_code, 303)
+        self.assertEqual(self.storage.get_active_session(7)["id"], old)
+        client.switch_session.assert_awaited_with("/old.jsonl")
+        agent.client.busy = True
+        rejected = self.client.post("/admin/sessions/new", data={
+            "csrf": csrf, "user_id": "7", "name": "不应创建",
+        })
+        self.assertEqual(rejected.status_code, 400)
+        self.assertNotIn("不应创建", [row["name"] for row in self.storage.list_sessions(7)])
 
 
 if __name__ == "__main__":

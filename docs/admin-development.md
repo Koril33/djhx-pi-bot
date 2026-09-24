@@ -4,6 +4,8 @@
 
 `admin.py` 作为 FastAPI 子路由挂在现有 `app.py` 的 `/admin`。页面由 Python 渲染 HTML，样式源文件位于 `admin_static/style.css`；没有前端构建步骤。后台通过现有 `Storage` 操作 `memory_items`、`sessions` 和 `session_summaries`。
 
+概览使用 `update_stats()` 和最近失败更新的元数据，不读取原始 Telegram payload；Pi 状态只检查已有的 `AgentSession`，不因为打开页面启动新进程。会话新建与切换调用 `bot.py` 中供 Telegram 和后台共用的 `create_user_session()` / `switch_user_session()`，并在同一用户的 `control_lock` 下执行。后台重命名仅更改 SQLite 显示名。用量页按北京时间计算日界，通过 `usage_runs` / `usage_events` 汇总；金额使用 Decimal，记忆维护按 `origin` 单列。
+
 导航使用普通链接，切页会加载完整 HTML。最初页面从 `/admin/style.css` 读取样式且响应为 `no-store`，每次切页都重新请求，浏览器短暂显示未着色内容。现在服务启动时读取约 8 KB 的样式，将其直接放入每页 `<head>`；CSP 使用对应的 SHA-256 哈希放行这份固定样式。页面仍保持 `no-store`，且切页不再依赖第二个样式请求。
 
 新增的 `runtime_settings(key, value_json, updated_at)` 保存可在线修改的记忆参数。启动顺序是建立 SQLite 连接、读取和校验覆盖值、应用到共享 `Settings` 对象，然后创建 `AgentManager`。表单保存时先整体校验，再写入 SQLite，最后更新进程中的 `Settings`；写入失败不会更新运行值。数据库迁移由 `CREATE TABLE IF NOT EXISTS` 完成。
@@ -46,6 +48,6 @@ uv run python -m py_compile *.py
 
 ## 文件与后续扩展
 
-`config.py` 定义身份和默认值；`storage.py` 管理配置表与查询；`admin.py` 实现校验、认证、页面和写操作；`admin_static/style.css` 实现响应式视觉样式；`tests/test_admin.py` 验证登录、CSRF、用户隔离、记忆 CRUD、摘要清空和设置持久化。
+`config.py` 定义身份和默认值；`storage.py` 管理配置表与查询；`admin.py` 实现校验、认证、页面和写操作；`bot.py` 提供共用会话操作；`admin_static/style.css` 实现响应式视觉样式；`tests/test_admin.py` 验证登录、CSRF、用户隔离、会话管理、用量、记忆 CRUD、摘要清空和设置持久化。
 
 若未来需要多管理员、精确审计或复杂检索，可在这些边界内增加管理员表、操作日志表和 FTS5。首版无需额外服务。
