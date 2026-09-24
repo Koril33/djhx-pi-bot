@@ -126,6 +126,32 @@ class StreamReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🔍 读取: file.py", calls)
         self.assertEqual(calls[-1], "完成")
 
+    async def test_tool_finishes_before_first_refresh_without_blocking_loop(self) -> None:
+        calls: list[str] = []
+        activity = {"current": None}
+
+        async def fake_send(send_fn, text, *, edit=False, msg=None, reply_markup=None):
+            calls.append(text)
+            return True if edit else _SentMessage()
+
+        async def deltas():
+            activity["current"] = "🔍 读取: file.py"
+            activity["notify"]()
+            activity["current"] = None
+            activity["notify"]()
+            await asyncio.sleep(0.02)
+            yield "完成"
+
+        with patch.object(bot, "_send", side_effect=fake_send):
+            await asyncio.wait_for(
+                bot.stream_reply(
+                    _FakeUpdate(), deltas(), interval=0, activity_holder=activity,
+                    initial_delay=0.001, initial_chars=100,
+                ), timeout=0.2,
+            )
+
+        self.assertEqual(calls[-1], "完成")
+
 
 class MarkdownSplitTests(unittest.TestCase):
     def test_long_single_line_is_bounded(self) -> None:

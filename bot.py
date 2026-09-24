@@ -622,10 +622,14 @@ async def stream_reply(
 
     async def flush(*, force: bool = False) -> None:
         """把当前 dirty 快照刷新到 Telegram；仅此处执行 Markdown 分段。"""
-        nonlocal msg, buf, dirty, first_text_rendered, last_edit
+        nonlocal msg, buf, dirty, first_delta_at, first_text_rendered, last_edit
         if not dirty and not force:
             return
         if not buf and (not activity_holder or not activity_holder.get("current")) and not first_text_rendered:
+            # 工具可能在首次刷新前已开始并结束。清除空刷新标记，
+            # 否则截止时间一过会在 while 循环中无 await 地占满事件循环。
+            dirty = False
+            first_delta_at = None
             return
 
         # 思考占位若已发出，直接编辑它，避免多发一条消息。
