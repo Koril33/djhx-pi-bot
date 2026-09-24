@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from telegram import Update
+from telegram.error import NetworkError
 
 import bot
 
@@ -69,6 +70,14 @@ class ImageDownloadTests(unittest.IsolatedAsyncioTestCase):
             await bot._download_image(SimpleNamespace(photo=[media], document=None))
         media.get_file.assert_not_awaited()
 
+    async def test_get_file_oversize_is_rejected_before_download(self):
+        media = media_with_data(PNG)
+        media.file_size = None
+        media.get_file.return_value.file_size = bot.MAX_IMAGE_BYTES + 1
+        with self.assertRaisesRegex(ValueError, "10 MiB"):
+            await bot._download_image(SimpleNamespace(photo=[media], document=None))
+        media.get_file.return_value.download_as_bytearray.assert_not_awaited()
+
     async def test_actual_oversize_is_rejected(self):
         media = media_with_data(PNG + b"x" * bot.MAX_IMAGE_BYTES)
         media.file_size = None
@@ -94,6 +103,25 @@ class ImageDownloadTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError) as raised:
             await bot._download_image(SimpleNamespace(photo=[media], document=None), user_id=1)
         self.assertEqual(str(raised.exception), "图片下载失败，请稍后重发")
+
+    async def test_transient_telegram_download_error_is_retried(self):
+        media = media_with_data(PNG)
+        media.get_file.return_value.download_as_bytearray.side_effect = [
+            NetworkError("connection lost"), bytearray(PNG),
+        ]
+        with patch.object(bot.asyncio, "sleep", new_callable=AsyncMock):
+            result = await bot._download_image(SimpleNamespace(photo=[], document=media))
+        self.assertEqual(result["mimeType"], "image/png")
+        self.assertEqual(media.get_file.await_count, 2)
+
+    async def test_repeated_telegram_download_error_has_safe_feedback(self):
+        media = media_with_data(PNG)
+        media.get_file.side_effect = NetworkError("https://api.telegram.org/file/botSECRET/image.png")
+        with patch.object(bot.asyncio, "sleep", new_callable=AsyncMock):
+            with self.assertRaises(ValueError) as raised:
+                await bot._download_image(SimpleNamespace(photo=[], document=media))
+        self.assertEqual(str(raised.exception), "图片下载失败，请稍后重发")
+        self.assertEqual(media.get_file.await_count, 3)
 
 
 class ImageMessageTests(unittest.IsolatedAsyncioTestCase):

@@ -41,6 +41,10 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 8192  # DeepSeek 单张图片的长/宽上限
 
 
+class _ImageTooLarge(ValueError):
+    """仅用于区分本地校验错误与下载库抛出的异常。"""
+
+
 # ================= Markdown → Telegram HTML =================
 
 
@@ -1069,16 +1073,27 @@ async def _download_image(message, *, user_id: int | None = None) -> dict[str, s
         raise ValueError("消息中没有图片")
     if media.file_size is not None and media.file_size > MAX_IMAGE_BYTES:
         raise ValueError("图片超过 10 MiB 限制，请压缩后重发")
-    try:
-        file = await media.get_file()
-        if file.file_size is not None and file.file_size > MAX_IMAGE_BYTES:
-            raise ValueError("图片超过 10 MiB 限制，请压缩后重发")
-        data = await file.download_as_bytearray()
-    except ValueError:
-        raise
-    except Exception as exc:
-        logger.warning("Telegram 图片下载失败", extra={"user_id": user_id, "err_type": type(exc).__name__})
-        raise ValueError("图片下载失败，请稍后重发") from None
+    for attempt in range(3):
+        try:
+            file = await media.get_file()
+            if file.file_size is not None and file.file_size > MAX_IMAGE_BYTES:
+                raise _ImageTooLarge("图片超过 10 MiB 限制，请压缩后重发")
+            data = await file.download_as_bytearray(read_timeout=60, connect_timeout=20)
+            break
+        except _ImageTooLarge:
+            raise
+        except (*_TG_NET_EXC, RetryAfter) as exc:
+            if attempt == 2:
+                logger.warning("Telegram 图片下载重试耗尽", extra={"user_id": user_id, "err_type": type(exc).__name__})
+                raise ValueError("图片下载失败，请稍后重发") from None
+            if isinstance(exc, RetryAfter):
+                delay = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
+                await asyncio.sleep(max(0.5, delay))
+            else:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        except Exception as exc:
+            logger.warning("Telegram 图片下载失败", extra={"user_id": user_id, "err_type": type(exc).__name__})
+            raise ValueError("图片下载失败，请稍后重发") from None
     if not data or len(data) > MAX_IMAGE_BYTES:
         raise ValueError("图片为空或超过 10 MiB 限制，请重发")
     mime_type = _image_mime_type(data)
