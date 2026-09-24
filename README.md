@@ -7,7 +7,7 @@
 ```
 Telegram ←→ nginx(TLS) ←→ FastAPI webhook ←→ python-telegram-bot
                                               └→ 常驻 pi --mode rpc 子进程 (JSONL over stdio)
-                                              └→ SQLite (用户/会话映射、Telegram 更新队列、模型用量账本)
+                                              └→ SQLite (会话映射、更新队列、用量账本、长期记忆与摘要)
 ```
 
 - V1 单环境（服务器本机）：bot 进程直接管理常驻 pi RPC 子进程
@@ -39,6 +39,17 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 | `/model list` / `/model use <id>` | 模型切换 |
 | `/stop` | 中止当前任务 |
 | `/status` | 运行状态 |
+| `/memory list [页码]` / `add` / `edit` / `delete` / `pin` / `unpin` | 长期记忆管理 |
+| `/summary show` / `/summary clear` | 当前会话摘要 |
+
+## 长期记忆与会话摘要
+
+- 自动记忆默认启用：每个会话积累指定数量的完整回合后，用独立、无工具的 DeepSeek Flash 调用更新该会话摘要，并提取跨会话稳定偏好。项目细节只留在会话摘要。维护调用单独计入 `/cost today`。
+- `/memory add <内容>` 可以立即手动保存。`/memory list` 显示记忆 ID，`/memory edit <id> <内容>`、`/memory delete <id>` 可以修改或删除。每条记忆和有效记忆数量均有可配置上限。
+- pi 扩展在模型请求前临时注入受预算限制的 SQLite 背景资料，不把同一份记忆逐轮写入 JSONL。删除后不再主动注入，但已存在于旧 JSONL、旧回复或摘要的内容不会自动消失。
+- 会话 JSONL 没有迁移时，bot 会为原会话 ID 新建 pi 会话，并从 SQLite 摘要和近期文字回合恢复主要背景。无法恢复旧图片、工具输出或逐字历史；没有摘要时会明确提示为空白历史。
+- `MEMORY_*` 环境变量控制自动提取周期、原始回合保留数量、单条记忆长度和注入字节预算，见 [.env.example](.env.example)。完整设计及限制见 [产品设计文档](docs/memory-product.md)。
+- 使用 `uv run python -m scripts.backup_db backup.db` 可生成一致的单文件 SQLite 备份。迁移记忆时拷贝这个数据库；新服务器仍需另行配置 bot 和模型凭证。
 | `/cost` / `/cost today` | 最近一轮 / 今日模型 token 与估算费用 |
 
 ## 用量和费用

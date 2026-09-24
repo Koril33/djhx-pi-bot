@@ -12,6 +12,7 @@ V1 拓扑：单个环境（服务器本机），每用户一个常驻 pi RPC 进
 import asyncio
 import base64
 import json
+from pathlib import Path
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,7 @@ from telegram.ext import (
 
 from config import Settings
 from costs import PricingCatalog, format_usd
+from memory import MemoryService, looks_secret, safe_turn_text
 from logging_conf import get_logger
 from pi_bridge import PiBusyError, PiError, PiRpcClient
 from storage import Storage
@@ -446,17 +448,28 @@ async def _send(
 class AgentSession:
     """单个用户在单个环境下的 pi 会话。"""
 
-    def __init__(self, user_id: int, settings: Settings, storage: Storage):
+    def __init__(self, user_id: int, settings: Settings, storage: Storage,
+                 memory: MemoryService | None = None):
         self.user_id = user_id
         self.settings = settings
         self.storage = storage
         self.prompt_pending = False
+        self.active_turn_id: int | None = None
+        self.recovery_notice: str | None = None
         self.control_lock = asyncio.Lock()
+        self.memory = memory
+        memory_enabled = getattr(settings, "memory_enabled", False) and memory is not None
+        if memory_enabled:
+            memory.clear_context(user_id)
         self.client = PiRpcClient(
             pi_cmd=settings.pi_cmd,
             session_dir=settings.pi_session_dir,
             provider=settings.pi_provider,
             model=settings.pi_model,
+            extra_args=(["--extension", str(Path(__file__).resolve().parent / "pi_extensions" / "memory-context.ts")]
+                        if memory_enabled else None),
+            extra_env=({"DJHX_MEMORY_CONTEXT_FILE": str(memory.context_path(user_id))}
+                       if memory_enabled else None),
         )
 
     async def ensure_default_session(self) -> None:
@@ -470,6 +483,18 @@ class AgentSession:
         await self.ensure_default_session()
         active = self.storage.get_active_session(self.user_id)
         session_file = active["pi_session_file"] if active else None
+        if (self.memory is not None and active and session_file
+                and not Path(session_file).is_file()
+                and not self.client.has_live_session(session_file)):
+            recovery = self.memory.build_recovery(active["id"])
+            state = await self.client.reset_session()
+            new_file = state.get("sessionFile")
+            if not new_file:
+                raise PiError("pi 未返回新会话文件，无法恢复缺失的历史")
+            self.storage.set_session_recovery(active["id"], new_file, recovery)
+            self.recovery_notice = ("旧会话文件不存在，已从 SQLite 摘要恢复主要内容；原始对话无法逐字恢复"
+                                    if recovery else "旧会话文件不存在，已创建空白 pi 会话；SQLite 没有可用摘要")
+            return
         # 进程仍存活但 stdout reader 已失效时，也必须按当前会话文件重启。
         await self.client.ensure_running(session_file)
         # 首次同步 pi 侧会话文件路径
@@ -486,16 +511,19 @@ class AgentManager:
     def __init__(self, settings: Settings, storage: Storage):
         self.settings = settings
         self.storage = storage
+        self.memory = MemoryService(settings, storage) if getattr(settings, "memory_enabled", False) else None
         self._agents: dict[int, AgentSession] = {}
 
     def get(self, user_id: int) -> AgentSession:
         agent = self._agents.get(user_id)
         if agent is None:
-            agent = AgentSession(user_id, self.settings, self.storage)
+            agent = AgentSession(user_id, self.settings, self.storage, self.memory)
             self._agents[user_id] = agent
         return agent
 
     async def shutdown(self) -> None:
+        if self.memory is not None:
+            await self.memory.shutdown()
         for agent in self._agents.values():
             try:
                 await agent.client.stop()
@@ -756,6 +784,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model list — 列出可用模型\n"
         "/model use <model_id> — 切换模型\n"
         "/cost [last|today] — 查看模型用量与估算费用\n"
+        "/memory — 查看和管理长期记忆\n"
+        "/summary — 查看或清空当前会话摘要\n"
         "/stop — 中止当前任务\n"
         "/status — 查看运行状态\n"
         "/help — 帮助"
@@ -847,8 +877,15 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
         if row is None or row["user_id"] != user.id:
             await reply_text(update, f"找不到会话 {sid}")
             return
-        if not row["pi_session_file"]:
-            await reply_text(update, "该会话没有关联的 pi 会话文件，无法切换（请用 /session new 创建）")
+        memory_service = getattr(agent, "memory", None)
+        missing_file = memory_service is not None and (
+            not row["pi_session_file"] or (
+                not Path(row["pi_session_file"]).is_file()
+                and not agent.client.has_live_session(row["pi_session_file"])
+            )
+        )
+        if not row["pi_session_file"] and memory_service is None:
+            await reply_text(update, "该会话没有可用的 pi 会话文件")
             return
         previous = storage.get_active_session(user.id)
         previous_file = previous["pi_session_file"] if previous else None
@@ -857,7 +894,17 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
             # 进程内切换会话，无需重启（避免冷启动）
             await agent.ensure_client()
             switch_attempted = True
-            await agent.client.switch_session(row["pi_session_file"])
+            if missing_file:
+                recovery = memory_service.build_recovery(sid)
+                state = await agent.client.reset_session()
+                new_file = state.get("sessionFile")
+                if not new_file:
+                    raise PiError("pi 未返回新会话文件")
+                storage.set_session_recovery(sid, new_file, recovery)
+                agent.recovery_notice = ("已从 SQLite 摘要恢复主要内容；旧 JSONL 未迁移"
+                                         if recovery else "旧 JSONL 不存在，SQLite 也没有可用摘要；已创建空白会话")
+            else:
+                await agent.client.switch_session(row["pi_session_file"])
             storage.set_active(sid)
         except Exception as e:
             logger.exception("切换会话失败", extra={"user_id": user.id, "err": str(e)[:300]})
@@ -871,7 +918,9 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
                     await agent.client.stop()
             await reply_text(update, f"切换会话失败: {_friendly_error(e)}")
         else:
-            await reply_text(update, f"✅ 已切换到会话「{row['name']}」({sid})")
+            await reply_text(update, f"✅ 已切换到会话「{row['name']}」({sid})"
+                             + (f"\n{agent.recovery_notice}" if missing_file else ""))
+            agent.recovery_notice = None
 
     else:
         await reply_text(update, "用法：/session new [名称] | /session list | /session use <id>")
@@ -1004,12 +1053,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
     counts = {key: 0 for key in ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")}
     total_usd = Decimal(0)
+    maintenance_usd = Decimal(0)
+    injected_bytes = 0
     unpriced = 0
     stale = False
     incomplete_usage = False
     has_events = False
     tiers: set[str] = set()
     for run in runs:
+        injected_bytes += run["memory_context_bytes"]
         run_counts = {key: 0 for key in counts}
         for event in storage.get_usage_events(run["id"]):
             has_events = True
@@ -1020,6 +1072,8 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
                 unpriced += 1
             else:
                 total_usd += Decimal(event["estimated_usd"])
+                if run["origin"] == "memory_maintenance":
+                    maintenance_usd += Decimal(event["estimated_usd"])
             if event["price_tier"]:
                 tiers.add(event["price_tier"])
             stale |= event["price_status"] == "stale_price"
@@ -1046,6 +1100,10 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
     ]
     if unpriced:
         lines.append(f"⚠️ {unpriced} 次模型调用未计价；上方金额不是完整总额")
+    if any(run["origin"] == "memory_maintenance" for run in runs):
+        lines.append(f"其中记忆维护：{format_usd(maintenance_usd)}")
+    if injected_bytes:
+        lines.append(f"记忆注入文本：{injected_bytes:,} 字节（不能精确拆分为计费 token）")
     if stale:
         lines.append("⚠️ 费率文件已到复核日期，请核对 DeepSeek 官方价格")
     if incomplete_usage:
@@ -1066,18 +1124,130 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     mode = context.args[0] if context.args else "last"
     if mode == "last":
-        last = storage.get_last_usage_run(user_id)
+        last = storage.get_last_usage_run(user_id, origin="chat")
         runs = [last] if last else []
         title = "📊 最近一轮"
     elif mode == "today":
         local_now = datetime.now(timezone(timedelta(hours=8)))
         midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
         runs = storage.get_usage_runs_since(user_id, midnight.timestamp())
-        title = f"📊 今日用量（北京时间，{len(runs)} 轮）"
+        chat_count = sum(run["origin"] == "chat" for run in runs)
+        maintenance_count = sum(run["origin"] == "memory_maintenance" for run in runs)
+        title = f"📊 今日用量（北京时间，聊天 {chat_count} 轮，记忆维护 {maintenance_count} 次）"
     else:
         await reply_text(update, "用法：/cost [last|today]")
         return
     await reply_text(update, _cost_report(storage, runs, title=title))
+
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = context.bot_data["settings"]
+    manager = context.bot_data["manager"]
+    memory = getattr(manager, "memory", None)
+    if memory is None:
+        await reply_text(update, "长期记忆未启用")
+        return
+    storage = context.bot_data["storage"]
+    user_id = update.effective_user.id
+    args = context.args or []
+    sub = args[0] if args else "list"
+    if sub == "list":
+        try:
+            page = max(1, int(args[1])) if len(args) > 1 else 1
+        except ValueError:
+            await reply_text(update, "用法：/memory list [页码]")
+            return
+        rows = storage.list_memories(user_id)
+        page_size = 8
+        shown = rows[(page - 1) * page_size:page * page_size]
+        lines = [f"🧠 长期记忆（{len(rows)}/{settings.memory_active_limit}，第 {page} 页）"]
+        lines += [f"{'📌 ' if row['pinned'] else ''}{row['id']}：{row['text']}" for row in shown]
+        if not shown:
+            lines.append("暂无此页记忆")
+        lines.append("/memory add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
+        await reply_text(update, "\n".join(lines))
+        return
+    if sub not in {"add", "edit", "delete", "pin", "unpin"}:
+        await reply_text(update, "用法：/memory list [页码] | add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
+        return
+    agent = manager.get(user_id)
+    async with agent.control_lock:
+        if sub == "add" or sub == "edit":
+            item = " ".join(args[1:] if sub == "add" else args[2:]).strip()
+            if not item or (sub == "edit" and len(args) < 3):
+                await reply_text(update, f"用法：/memory {sub} " + ("<内容>" if sub == "add" else "<id> <内容>"))
+                return
+            if len(item) > settings.memory_item_max_chars:
+                await reply_text(update, f"记忆过长，最多 {settings.memory_item_max_chars} 字符")
+                return
+            if looks_secret(item):
+                await reply_text(update, "请不要把密码、密钥或令牌存为长期记忆")
+                return
+            try:
+                if sub == "add":
+                    memory_id = storage.add_memory(user_id, item, limit=settings.memory_active_limit)
+                else:
+                    memory_id = args[1]
+                    if not storage.edit_memory(user_id, memory_id, item):
+                        await reply_text(update, "找不到这条记忆")
+                        return
+            except Exception as exc:
+                await reply_text(update, f"保存记忆失败：{str(exc)[:120]}")
+                return
+            result = f"✅ 已保存记忆 {memory_id}"
+        else:
+            if len(args) < 2:
+                await reply_text(update, f"用法：/memory {sub} <id>")
+                return
+            memory_id = args[1]
+            if sub == "delete":
+                changed = storage.delete_memory(user_id, memory_id)
+                result = f"已删除记忆 {memory_id}；旧会话历史中相同信息仍可能存在"
+            else:
+                changed = storage.pin_memory(user_id, memory_id, sub == "pin")
+                result = f"已{'置顶' if sub == 'pin' else '取消置顶'}记忆 {memory_id}"
+            if not changed:
+                await reply_text(update, "找不到这条记忆")
+                return
+        active = storage.get_active_session(user_id)
+        if active and not agent.client.busy:
+            try:
+                memory.refresh_context(user_id, active["id"], active["pi_session_file"])
+            except Exception:
+                memory.clear_context(user_id)
+                logger.exception("记忆变更后刷新上下文失败", extra={"user_id": user_id})
+                result += "；临时上下文刷新失败，下一轮将重新生成"
+        await reply_text(update, result + ("；当前正在进行的请求可能已读取旧内容" if agent.client.busy else ""))
+
+
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    manager = context.bot_data["manager"]
+    if getattr(manager, "memory", None) is None:
+        await reply_text(update, "会话摘要未启用")
+        return
+    storage = context.bot_data["storage"]
+    user_id = update.effective_user.id
+    active = storage.get_active_session(user_id)
+    if active is None:
+        await reply_text(update, "当前没有会话")
+        return
+    sub = context.args[0] if context.args else "show"
+    if sub == "show":
+        row = storage.get_summary(active["id"])
+        await reply_text(update, "📝 当前会话摘要\n" + (row["summary_text"] if row and row["summary_text"] else "暂无摘要"))
+    elif sub == "clear":
+        agent = manager.get(user_id)
+        async with agent.control_lock:
+            storage.clear_summary(active["id"])
+            if not agent.client.busy:
+                try:
+                    manager.memory.refresh_context(user_id, active["id"], active["pi_session_file"])
+                except Exception:
+                    manager.memory.clear_context(user_id)
+                    logger.exception("摘要清空后刷新上下文失败", extra={"user_id": user_id})
+        await reply_text(update, "已清空 SQLite 会话摘要；已压缩的旧内容无法仅靠数据库重建，旧 pi JSONL 不会自动删除")
+    else:
+        await reply_text(update, "用法：/summary [show|clear]")
 
 
 async def _read_usage_stats(client: PiRpcClient) -> dict | None:
@@ -1250,6 +1420,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     usage_run_id: str | None = None
     usage_seq = 0
     turn_settled = False
+    memory_turn_id: int | None = None
+    memory_session_id: str | None = None
+    assistant_text = ""
+    injected_bytes = 0
 
     # 相册由多条独立 Update 组成；逐条提交会丢失图片顺序或让后续图片撞上忙碌状态。
     # 当前明确要求单张发送，并在同一相册内只提示一次。
@@ -1303,6 +1477,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
                 await reply_text(update, f"⚠️ pi 进程启动失败: {_friendly_error(e)}")
                 return
+            if getattr(agent, "recovery_notice", None):
+                await reply_text(update, agent.recovery_notice)
+                agent.recovery_notice = None
 
             # 图片下载可能耗时，先完成校验，再依据最新的 busy 状态选择 steer 或 prompt。
             # 否则当前回合可能在下载期间结束，图片被提交到空闲 steer 队列。
@@ -1329,6 +1506,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         await agent.client.steer(text, images=images)
                     else:
                         await agent.client.steer(text)
+                    if getattr(agent, "active_turn_id", None) is not None:
+                        storage.append_turn_steer(
+                            agent.active_turn_id,
+                            safe_turn_text(text, getattr(settings, "memory_turn_user_chars", 4000)),
+                        )
                     await reply_text(update, "↩️ pi 已收到新指令，将在当前任务中处理")
                 except Exception as e:
                     logger.exception("插入指令失败", extra={"user_id": user.id})
@@ -1339,6 +1521,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             agent.prompt_pending = True
             owns_prompt = True
+            memory = getattr(manager, "memory", None)
+            if memory is not None:
+                try:
+                    active = storage.get_active_session(user.id)
+                    if active:
+                        memory_session_id = active["id"]
+                        memory_turn_id = storage.start_turn(
+                            user.id, memory_session_id, getattr(update, "update_id", None),
+                            safe_turn_text(text, settings.memory_turn_user_chars), has_image,
+                        )
+                        agent.active_turn_id = memory_turn_id
+                        injected_bytes = memory.refresh_context(
+                            user.id, memory_session_id, active["pi_session_file"], text,
+                        )
+                        logger.info("记忆上下文已准备", extra={"user_id": user.id,
+                                   "injected_bytes": injected_bytes})
+                except Exception:
+                    logger.exception("准备记忆上下文失败", extra={"user_id": user.id})
+                    memory.clear_context(user.id)
 
         if getattr(settings, "cost_tracking_enabled", False):
             stats_before = await _read_usage_stats(agent.client)
@@ -1347,6 +1548,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 usage_run_id = storage.start_usage_run(
                     user.id, active["id"] if active else None,
                     getattr(update, "update_id", None), stats_before,
+                    memory_context_bytes=injected_bytes,
                 )
             except Exception:
                 logger.exception("创建用量记录失败", extra={"user_id": user.id})
@@ -1379,7 +1581,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 notify()
 
         async def gen():
-            nonlocal turn_settled
+            nonlocal turn_settled, assistant_text
             async for delta in agent.client.prompt(
                 text,
                 images=images,
@@ -1387,6 +1589,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 on_tool=on_tool,
                 on_usage=on_usage,
             ):
+                if memory_turn_id is not None:
+                    assistant_text = (assistant_text + delta)[:settings.memory_turn_assistant_chars]
                 yield delta
             turn_settled = True
 
@@ -1405,12 +1609,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_text(update, f"⚠️ 处理出错: {_friendly_error(e)}")
     finally:
         if owns_prompt:
+            if memory_turn_id is not None:
+                try:
+                    storage.finish_turn(
+                        memory_turn_id,
+                        safe_turn_text(assistant_text, settings.memory_turn_assistant_chars),
+                        complete=turn_settled,
+                    )
+                    if turn_settled and memory_session_id is not None:
+                        manager.memory.schedule_summary(user.id, memory_session_id)
+                except Exception:
+                    logger.exception("保存会话回合失败", extra={"user_id": user.id})
+            if hasattr(agent, "active_turn_id"):
+                agent.active_turn_id = None
             if usage_run_id is not None:
                 stats_after = await _read_usage_stats(agent.client)
                 try:
                     storage.finish_usage_run(usage_run_id, "complete" if turn_settled else "incomplete", stats_after)
                     if getattr(settings, "cost_auto_report", False):
-                        run = storage.get_last_usage_run(user.id)
+                        run = storage.get_last_usage_run(user.id, origin="chat")
                         if run is not None and run["id"] == usage_run_id:
                             try:
                                 await reply_text(update, _cost_report(storage, [run], title="📊 本轮用量"))
@@ -1441,6 +1658,8 @@ COMMAND_MENU = [
     ("model", "模型管理"),
     ("status", "运行状态"),
     ("cost", "模型用量与费用"),
+    ("memory", "长期记忆"),
+    ("summary", "当前会话摘要"),
     ("stop", "中止任务"),
 ]
 
@@ -1497,6 +1716,8 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         CommandHandler("stop", cmd_stop),
         CommandHandler("status", cmd_status),
         CommandHandler("cost", cmd_cost),
+        CommandHandler("memory", cmd_memory),
+        CommandHandler("summary", cmd_summary),
         CallbackQueryHandler(on_callback),
     ]
     for h in handlers:

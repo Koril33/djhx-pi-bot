@@ -52,11 +52,15 @@ class PiRpcClient:
         session_dir: str,
         provider: str | None = None,
         model: str | None = None,
+        extra_args: list[str] | None = None,
+        extra_env: dict[str, str] | None = None,
     ):
         self.pi_cmd = pi_cmd
         self.session_dir = session_dir
         self.provider = provider
         self.model = model
+        self.extra_args = extra_args or []
+        self.extra_env = extra_env or {}
         self._session_file: str | None = None
         self.proc: asyncio.subprocess.Process | None = None
         self._event_queue: asyncio.Queue[dict | PiError] = asyncio.Queue(maxsize=MAX_QUEUED_EVENTS)
@@ -70,6 +74,14 @@ class PiRpcClient:
         self._lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
 
+    def has_live_session(self, session_file: str | None) -> bool:
+        """新会话的 JSONL 可能直到首轮 prompt 才落盘。"""
+        return bool(
+            session_file and self._session_file == session_file and self.proc
+            and self.proc.returncode is None and self._transport_error is None
+            and self._reader_task and not self._reader_task.done()
+        )
+
     # ---------- 进程生命周期 ----------
     async def start(self, session_file: str | None = None) -> None:
         Path(self.session_dir).mkdir(parents=True, exist_ok=True)
@@ -80,9 +92,11 @@ class PiRpcClient:
             args += ["--provider", self.provider]
         if self.model:
             args += ["--model", self.model]
+        args += self.extra_args
 
         logger.info("spawn pi rpc", extra={"pi_args": args})
         env = os.environ.copy()
+        env.update(self.extra_env)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -479,6 +493,18 @@ class PiRpcClient:
                 # 会话已经创建；名称设置失败不能让上层误以为切换未发生。
                 logger.exception("pi 会话创建成功，但设置名称失败", extra={"session_name": name})
         return data
+
+    async def reset_session(self) -> dict:
+        """丢失旧 JSONL 时从新的本地会话文件开始。"""
+        if self.busy:
+            raise PiBusyError("pi 正在处理请求，不能重建会话")
+        async with self._lock:
+            if self.busy:
+                raise PiBusyError("pi 正在处理请求，不能重建会话")
+            await self._stop_unlocked()
+            self._session_file = None
+            await self.start()
+        return await self.get_state()
 
     async def get_state(self) -> dict:
         data = await self._command("get_state")

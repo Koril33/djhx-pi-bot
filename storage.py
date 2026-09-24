@@ -5,6 +5,7 @@
 - sessions: 会话记录（每个会话对应 pi 侧的一个 jsonl 会话文件）
 """
 import json
+import hashlib
 import os
 import sqlite3
 import threading
@@ -40,6 +41,8 @@ CREATE TABLE IF NOT EXISTS usage_runs (
     started_at         REAL NOT NULL,
     finished_at        REAL,
     status             TEXT NOT NULL DEFAULT 'running',
+    origin             TEXT NOT NULL DEFAULT 'chat',
+    memory_context_bytes INTEGER NOT NULL DEFAULT 0,
     stats_before       TEXT,
     stats_after        TEXT
 );
@@ -65,6 +68,48 @@ CREATE TABLE IF NOT EXISTS usage_events (
     PRIMARY KEY (run_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_run ON usage_events(run_id);
+
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id            INTEGER NOT NULL,
+    session_id         TEXT NOT NULL,
+    telegram_update_id INTEGER UNIQUE,
+    user_text          TEXT NOT NULL,
+    steer_text         TEXT NOT NULL DEFAULT '',
+    assistant_text     TEXT NOT NULL DEFAULT '',
+    has_image          INTEGER NOT NULL DEFAULT 0,
+    status             TEXT NOT NULL DEFAULT 'running',
+    created_at         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turns_session ON conversation_turns(session_id, id);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id      TEXT PRIMARY KEY,
+    user_id         INTEGER NOT NULL,
+    summary_text    TEXT NOT NULL DEFAULT '',
+    covered_turn_id INTEGER NOT NULL DEFAULT 0,
+    updated_at      REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_items (
+    id           TEXT PRIMARY KEY,
+    user_id      INTEGER NOT NULL,
+    text         TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    pinned       INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    UNIQUE (user_id, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_user ON memory_items(user_id, pinned DESC, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS session_recovery (
+    session_id     TEXT PRIMARY KEY,
+    pi_session_file TEXT NOT NULL,
+    context_text   TEXT NOT NULL,
+    updated_at     REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS telegram_updates (
     update_id      INTEGER PRIMARY KEY,
@@ -96,6 +141,11 @@ class Storage:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(usage_runs)")}
+            if "origin" not in columns:
+                self._conn.execute("ALTER TABLE usage_runs ADD COLUMN origin TEXT NOT NULL DEFAULT 'chat'")
+            if "memory_context_bytes" not in columns:
+                self._conn.execute("ALTER TABLE usage_runs ADD COLUMN memory_context_bytes INTEGER NOT NULL DEFAULT 0")
             self._conn.commit()
 
     def _query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -192,17 +242,171 @@ class Storage:
     def touch(self, sid: str) -> None:
         self._exec("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?", (sid,))
 
+    # ---------- 可迁移的会话摘要和长期记忆 ----------
+    def start_turn(self, user_id: int, session_id: str, update_id: int | None,
+                   user_text: str, has_image: bool) -> int:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO conversation_turns "
+                "(user_id, session_id, telegram_update_id, user_text, has_image, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, session_id, update_id, user_text, int(has_image), time.time()),
+            )
+            row = self._conn.execute(
+                "SELECT id FROM conversation_turns WHERE telegram_update_id = ?" if update_id is not None
+                else "SELECT last_insert_rowid() AS id",
+                (update_id,) if update_id is not None else (),
+            ).fetchone()
+            return row["id"]
+
+    def append_turn_steer(self, turn_id: int, text: str) -> None:
+        self._exec("UPDATE conversation_turns SET steer_text = steer_text || ? WHERE id = ?",
+                   ("\n" + text, turn_id))
+
+    def finish_turn(self, turn_id: int, assistant_text: str, *, complete: bool) -> None:
+        self._exec("UPDATE conversation_turns SET assistant_text = ?, status = ? WHERE id = ?",
+                   (assistant_text, "complete" if complete else "incomplete", turn_id))
+
+    def get_summary(self, session_id: str) -> sqlite3.Row | None:
+        rows = self._query("SELECT * FROM session_summaries WHERE session_id = ?", (session_id,))
+        return rows[0] if rows else None
+
+    def pending_summary_turns(self, session_id: str) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT * FROM conversation_turns WHERE session_id = ? AND status = 'complete' "
+            "AND id > COALESCE((SELECT covered_turn_id FROM session_summaries WHERE session_id = ?), 0) "
+            "ORDER BY id", (session_id, session_id),
+        )
+
+    def latest_turns(self, session_id: str, after_id: int = 0) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT * FROM conversation_turns WHERE session_id = ? AND status = 'complete' "
+            "AND id > ? ORDER BY id", (session_id, after_id),
+        )
+
+    def apply_summary(self, user_id: int, session_id: str, previous_covered_id: int,
+                      covered_id: int, summary: str, candidates: list[str],
+                      *, memory_limit: int, turn_retention: int) -> None:
+        now = time.time()
+        with self._lock, self._conn:
+            old = self._conn.execute(
+                "SELECT covered_turn_id FROM session_summaries WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if (old[0] if old else 0) != previous_covered_id:
+                raise ValueError("会话摘要已被其他任务更新")
+            self._conn.execute(
+                "INSERT INTO session_summaries (session_id, user_id, summary_text, covered_turn_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
+                "summary_text=excluded.summary_text, covered_turn_id=excluded.covered_turn_id, "
+                "updated_at=excluded.updated_at",
+                (session_id, user_id, summary, covered_id, now),
+            )
+            count = self._conn.execute(
+                "SELECT count(*) FROM memory_items WHERE user_id = ?", (user_id,)
+            ).fetchone()[0]
+            for item in candidates:
+                if count >= memory_limit:
+                    break
+                digest = hashlib.sha256(item.casefold().strip().encode("utf-8")).hexdigest()
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO memory_items "
+                    "(id, user_id, text, content_hash, source, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'auto', ?, ?)",
+                    (uuid.uuid4().hex[:12], user_id, item, digest, now, now),
+                )
+                count += cur.rowcount
+            self._conn.execute(
+                "DELETE FROM conversation_turns WHERE session_id = ? AND id <= ? "
+                "AND id NOT IN (SELECT id FROM conversation_turns WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT ?)",
+                (session_id, covered_id, session_id, turn_retention),
+            )
+
+    def clear_summary(self, session_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE session_summaries SET summary_text = '', updated_at = ? WHERE session_id = ?",
+                               (time.time(), session_id))
+            self._conn.execute("UPDATE session_recovery SET context_text = '' WHERE session_id = ?",
+                               (session_id,))
+
+    def list_memories(self, user_id: int) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT * FROM memory_items WHERE user_id = ? ORDER BY pinned DESC, updated_at DESC", (user_id,),
+        )
+
+    def get_memory(self, user_id: int, memory_id: str) -> sqlite3.Row | None:
+        rows = self._query("SELECT * FROM memory_items WHERE user_id = ? AND id = ?", (user_id, memory_id))
+        return rows[0] if rows else None
+
+    def add_memory(self, user_id: int, item: str, *, limit: int, source: str = "manual") -> str:
+        digest = hashlib.sha256(item.casefold().strip().encode("utf-8")).hexdigest()
+        now = time.time()
+        with self._lock, self._conn:
+            existing = self._conn.execute(
+                "SELECT id FROM memory_items WHERE user_id = ? AND content_hash = ?", (user_id, digest)
+            ).fetchone()
+            if existing:
+                return existing["id"]
+            count = self._conn.execute("SELECT count(*) FROM memory_items WHERE user_id = ?", (user_id,)).fetchone()[0]
+            if count >= limit:
+                raise ValueError("记忆已达到数量上限，请先删除或编辑已有记忆")
+            memory_id = uuid.uuid4().hex[:12]
+            self._conn.execute(
+                "INSERT INTO memory_items (id, user_id, text, content_hash, source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (memory_id, user_id, item, digest, source, now, now),
+            )
+            return memory_id
+
+    def edit_memory(self, user_id: int, memory_id: str, item: str) -> bool:
+        digest = hashlib.sha256(item.casefold().strip().encode("utf-8")).hexdigest()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE memory_items SET text = ?, content_hash = ?, updated_at = ? "
+                "WHERE user_id = ? AND id = ?", (item, digest, time.time(), user_id, memory_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_memory(self, user_id: int, memory_id: str) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM memory_items WHERE user_id = ? AND id = ?", (user_id, memory_id))
+            return cur.rowcount > 0
+
+    def pin_memory(self, user_id: int, memory_id: str, pinned: bool) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute("UPDATE memory_items SET pinned = ?, updated_at = ? "
+                                     "WHERE user_id = ? AND id = ?",
+                                     (int(pinned), time.time(), user_id, memory_id))
+            return cur.rowcount > 0
+
+    def set_session_recovery(self, session_id: str, pi_session_file: str, context_text: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE sessions SET pi_session_file = ? WHERE id = ?",
+                               (pi_session_file, session_id))
+            self._conn.execute(
+                "INSERT INTO session_recovery (session_id, pi_session_file, context_text, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
+                "pi_session_file=excluded.pi_session_file, context_text=excluded.context_text, "
+                "updated_at=excluded.updated_at",
+                (session_id, pi_session_file, context_text, time.time()),
+            )
+
+    def get_session_recovery(self, session_id: str, pi_session_file: str | None) -> str:
+        rows = self._query("SELECT context_text FROM session_recovery WHERE session_id = ? "
+                           "AND pi_session_file = ?", (session_id, pi_session_file))
+        return rows[0]["context_text"] if rows else ""
+
     # ---------- LLM 用量账本 ----------
     def start_usage_run(
         self, user_id: int, session_id: str | None, telegram_update_id: int | None,
-        stats_before: dict | None,
+        stats_before: dict | None, *, origin: str = "chat", memory_context_bytes: int = 0,
     ) -> str:
         run_id = uuid.uuid4().hex
         self._exec(
-            "INSERT INTO usage_runs (id, user_id, session_id, telegram_update_id, started_at, stats_before) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO usage_runs (id, user_id, session_id, telegram_update_id, started_at, stats_before, "
+            "origin, memory_context_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (run_id, user_id, session_id, telegram_update_id, time.time(),
-             json.dumps(stats_before) if stats_before is not None else None),
+             json.dumps(stats_before) if stats_before is not None else None, origin, memory_context_bytes),
         )
         return run_id
 
@@ -222,9 +426,10 @@ class Storage:
             (status, time.time(), json.dumps(stats_after) if stats_after is not None else None, run_id),
         )
 
-    def get_last_usage_run(self, user_id: int) -> sqlite3.Row | None:
+    def get_last_usage_run(self, user_id: int, origin: str | None = None) -> sqlite3.Row | None:
         rows = self._query(
-            "SELECT * FROM usage_runs WHERE user_id = ? ORDER BY started_at DESC LIMIT 1", (user_id,),
+            "SELECT * FROM usage_runs WHERE user_id = ? AND (? IS NULL OR origin = ?) "
+            "ORDER BY started_at DESC LIMIT 1", (user_id, origin, origin),
         )
         return rows[0] if rows else None
 

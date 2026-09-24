@@ -31,6 +31,25 @@ class Settings(BaseSettings):
     cost_tracking_enabled: bool = True
     cost_auto_report: bool = True
 
+    # SQLite 长期记忆与会话摘要；全部预算可通过环境变量调整
+    memory_enabled: bool = True
+    memory_auto_extract: bool = True
+    memory_model: str = "deepseek-flash"
+    memory_batch_turns: int = 5
+    memory_summary_retry_seconds: int = 3600
+    memory_turn_retention: int = 20
+    memory_turn_user_chars: int = 4000
+    memory_turn_assistant_chars: int = 8000
+    memory_summary_input_max_bytes: int = 16000
+    memory_summary_response_max_bytes: int = 8192
+    memory_active_limit: int = 100
+    memory_item_max_chars: int = 240
+    memory_inject_max_items: int = 6
+    memory_inject_max_bytes: int = 4096
+    memory_summary_max_bytes: int = 1536
+    memory_items_max_bytes: int = 2048
+    memory_context_dir: str = "data/memory-context"
+
     # 服务
     host: str = "127.0.0.1"
     port: int = 8128
@@ -77,6 +96,21 @@ class Settings(BaseSettings):
             raise ValueError("Webhook 队列容量或请求大小限制无效")
         if self.shutdown_drain_seconds <= 0:
             raise ValueError("SHUTDOWN_DRAIN_SECONDS 必须大于 0")
+        if self.memory_enabled:
+            limits = (
+                self.memory_batch_turns, self.memory_turn_retention,
+                self.memory_summary_retry_seconds,
+                self.memory_turn_user_chars, self.memory_turn_assistant_chars,
+                self.memory_summary_input_max_bytes, self.memory_active_limit,
+                self.memory_summary_response_max_bytes,
+                self.memory_item_max_chars, self.memory_inject_max_items,
+                self.memory_inject_max_bytes, self.memory_summary_max_bytes,
+                self.memory_items_max_bytes,
+            )
+            if any(value < 1 for value in limits):
+                raise ValueError("MEMORY_* 限额必须大于 0")
+            if self.memory_summary_max_bytes + self.memory_items_max_bytes > self.memory_inject_max_bytes:
+                raise ValueError("摘要和记忆注入预算之和不能超过 MEMORY_INJECT_MAX_BYTES")
 
 
 @lru_cache
