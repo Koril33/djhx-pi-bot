@@ -1,0 +1,36 @@
+{
+  "revision": "deepseek-2026-09-24",
+  "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "checked_at": "2026-09-24T00:00:00Z",
+  "review_after": "2026-10-24T00:00:00Z",
+  "effective_from": "2026-09-10T04:00:00Z",
+  "effective_until": "2027-01-01T00:00:00Z",
+  "currency": "USD",
+  "per_tokens": 1000000,
+  "provider": "deepseek",
+  "aliases": {
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash"
+  },
+  "peak_schedule": {
+    "weekdays_utc": [0, 1, 2, 3, 4],
+    "windows_utc": [["01:00", "04:00"], ["06:00", "10:00"]],
+    "china_offset_minutes": 480,
+    "china_holidays": [
+      "2026-09-25", "2026-09-26", "2026-09-27",
+      "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04",
+      "2026-10-05", "2026-10-06", "2026-10-07"
+    ],
+    "holiday_calendar_through": "2026-12-31"
+  },
+  "models": {
+    "deepseek-flash": {
+      "peak": {"cache_miss": "0.30", "cache_hit": "0.006", "output": "1.20"},
+      "off_peak": {"cache_miss": "0.15", "cache_hit": "0.003", "output": "0.60"}
+    },
+    "deepseek-v4-pro": {
+      "peak": {"cache_miss": "1.32", "cache_hit": "0.044", "output": "3.96"},
+      "off_peak": {"cache_miss": "0.66", "cache_hit": "0.022", "output": "1.98"}
+    }
+  }
+}

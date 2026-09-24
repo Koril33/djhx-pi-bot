@@ -58,6 +58,28 @@ class PiRpcClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.stop()
         self.tempdir.cleanup()
 
+    async def test_collects_each_model_call_and_compaction_usage(self) -> None:
+        usage = {"input": 2, "cacheRead": 3, "cacheWrite": 0,
+                 "output": 4, "reasoning": 1, "totalTokens": 9}
+
+        def on_command(command):
+            proc.emit({"id": command["id"], "type": "response", "command": "prompt", "success": True})
+            for index in range(2):
+                proc.emit({"type": "message_end", "message": {"role": "assistant",
+                    "provider": "deepseek", "model": "deepseek-flash", "timestamp": 1790215200000,
+                    "usage": usage, "stopReason": "toolUse" if index == 0 else "stop"}})
+            proc.emit({"type": "compaction_end", "result": {"usage": usage}})
+            proc.emit({"type": "agent_settled"})
+
+        proc = FakeProc(on_command)
+        received = []
+        with patch("pi_bridge.asyncio.create_subprocess_exec", return_value=proc):
+            result = "".join([part async for part in self.client.prompt("hello", on_usage=received.append)])
+        self.assertEqual(result, "")
+        self.assertEqual([item["kind"] for item in received], ["assistant", "assistant", "compaction"])
+        self.assertEqual(received[0]["occurred_at"], 1790215200)
+        self.assertEqual(received[0]["usage"]["cacheRead"], 3)
+
     async def test_reads_120kb_record_and_waits_for_agent_settled(self) -> None:
         def on_command(command):
             proc.emit({"id": command["id"], "type": "response", "command": "prompt", "success": True})

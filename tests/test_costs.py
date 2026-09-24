@@ -1,0 +1,104 @@
+import json
+import tempfile
+import unittest
+from contextlib import closing
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+from bot import _cost_report
+from costs import PricingCatalog, PriceResult, normalize_usage
+from storage import Storage
+
+
+def utc(value: str) -> float:
+    return datetime.fromisoformat(value).replace(tzinfo=timezone.utc).timestamp()
+
+
+class PricingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.catalog = PricingCatalog()
+        self.usage = {"input": 236, "cacheRead": 2304, "cacheWrite": 0,
+                      "output": 124, "reasoning": 10}
+
+    def test_peak_uses_cache_miss_hit_and_output_without_double_counting_reasoning(self) -> None:
+        result = self.catalog.price("deepseek", "deepseek-v4-flash", self.usage,
+                                    utc("2026-09-24T02:00:00"))
+        self.assertEqual(result.status, "priced")
+        self.assertEqual(result.tier, "peak")
+        self.assertEqual(Decimal(result.usd), Decimal("0.000233424"))
+        self.assertEqual(json.loads(result.snapshot)["model"], "deepseek-flash")
+
+    def test_weekend_and_chinese_holiday_use_offpeak_rate(self) -> None:
+        for date in ("2026-09-26T02:00:00", "2026-10-01T02:00:00"):
+            result = self.catalog.price("deepseek", "deepseek-flash", self.usage, utc(date))
+            self.assertEqual(result.tier, "off_peak")
+            self.assertEqual(Decimal(result.usd), Decimal("0.000116712"))
+
+    def test_unknown_model_and_expired_calendar_are_not_silently_priced(self) -> None:
+        self.assertEqual(self.catalog.price("other", "deepseek-flash", self.usage,
+                                             utc("2026-09-24T02:00:00")).status, "missing_rule")
+        self.assertEqual(self.catalog.price("deepseek", "future-model", self.usage,
+                                             utc("2026-09-24T02:00:00")).status, "missing_rule")
+        self.assertEqual(self.catalog.price("deepseek", "deepseek-flash", self.usage,
+                                             utc("2027-01-01T02:00:00")).status, "outside_effective_period")
+
+    def test_updated_price_file_is_read_without_code_change(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            config = json.loads(Path(self.catalog.path).read_text(encoding="utf-8"))
+            path = Path(folder) / "pricing.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            catalog = PricingCatalog(str(path))
+            first = catalog.price("deepseek", "deepseek-flash", self.usage, utc("2026-09-24T02:00:00"))
+            config["revision"] = "new-revision"
+            config["models"]["deepseek-flash"]["peak"]["output"] = "2.40"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            second = catalog.price("deepseek", "deepseek-flash", self.usage, utc("2026-09-24T02:00:00"))
+            self.assertGreater(Decimal(second.usd), Decimal(first.usd))
+            self.assertEqual(json.loads(second.snapshot)["revision"], "new-revision")
+            config["per_tokens"] = 0
+            path.write_text(json.dumps(config), encoding="utf-8")
+            self.assertEqual(catalog.price("deepseek", "deepseek-flash", self.usage,
+                                           utc("2026-09-24T02:00:00")).status, "invalid_config")
+
+
+class UsageLedgerTests(unittest.TestCase):
+    def test_persists_price_snapshot_and_flags_unaccounted_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(str(Path(folder) / "bot.db"))
+            with closing(storage._conn):
+                self._check_persisted_snapshot(storage)
+
+    def _check_persisted_snapshot(self, storage: Storage) -> None:
+        run_id = storage.start_usage_run(42, None, 123, {"tokens": {"input": 0, "output": 0,
+                "cacheRead": 0, "cacheWrite": 0}})
+        event = {"kind": "assistant", "occurred_at": utc("2026-09-24T02:00:00"),
+                 "provider": "deepseek", "model": "deepseek-flash", "usage": {
+                     "input": 2, "cacheRead": 3, "output": 4, "reasoning": 1}}
+        price = PricingCatalog().price(event["provider"], event["model"],
+                                       event["usage"], event["occurred_at"])
+        storage.record_usage_event(run_id, 1, event, price)
+        storage.finish_usage_run(run_id, "complete", {"tokens": {"input": 3, "output": 4,
+            "cacheRead": 3, "cacheWrite": 0}})
+        row = storage.get_usage_events(run_id)[0]
+        self.assertEqual(row["total_tokens"], 9)
+        self.assertEqual(row["price_snapshot"], price.snapshot)
+        report = _cost_report(storage, [storage.get_last_usage_run(42)], title="test")
+        self.assertIn("pi 会话统计高于已记录事件", report)
+        self.assertIn("缓存命中 3", report)
+
+    def test_unknown_price_is_visible_in_report(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(str(Path(folder) / "bot.db"))
+            with closing(storage._conn):
+                run_id = storage.start_usage_run(42, None, None, None)
+                storage.record_usage_event(run_id, 1, {"kind": "assistant", "occurred_at": 1,
+                    "provider": "other", "model": "model", "usage": {"input": 1, "output": 1}},
+                    PriceResult("missing_rule"))
+                storage.finish_usage_run(run_id, "complete", None)
+                report = _cost_report(storage, [storage.get_last_usage_run(42)], title="test")
+                self.assertIn("1 次模型调用未计价", report)
+
+
+if __name__ == "__main__":
+    unittest.main()

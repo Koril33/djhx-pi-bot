@@ -11,8 +11,11 @@ V1 拓扑：单个环境（服务器本机），每用户一个常驻 pi RPC 进
 """
 import asyncio
 import base64
+import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from html import escape
 
 import httpx
@@ -30,6 +33,7 @@ from telegram.ext import (
 )
 
 from config import Settings
+from costs import PricingCatalog, format_usd
 from logging_conf import get_logger
 from pi_bridge import PiBusyError, PiError, PiRpcClient
 from storage import Storage
@@ -751,6 +755,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/session use <id> — 切换到指定会话\n"
         "/model list — 列出可用模型\n"
         "/model use <model_id> — 切换模型\n"
+        "/cost [last|today] — 查看模型用量与估算费用\n"
         "/stop — 中止当前任务\n"
         "/status — 查看运行状态\n"
         "/help — 帮助"
@@ -996,6 +1001,94 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _cmd_status_unlocked(update, context)
 
 
+def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
+    counts = {key: 0 for key in ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")}
+    total_usd = Decimal(0)
+    unpriced = 0
+    stale = False
+    incomplete_usage = False
+    has_events = False
+    tiers: set[str] = set()
+    for run in runs:
+        run_counts = {key: 0 for key in counts}
+        for event in storage.get_usage_events(run["id"]):
+            has_events = True
+            for key in counts:
+                counts[key] += event[key]
+                run_counts[key] += event[key]
+            if event["estimated_usd"] is None:
+                unpriced += 1
+            else:
+                total_usd += Decimal(event["estimated_usd"])
+            if event["price_tier"]:
+                tiers.add(event["price_tier"])
+            stale |= event["price_status"] == "stale_price"
+        if run["stats_before"] and run["stats_after"]:
+            try:
+                before = json.loads(run["stats_before"])["tokens"]
+                after = json.loads(run["stats_after"])["tokens"]
+                for field, ledger_field in (("input", "input_tokens"), ("cacheRead", "cache_read_tokens"),
+                                            ("cacheWrite", "cache_write_tokens"), ("output", "output_tokens")):
+                    if after[field] - before[field] > run_counts[ledger_field]:
+                        incomplete_usage = True
+            except (KeyError, TypeError, ValueError):
+                pass
+    if not runs:
+        return f"{title}：暂无用量记录"
+    tier_name = {"peak": "峰时", "off_peak": "谷时"}
+    tier_label = "、".join(tier_name.get(tier, tier) for tier in sorted(tiers))
+    lines = [
+        title,
+        f"输入：未命中 {counts['input_tokens']:,} · 缓存命中 {counts['cache_read_tokens']:,}"
+        + (f" · 缓存写入 {counts['cache_write_tokens']:,}" if counts["cache_write_tokens"] else ""),
+        f"输出：{counts['output_tokens']:,} tokens",
+        f"按公开价格估算：{format_usd(total_usd)}" + (f"（{tier_label}）" if tier_label else ""),
+    ]
+    if unpriced:
+        lines.append(f"⚠️ {unpriced} 次模型调用未计价；上方金额不是完整总额")
+    if stale:
+        lines.append("⚠️ 费率文件已到复核日期，请核对 DeepSeek 官方价格")
+    if incomplete_usage:
+        lines.append("⚠️ pi 会话统计高于已记录事件；可能包含工具或摘要调用，金额可能偏低")
+    if any(run["status"] != "complete" for run in runs):
+        lines.append("⚠️ 存在未完成回合，用量可能不完整")
+    if not has_events:
+        lines.append("尚未收到模型用量；请勿将 $0 视为官方实扣金额")
+    return "\n".join(lines)
+
+
+async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = context.bot_data["settings"]
+    if not getattr(settings, "cost_tracking_enabled", False):
+        await reply_text(update, "用量记录未启用")
+        return
+    storage = context.bot_data["storage"]
+    user_id = update.effective_user.id
+    mode = context.args[0] if context.args else "last"
+    if mode == "last":
+        last = storage.get_last_usage_run(user_id)
+        runs = [last] if last else []
+        title = "📊 最近一轮"
+    elif mode == "today":
+        local_now = datetime.now(timezone(timedelta(hours=8)))
+        midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        runs = storage.get_usage_runs_since(user_id, midnight.timestamp())
+        title = f"📊 今日用量（北京时间，{len(runs)} 轮）"
+    else:
+        await reply_text(update, "用法：/cost [last|today]")
+        return
+    await reply_text(update, _cost_report(storage, runs, title=title))
+
+
+async def _read_usage_stats(client: PiRpcClient) -> dict | None:
+    try:
+        stats = await client.get_session_stats()
+        return {"tokens": stats.get("tokens"), "cost": stats.get("cost")}
+    except Exception as exc:
+        logger.warning("读取 pi 会话用量失败", extra={"err": str(exc)[:200]})
+        return None
+
+
 # ================= 快捷按钮回调 =================
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1154,6 +1247,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = "请分析这张图片。"
     chat = update.effective_chat
     owns_prompt = False
+    usage_run_id: str | None = None
+    usage_seq = 0
+    turn_settled = False
 
     # 相册由多条独立 Update 组成；逐条提交会丢失图片顺序或让后续图片撞上忙碌状态。
     # 当前明确要求单张发送，并在同一相册内只提示一次。
@@ -1244,6 +1340,30 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             agent.prompt_pending = True
             owns_prompt = True
 
+        if getattr(settings, "cost_tracking_enabled", False):
+            stats_before = await _read_usage_stats(agent.client)
+            try:
+                active = storage.get_active_session(user.id)
+                usage_run_id = storage.start_usage_run(
+                    user.id, active["id"] if active else None,
+                    getattr(update, "update_id", None), stats_before,
+                )
+            except Exception:
+                logger.exception("创建用量记录失败", extra={"user_id": user.id})
+
+        pricing = PricingCatalog(getattr(settings, "pricing_file", "pricing.json"))
+
+        def on_usage(event: dict) -> None:
+            nonlocal usage_seq
+            if usage_run_id is None:
+                return
+            usage_seq += 1
+            price = pricing.price(event["provider"], event["model"], event["usage"], event["occurred_at"])
+            try:
+                storage.record_usage_event(usage_run_id, usage_seq, event, price)
+            except Exception:
+                logger.exception("保存模型用量失败", extra={"user_id": user.id, "run_id": usage_run_id})
+
         # 思考占位 + 工具活动状态
         placeholder = {"msg": None}
         activity = {"current": None}
@@ -1259,13 +1379,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 notify()
 
         async def gen():
+            nonlocal turn_settled
             async for delta in agent.client.prompt(
                 text,
                 images=images,
                 on_thinking=on_thinking,
                 on_tool=on_tool,
+                on_usage=on_usage,
             ):
                 yield delta
+            turn_settled = True
 
         await stream_reply(
             update, gen(), settings.stream_edit_interval,
@@ -1282,6 +1405,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_text(update, f"⚠️ 处理出错: {_friendly_error(e)}")
     finally:
         if owns_prompt:
+            if usage_run_id is not None:
+                stats_after = await _read_usage_stats(agent.client)
+                try:
+                    storage.finish_usage_run(usage_run_id, "complete" if turn_settled else "incomplete", stats_after)
+                    if getattr(settings, "cost_auto_report", False):
+                        run = storage.get_last_usage_run(user.id)
+                        if run is not None and run["id"] == usage_run_id:
+                            try:
+                                await reply_text(update, _cost_report(storage, [run], title="📊 本轮用量"))
+                            except Exception:
+                                logger.exception("发送用量摘要失败", extra={"user_id": user.id})
+                except Exception:
+                    logger.exception("完成用量记录失败", extra={"user_id": user.id, "run_id": usage_run_id})
             agent.prompt_pending = False
         stop_typing.set()
         keepalive.cancel()
@@ -1304,6 +1440,7 @@ COMMAND_MENU = [
     ("session", "会话管理"),
     ("model", "模型管理"),
     ("status", "运行状态"),
+    ("cost", "模型用量与费用"),
     ("stop", "中止任务"),
 ]
 
@@ -1359,6 +1496,7 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         CommandHandler("model", cmd_model),
         CommandHandler("stop", cmd_stop),
         CommandHandler("status", cmd_status),
+        CommandHandler("cost", cmd_cost),
         CallbackQueryHandler(on_callback),
     ]
     for h in handlers:

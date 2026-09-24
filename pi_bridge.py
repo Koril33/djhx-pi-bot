@@ -212,12 +212,29 @@ class PiRpcClient:
             if isinstance(message, dict) and message.get("role") == "assistant":
                 routed = {"type": etype, "message": {"role": "assistant", "stopReason": message.get("stopReason"),
                                                        "errorMessage": str(message.get("errorMessage") or "")[:500]}}
+                if isinstance(message.get("usage"), dict):
+                    routed["message"]["usage"] = {
+                        key: message["usage"][key]
+                        for key in ("input", "output", "cacheRead", "cacheWrite", "reasoning", "totalTokens")
+                        if key in message["usage"]
+                    }
+                for key in ("provider", "model", "timestamp"):
+                    if key in message:
+                        routed["message"][key] = message[key]
         elif etype in ("auto_retry_end", "compaction_end", "error", "agent_settled"):
             routed = {"type": etype}
             for key in ("success", "finalError", "errorMessage", "error", "message"):
                 if key in event:
                     value = event[key]
                     routed[key] = value if isinstance(value, bool) else str(value)[:500]
+            if etype == "compaction_end" and isinstance(event.get("result"), dict):
+                usage = event["result"].get("usage")
+                if isinstance(usage, dict):
+                    routed["usage"] = {
+                        key: usage[key]
+                        for key in ("input", "output", "cacheRead", "cacheWrite", "reasoning", "totalTokens")
+                        if key in usage
+                    }
         if routed is not None:
             await self._event_queue.put(routed)
 
@@ -336,6 +353,7 @@ class PiRpcClient:
         images: list[dict] | None = None,
         on_thinking: Callable[[], Any] | None = None,
         on_tool: Callable[[str, str, dict | None], Any] | None = None,
+        on_usage: Callable[[dict], Any] | None = None,
     ) -> AsyncIterator[str]:
         """发送用户消息并流式产出文本增量。
 
@@ -361,6 +379,21 @@ class PiRpcClient:
         last_error: str | None = None
         settled = False
         may_be_running = False
+
+        async def report_usage(kind: str, usage: dict, provider: str | None, model: str | None,
+                               timestamp: int | float | None = None) -> None:
+            if not any(usage.get(key) for key in ("input", "cacheRead", "cacheWrite", "output")):
+                return
+            occurred_at = (timestamp / 1000 if isinstance(timestamp, (int, float)) and timestamp > 100_000_000_000
+                           else time.time())
+            try:
+                await _invoke(on_usage, {
+                    "kind": kind, "usage": usage, "provider": provider or self.provider or "",
+                    "model": model or self.model or "", "occurred_at": occurred_at,
+                })
+            except Exception:
+                logger.exception("记录 pi 用量回调失败", extra={"cmd_id": cmd_id})
+
         try:
             may_be_running = True
             resp = await self._request(body)
@@ -395,6 +428,9 @@ class PiRpcClient:
                 elif etype == "message_end":
                     message = event.get("message") or {}
                     if message.get("role") == "assistant":
+                        if isinstance(message.get("usage"), dict):
+                            await report_usage("assistant", message["usage"], message.get("provider"),
+                                               message.get("model"), message.get("timestamp"))
                         reason = message.get("stopReason")
                         if reason in ("error", "aborted"):
                             last_error = str(message.get("errorMessage") or ("pi 已中止" if reason == "aborted" else "模型响应失败"))
@@ -404,6 +440,8 @@ class PiRpcClient:
                     last_error = str(event.get("finalError") or "模型重试失败")
                 elif etype == "compaction_end" and event.get("errorMessage"):
                     last_error = str(event["errorMessage"])
+                elif etype == "compaction_end" and isinstance(event.get("usage"), dict):
+                    await report_usage("compaction", event["usage"], self.provider, self.model)
                 elif etype == "error":
                     last_error = str(event.get("error") or event.get("message") or "pi 处理失败")
                 elif etype == "agent_settled":
@@ -448,6 +486,9 @@ class PiRpcClient:
             path = data["sessionFile"]
             self._session_file = path if isinstance(path, str) and path else None
         return data
+
+    async def get_session_stats(self) -> dict:
+        return await self._command("get_session_stats", timeout=5)
 
     async def switch_session(self, session_path: str) -> dict:
         """进程内切换到指定会话文件（无需重启进程）。"""

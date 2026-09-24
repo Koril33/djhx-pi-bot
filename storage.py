@@ -4,12 +4,15 @@
 - users:    telegram 用户
 - sessions: 会话记录（每个会话对应 pi 侧的一个 jsonl 会话文件）
 """
+import json
 import os
 import sqlite3
 import threading
 import time
 import uuid
 from pathlib import Path
+
+from costs import PriceResult, normalize_usage
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -28,6 +31,40 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS usage_runs (
+    id                 TEXT PRIMARY KEY,
+    user_id            INTEGER NOT NULL,
+    session_id         TEXT,
+    telegram_update_id INTEGER,
+    started_at         REAL NOT NULL,
+    finished_at        REAL,
+    status             TEXT NOT NULL DEFAULT 'running',
+    stats_before       TEXT,
+    stats_after        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_runs_user_time ON usage_runs(user_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS usage_events (
+    run_id             TEXT NOT NULL,
+    seq                INTEGER NOT NULL,
+    kind               TEXT NOT NULL,
+    occurred_at        REAL NOT NULL,
+    provider           TEXT NOT NULL,
+    model              TEXT NOT NULL,
+    input_tokens       INTEGER NOT NULL,
+    cache_read_tokens  INTEGER NOT NULL,
+    cache_write_tokens INTEGER NOT NULL,
+    output_tokens      INTEGER NOT NULL,
+    reasoning_tokens   INTEGER NOT NULL,
+    total_tokens       INTEGER NOT NULL,
+    estimated_usd      TEXT,
+    price_tier         TEXT,
+    price_status       TEXT NOT NULL,
+    price_snapshot     TEXT,
+    PRIMARY KEY (run_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_run ON usage_events(run_id);
 
 CREATE TABLE IF NOT EXISTS telegram_updates (
     update_id      INTEGER PRIMARY KEY,
@@ -154,6 +191,51 @@ class Storage:
 
     def touch(self, sid: str) -> None:
         self._exec("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?", (sid,))
+
+    # ---------- LLM 用量账本 ----------
+    def start_usage_run(
+        self, user_id: int, session_id: str | None, telegram_update_id: int | None,
+        stats_before: dict | None,
+    ) -> str:
+        run_id = uuid.uuid4().hex
+        self._exec(
+            "INSERT INTO usage_runs (id, user_id, session_id, telegram_update_id, started_at, stats_before) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, user_id, session_id, telegram_update_id, time.time(),
+             json.dumps(stats_before) if stats_before is not None else None),
+        )
+        return run_id
+
+    def record_usage_event(self, run_id: str, seq: int, event: dict, price: PriceResult) -> None:
+        usage = normalize_usage(event["usage"])
+        self._exec(
+            "INSERT INTO usage_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, seq, event["kind"], event["occurred_at"], event["provider"], event["model"],
+             usage["input"], usage["cacheRead"], usage["cacheWrite"], usage["output"],
+             usage["reasoning"], usage["totalTokens"], price.usd, price.tier,
+             price.status, price.snapshot),
+        )
+
+    def finish_usage_run(self, run_id: str, status: str, stats_after: dict | None) -> None:
+        self._exec(
+            "UPDATE usage_runs SET status = ?, finished_at = ?, stats_after = ? WHERE id = ?",
+            (status, time.time(), json.dumps(stats_after) if stats_after is not None else None, run_id),
+        )
+
+    def get_last_usage_run(self, user_id: int) -> sqlite3.Row | None:
+        rows = self._query(
+            "SELECT * FROM usage_runs WHERE user_id = ? ORDER BY started_at DESC LIMIT 1", (user_id,),
+        )
+        return rows[0] if rows else None
+
+    def get_usage_runs_since(self, user_id: int, since: float) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT * FROM usage_runs WHERE user_id = ? AND started_at >= ? ORDER BY started_at DESC",
+            (user_id, since),
+        )
+
+    def get_usage_events(self, run_id: str) -> list[sqlite3.Row]:
+        return self._query("SELECT * FROM usage_events WHERE run_id = ? ORDER BY seq", (run_id,))
 
     # ---------- Telegram webhook inbox ----------
     # 更新先持久化再 ACK；重启后未处理记录仍可重放。

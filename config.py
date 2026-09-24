@@ -27,6 +27,9 @@ class Settings(BaseSettings):
 
     # 存储
     db_path: str = "data/bot.db"
+    pricing_file: str = "pricing.json"  # 费率、峰谷时段与节假日，按官方变动更新
+    cost_tracking_enabled: bool = True
+    cost_auto_report: bool = True
 
     # 服务
     host: str = "127.0.0.1"
