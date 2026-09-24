@@ -174,6 +174,10 @@ async def lifespan(app: FastAPI):
     settings.validate_runtime()
     storage = Storage(settings.db_path)
     storage.prune_updates()
+    interrupted_turns = storage.fail_interrupted_turns()
+    if interrupted_turns:
+        logger.warning("上次服务中断留下未完成的会话回合，已标记为不完整",
+                       extra={"count": interrupted_turns})
     interrupted = storage.fail_interrupted_updates()
     if interrupted:
         logger.error("上次服务中断留下未确认更新，需人工核对", extra={"count": interrupted})

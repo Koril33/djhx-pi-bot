@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS usage_runs (
     finished_at        REAL,
     status             TEXT NOT NULL DEFAULT 'running',
     origin             TEXT NOT NULL DEFAULT 'chat',
-    memory_context_bytes INTEGER NOT NULL DEFAULT 0,
+    memory_context_bytes INTEGER NOT NULL DEFAULT 0, -- 每轮准备的上下文大小，不是累计注入量
     stats_before       TEXT,
     stats_after        TEXT
 );
@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     assistant_text     TEXT NOT NULL DEFAULT '',
     has_image          INTEGER NOT NULL DEFAULT 0,
     status             TEXT NOT NULL DEFAULT 'running',
+    interruption_notice_pending INTEGER NOT NULL DEFAULT 0,
     created_at         REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turns_session ON conversation_turns(session_id, id);
@@ -146,6 +147,11 @@ class Storage:
                 self._conn.execute("ALTER TABLE usage_runs ADD COLUMN origin TEXT NOT NULL DEFAULT 'chat'")
             if "memory_context_bytes" not in columns:
                 self._conn.execute("ALTER TABLE usage_runs ADD COLUMN memory_context_bytes INTEGER NOT NULL DEFAULT 0")
+            turn_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(conversation_turns)")}
+            if "interruption_notice_pending" not in turn_columns:
+                self._conn.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN interruption_notice_pending INTEGER NOT NULL DEFAULT 0"
+                )
             self._conn.commit()
 
     def _query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -266,6 +272,28 @@ class Storage:
     def finish_turn(self, turn_id: int, assistant_text: str, *, complete: bool) -> None:
         self._exec("UPDATE conversation_turns SET assistant_text = ?, status = ? WHERE id = ?",
                    (assistant_text, "complete" if complete else "incomplete", turn_id))
+
+    def fail_interrupted_turns(self) -> int:
+        """进程重启后将失去执行者的回合标记为不完整，保留一次性通知。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE conversation_turns SET status = 'incomplete', interruption_notice_pending = 1 "
+                "WHERE status = 'running'"
+            )
+            return cur.rowcount
+
+    def pending_interruption_notice_count(self, user_id: int) -> int:
+        rows = self._query(
+            "SELECT count(*) AS count FROM conversation_turns "
+            "WHERE user_id = ? AND interruption_notice_pending = 1", (user_id,)
+        )
+        return rows[0]["count"]
+
+    def acknowledge_interruption_notice(self, user_id: int) -> None:
+        self._exec(
+            "UPDATE conversation_turns SET interruption_notice_pending = 0 "
+            "WHERE user_id = ? AND interruption_notice_pending = 1", (user_id,)
+        )
 
     def get_summary(self, session_id: str) -> sqlite3.Row | None:
         rows = self._query("SELECT * FROM session_summaries WHERE session_id = ?", (session_id,))

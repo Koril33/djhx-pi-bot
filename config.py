@@ -34,7 +34,6 @@ class Settings(BaseSettings):
     # SQLite 长期记忆与会话摘要；全部预算可通过环境变量调整
     memory_enabled: bool = True
     memory_auto_extract: bool = True
-    memory_model: str = "deepseek-flash"
     memory_batch_turns: int = 5
     memory_summary_retry_seconds: int = 3600
     memory_turn_retention: int = 20

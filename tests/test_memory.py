@@ -11,14 +11,14 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 from bot import AgentSession
-from memory import MemoryService
+from memory import MemoryService, safe_turn_text
 from storage import Storage
 from scripts.backup_db import main as backup_main
 
 
 def settings(folder: str, **overrides):
     values = dict(
-        memory_enabled=True, memory_auto_extract=True, memory_model="deepseek-flash",
+        memory_enabled=True, memory_auto_extract=True,
         memory_batch_turns=2, memory_turn_retention=2,
         memory_summary_retry_seconds=3600,
         memory_turn_user_chars=100, memory_turn_assistant_chars=100,
@@ -88,6 +88,26 @@ class MemoryStorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.storage.add_memory(7, "事实 5", limit=4)
 
+    def test_interrupted_turn_is_incomplete_and_notice_survives_restart(self):
+        running = self.storage.start_turn(7, self.sid, 51, "中断前的消息", False)
+        self.assertEqual(self.storage.fail_interrupted_turns(), 1)
+        self.assertEqual(self.storage.fail_interrupted_turns(), 0)
+        self.assertEqual(self.storage._query("SELECT status FROM conversation_turns WHERE id = ?", (running,))[0]["status"],
+                         "incomplete")
+        self.assertEqual(self.storage.pending_summary_turns(self.sid), [])
+        self.storage._conn.close()
+        self.storage = Storage(str(Path(self.folder.name) / "bot.db"))
+        self.assertEqual(self.storage.pending_interruption_notice_count(7), 1)
+        self.storage.acknowledge_interruption_notice(7)
+        self.assertEqual(self.storage.pending_interruption_notice_count(7), 0)
+
+    def test_secret_is_redacted_before_turn_is_clipped(self):
+        text = "前言 password:abcdefghijklmnop 后文"
+        safe = safe_turn_text(text, 24)
+        self.assertLessEqual(len(safe), 24)
+        self.assertNotIn("abc", safe)
+        self.assertIn("已省略敏感内容", safe)
+
     def test_single_file_backup_contains_memory(self):
         self.storage.add_memory(7, "一条可迁移记忆", limit=4)
         target = Path(self.folder.name) / "copy.db"
@@ -108,6 +128,27 @@ class MemoryStorageTests(unittest.TestCase):
             columns = {row[1] for row in migrated._conn.execute("PRAGMA table_info(usage_runs)")}
             self.assertIn("origin", columns)
             self.assertIn("memory_context_bytes", columns)
+        finally:
+            migrated._conn.close()
+
+    def test_existing_turn_database_gets_interruption_notice_column(self):
+        legacy_path = Path(self.folder.name) / "legacy_turns.db"
+        with closing(sqlite3.connect(legacy_path)) as old:
+            old.execute(
+                "CREATE TABLE conversation_turns (id INTEGER PRIMARY KEY, user_id INTEGER, "
+                "session_id TEXT, telegram_update_id INTEGER UNIQUE, user_text TEXT, "
+                "steer_text TEXT DEFAULT '', assistant_text TEXT DEFAULT '', has_image INTEGER DEFAULT 0, "
+                "status TEXT DEFAULT 'running', created_at REAL)"
+            )
+            old.execute(
+                "INSERT INTO conversation_turns (id, user_id, session_id, user_text, status, created_at) "
+                "VALUES (1, 7, 'old', '中断的消息', 'running', 1)"
+            )
+            old.commit()
+        migrated = Storage(str(legacy_path))
+        try:
+            self.assertEqual(migrated.fail_interrupted_turns(), 1)
+            self.assertEqual(migrated.pending_interruption_notice_count(7), 1)
         finally:
             migrated._conn.close()
 
@@ -153,6 +194,20 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
         run = self.storage.get_last_usage_run(7)
         self.assertEqual(run["origin"], "memory_maintenance")
         self.assertEqual(len(self.storage.get_usage_events(run["id"])), 1)
+
+    async def test_interruption_notice_is_acknowledged_only_after_delivery(self):
+        self.storage.start_turn(7, self.sid, 999, "上次未完成", False)
+        self.storage.fail_interrupted_turns()
+        update = SimpleNamespace()
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            reply.side_effect = RuntimeError("Telegram unavailable")
+            with self.assertRaises(RuntimeError):
+                await bot.notify_interrupted_turns(update, self.storage, 7)
+            self.assertEqual(self.storage.pending_interruption_notice_count(7), 1)
+            reply.side_effect = None
+            await bot.notify_interrupted_turns(update, self.storage, 7)
+            self.assertIn("不会纳入 SQLite 摘要", reply.await_args.args[1])
+        self.assertEqual(self.storage.pending_interruption_notice_count(7), 0)
 
     async def test_missing_jsonl_rebinds_existing_app_session(self):
         active = self.storage.get_active_session(7)

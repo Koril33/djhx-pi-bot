@@ -69,7 +69,7 @@ _PRE_LANGS = {
 def md_to_html(text: str) -> str:
     """标准 Markdown → Telegram HTML parse_mode 子集。
 
-    转换：粗体、斜体、删除线、行内代码、围栏代码块、表格（等宽块）、标题（转粗体）、
+    转换：粗体、斜体、删除线、行内代码、围栏代码块、表格（逐项列表）、标题（转粗体）、
     链接、引用块、无序列表（含嵌套缩进）、分隔线。
     粗体/斜体/标题/链接等片段经 stash 暂存、最后统一恢复，避免与残余转义重复转义
     （修复双重转义：**a & b** 曾被转成 &amp;amp;）。
@@ -93,6 +93,35 @@ def md_to_html(text: str) -> str:
         return stash(f"<pre>{escape(body, quote=False)}</pre>")
 
     text = re.sub(r"```(\w*)[ \t]*\n(.*?)```", _fence, text, flags=re.S)
+
+    # 表格在行内 Markdown 处理前转成窄屏友好的逐项列表；围栏代码已被暂存，不会误改。
+    def _table(m: re.Match) -> str:
+        lines = m.group(0).rstrip("\n").splitlines()
+        rows = [ln for ln in lines if not re.fullmatch(r"[\s|:\-]+", ln)]
+        if len(rows) < 2:
+            return m.group(0)
+        cells = [[cell.strip() for cell in ln.strip().strip("|").split("|")] for ln in rows]
+        headers = cells[0]
+        indexed = headers[0].casefold() in {"#", "序号", "编号", "no", "no.", "id"}
+        first_field = 1 if indexed else 0
+        blocks = []
+        for ordinal, row in enumerate(cells[1:], 1):
+            if not any(row):
+                continue
+            number = row[0] if indexed and row[0] else str(ordinal)
+            title = row[first_field] if first_field < len(row) else "条目"
+            title = re.sub(r"[`*_~]", "", title)[:36]
+            if first_field < len(row) and len(row[first_field]) > 36:
+                title += "…"
+            fields = [f"**{number}. {title}**"]
+            for index in range(first_field, len(row)):
+                if row[index]:
+                    label = headers[index] if index < len(headers) and headers[index] else f"第 {index + 1} 列"
+                    fields.append(f"- {label}：{row[index]}")
+            blocks.append("\n".join(fields))
+        return "\n\n".join(blocks) + "\n" if blocks else m.group(0)
+
+    text = re.sub(r"(?m)(^[ \t]*\|.*\|[ \t]*\n?){2,}", _table, text)
 
     # 2) 引用块 > 行 → <blockquote>…</blockquote>（内容递归渲染，支持嵌套）
     def _quote(m: re.Match) -> str:
@@ -132,36 +161,17 @@ def md_to_html(text: str) -> str:
 
     text = re.sub(r"(?m)^\s{0,3}(#{1,6})\s+(.+?)\s*$", _heading, text)
 
-    # 8) 表格 → <pre> 等宽块（去掉 | 分隔行，列对齐）
-    def _table(m: re.Match) -> str:
-        lines = m.group(0).rstrip("\n").splitlines()
-        rows = [ln for ln in lines if not re.fullmatch(r"[\s|:\-]+", ln)]
-        if not rows:
-            return ""
-        cells = [[c.strip() for c in ln.strip().strip("|").split("|")] for ln in rows]
-        max_cols = max(len(r) for r in cells)
-        widths = [max(len(r[i]) for r in cells if i < len(r)) for i in range(max_cols)]
-        out = []
-        for r in cells:
-            line = "  ".join(
-                (c.ljust(widths[i]) if i < len(widths) else c) for i, c in enumerate(r)
-            )
-            out.append(line.rstrip())
-        return stash(f"<pre>{escape(chr(10).join(out))}</pre>")
-
-    text = re.sub(r"(?m)(^\s*\|.*\|\s*$\n?){2,}", _table, text)
-
-    # 9) 链接 [text](url) → <a href="url">text</a>（仅 http/https/tg 协议）
+    # 8) 链接 [text](url) → <a href="url">text</a>（仅 http/https/tg 协议）
     def _link(m: re.Match) -> str:
         url, label = m.group(2), m.group(1)
         return stash(f'<a href="{escape(url, quote=False)}">{escape(label)}</a>')
 
     text = re.sub(r"\[([^\[\]\n]+)\]\((https?://[^)\s]+|tg://[^)\s]+)\)", _link, text)
 
-    # 10) 分隔线 --- → 空行
+    # 9) 分隔线 --- → 空行
     text = re.sub(r"(?m)^\s*---+\s*$", "", text)
 
-    # 11) 无序列表：- / * → • bullet；复选框 → ✅/⬜；保留嵌套缩进（全角空格防折叠）
+    # 10) 无序列表：- / * → • bullet；复选框 → ✅/⬜；保留嵌套缩进（全角空格防折叠）
     def _indent(prefix: str) -> str:
         return "　" * (len(prefix.expandtabs(2)) // 2)
 
@@ -181,7 +191,7 @@ def md_to_html(text: str) -> str:
         text,
     )
 
-    # 12) 残余纯文本转义：仅保留 Telegram 合法标签，其余 <...> 一律转义
+    # 11) 残余纯文本转义：仅保留 Telegram 合法标签，其余 <...> 一律转义
     def _escape_residual(s: str) -> str:
         tag_re = re.compile(
             r"(</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|tg-spoiler|br|blockquote)(?:\s[^<>]*)?/?>)"
@@ -193,8 +203,7 @@ def md_to_html(text: str) -> str:
 
     text = _escape_residual(text)
 
-    # 13) 恢复暂存的代码/表格/粗体等片段（可能嵌套，需迭代到无残留：
-    #     表格/粗体可能包裹行内代码的占位符，单遍顺序替换会漏掉内层）
+    # 12) 恢复暂存的代码/粗体等片段（可能嵌套，需迭代到无残留）
     while True:
         prev = text
         for i, html in enumerate(sentinel):
@@ -557,6 +566,20 @@ async def reply_text(update: Update, text: str, reply_markup=None) -> None:
             await _send(update.message.reply_text, chunk, reply_markup=markup)
         else:
             await _send(update.effective_chat.send_message, chunk, reply_markup=markup)
+
+
+async def notify_interrupted_turns(update: Update, storage: Storage, user_id: int) -> None:
+    """下一条普通消息到来时告知上次中断；发送成功后才清除通知。"""
+    count = storage.pending_interruption_notice_count(user_id)
+    if not count:
+        return
+    await reply_text(
+        update,
+        f"⚠️ 上次服务中断留下 {count} 个未完成回合，已标记为不完整，"
+        "不会纳入 SQLite 摘要，也不会自动重放。旧 pi 会话可能仍保留部分内容；"
+        "如需继续，请先确认工具执行结果，再重新发送原消息。",
+    )
+    storage.acknowledge_interruption_notice(user_id)
 
 
 async def stream_reply(
@@ -1058,14 +1081,14 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
     counts = {key: 0 for key in ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")}
     total_usd = Decimal(0)
     maintenance_usd = Decimal(0)
-    injected_bytes = 0
+    prepared_context_bytes = 0
     unpriced = 0
     stale = False
     incomplete_usage = False
     has_events = False
     tiers: set[str] = set()
     for run in runs:
-        injected_bytes += run["memory_context_bytes"]
+        prepared_context_bytes += run["memory_context_bytes"]
         run_counts = {key: 0 for key in counts}
         for event in storage.get_usage_events(run["id"]):
             has_events = True
@@ -1106,8 +1129,11 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
         lines.append(f"⚠️ {unpriced} 次模型调用未计价；上方金额不是完整总额")
     if any(run["origin"] == "memory_maintenance" for run in runs):
         lines.append(f"其中记忆维护：{format_usd(maintenance_usd)}")
-    if injected_bytes:
-        lines.append(f"记忆注入文本：{injected_bytes:,} 字节（不能精确拆分为计费 token）")
+    if prepared_context_bytes:
+        lines.append(
+            f"各回合准备的记忆上下文合计：{prepared_context_bytes:,} 字节"
+            "（每回合记一次；多次模型调用可能重复注入，不能据此计算记忆费用）"
+        )
     if stale:
         lines.append("⚠️ 费率文件已到复核日期，请核对 DeepSeek 官方价格")
     if incomplete_usage:
@@ -1481,6 +1507,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
                 await reply_text(update, f"⚠️ pi 进程启动失败: {_friendly_error(e)}")
                 return
+            await notify_interrupted_turns(update, storage, user.id)
             if getattr(agent, "recovery_notice", None):
                 await reply_text(update, agent.recovery_notice)
                 agent.recovery_notice = None

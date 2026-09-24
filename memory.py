@@ -26,7 +26,7 @@ def clip_bytes(text: str, limit: int) -> str:
 
 
 def safe_turn_text(text: str, limit: int) -> str:
-    return _SECRET.sub("[已省略敏感内容]", text[:limit])
+    return _SECRET.sub("[已省略敏感内容]", text)[:limit]
 
 
 def looks_secret(text: str) -> bool:
@@ -193,7 +193,7 @@ class MemoryService:
             instruction = prefix + "\n\n".join(inputs)
             client = PiRpcClient(
                 self.settings.pi_cmd, self.settings.pi_session_dir,
-                provider="deepseek", model=self.settings.memory_model,
+                provider="deepseek", model="deepseek-flash",
                 extra_args=["--no-session", "--no-tools", "--no-extensions", "--no-context-files",
                             "--no-skills", "--no-prompt-templates"],
             )

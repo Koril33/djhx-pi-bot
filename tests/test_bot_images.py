@@ -138,6 +138,7 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         )
         self.storage = Mock()
         self.storage.get_active_session.return_value = {"id": "s1", "name": "已命名"}
+        self.storage.pending_interruption_notice_count.return_value = 0
         self.calls = []
 
         async def prompt(text, **kwargs):

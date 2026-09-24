@@ -154,6 +154,27 @@ class StreamReplyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MarkdownSplitTests(unittest.TestCase):
+    def test_table_becomes_readable_list_without_code_block(self) -> None:
+        table = (
+            "问题汇总\n\n| # | 问题 | 位置 | 影响 |\n"
+            "|---|---|---|---|\n"
+            "| 1 | running 回合未收尾 | `storage.py:274` | 迁移时缺一轮 |\n"
+            "| 2 | 记忆费用说明不清 | `bot.py:1110` | 容易误解 |"
+        )
+        html = bot.md_to_html(table)
+        self.assertNotIn("<pre>", html)
+        self.assertIn("问题汇总", html)
+        self.assertIn("<b>1. running 回合未收尾</b>", html)
+        self.assertNotIn("第 1 列：#", html)
+        self.assertIn("问题：running 回合未收尾", html)
+        self.assertIn("位置：<code>storage.py:274</code>", html)
+        self.assertIn("<b>2. 记忆费用说明不清</b>", html)
+
+    def test_table_inside_code_fence_stays_code(self) -> None:
+        html = bot.md_to_html("```md\n| A | B |\n|---|---|\n| 1 | 2 |\n```")
+        self.assertIn("<pre", html)
+        self.assertNotIn("第 1 项", html)
+
     def test_long_single_line_is_bounded(self) -> None:
         text = "<" * 5000
         chunks = bot.split_markdown(text)
