@@ -136,6 +136,9 @@ class AdminTests(unittest.TestCase):
         self.storage.enqueue_update(99, '{"update_id":99,"message":"private"}')
         self.storage.claim_updates(1)
         self.storage.fail_update(99, "RuntimeError: private diagnostic")
+        self.storage.enqueue_update(100, '{"update_id":100}')
+        self.storage.claim_updates(1)
+        self.storage.fail_update(100, "服务重启时更新执行状态不确定；未自动重放")
         run = self.storage.start_usage_run(7, None, None, None)
         self.storage.record_usage_event(run, 1, {
             "kind": "assistant", "occurred_at": 1, "provider": "deepseek", "model": "deepseek-flash",
@@ -146,6 +149,7 @@ class AdminTests(unittest.TestCase):
         overview = self.client.get("/admin/overview?user_id=7")
         self.assertEqual(overview.status_code, 200)
         self.assertIn("RuntimeError", overview.text)
+        self.assertIn("重启时状态不确定", overview.text)
         self.assertNotIn("private diagnostic", overview.text)
         self.assertNotIn("private\"", overview.text)
         usage = self.client.get("/admin/usage?user_id=7&range=today")

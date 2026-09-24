@@ -328,9 +328,13 @@ def _overview_page(request: Request, csrf: str, user_id: int | None) -> HTMLResp
                          for label, value in cards)
     failed = []
     for row in storage.get_recent_failed_updates():
-        reason = (row["last_error"] or "").split(":", 1)[0].strip()[:64]
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", reason):
-            reason = "处理失败"
+        error = row["last_error"] or ""
+        if error.startswith("服务重启时更新执行状态不确定"):
+            reason = "重启时状态不确定"
+        else:
+            reason = error.split(":", 1)[0].strip()[:64]
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", reason):
+                reason = "处理失败"
         failed.append(f'<div class="list-row"><span class="mono">#{_e(row["update_id"])}</span>'
                       f'<span>{_e(reason)}</span><span class="muted">{_e(_time_label(row["processed_at"]))}</span></div>')
     failure_html = "".join(failed) or '<p class="empty small">没有失败更新</p>'
