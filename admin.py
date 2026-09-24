@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import Settings
 from logging_conf import get_logger
@@ -25,6 +25,10 @@ from storage import Storage
 logger = get_logger("admin")
 router = APIRouter(prefix="/admin", include_in_schema=False)
 _STATIC_DIR = Path(__file__).resolve().parent / "admin_static"
+# 后台是整页导航。把这份小样式与 HTML 一起送达，避免每次切页重取 CSS 时短暂裸显。
+_STYLE = (_STATIC_DIR / "style.css").read_text(encoding="utf-8")
+_STYLE_TAG = f"<style>{_STYLE}</style>"
+_STYLE_HASH = base64.b64encode(hashlib.sha256(_STYLE.encode("utf-8")).digest()).decode("ascii")
 _SESSION_COOKIE = "dj_admin_session"
 _PRELOGIN_COOKIE = "dj_admin_prelogin"
 _SESSION_SECONDS = 12 * 3600
@@ -146,7 +150,7 @@ def _storage(request: Request) -> Storage:
 def _headers() -> dict[str, str]:
     return {
         "Cache-Control": "no-store",
-        "Content-Security-Policy": "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "Content-Security-Policy": f"default-src 'none'; style-src 'sha256-{_STYLE_HASH}'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
         "X-Frame-Options": "DENY",
@@ -208,7 +212,7 @@ def _login_page(csrf: str, error: str = "") -> str:
     message = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else ""
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · Pi 管理</title>
-<link rel="stylesheet" href="/admin/style.css"></head><body class="login-body">
+{_STYLE_TAG}</head><body class="login-body">
 <main class="login-card"><div class="brand-mark" aria-hidden="true">P<span>·</span></div>
 <p class="eyebrow">DJHX / PI</p><h1>管理后台</h1>{message}
 <form method="post" action="/admin/login" class="form-stack">
@@ -225,7 +229,7 @@ def _layout(title: str, active: str, body: str, csrf: str, user_id: int | None, 
         return f'<a class="{cls}" href="/admin/{path}{suffix if path != "settings" else ""}">{label}</a>'
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{_e(title)} · Pi 管理</title>
-<link rel="stylesheet" href="/admin/style.css"></head><body>
+{_STYLE_TAG}</head><body>
 <div class="app-shell"><aside class="sidebar"><a class="brand" href="/admin/memories">
 <span class="brand-mark">P<span>·</span></span><span>PI<span class="brand-muted"> / ADMIN</span></span></a>
 <nav aria-label="主导航">{nav('memories', '长期记忆', 'memories')}{nav('summaries', '会话摘要', 'summaries')}{nav('settings', '记忆设置', 'settings')}</nav>
@@ -364,12 +368,6 @@ def _refresh_memory(request: Request, user_id: int) -> None:
             memory.refresh_context(user_id, active["id"], active["pi_session_file"])
         except Exception:
             logger.exception("后台变更后刷新记忆上下文失败", extra={"user_id": user_id})
-
-
-@router.get("/style.css")
-async def stylesheet() -> FileResponse:
-    return FileResponse(_STATIC_DIR / "style.css", media_type="text/css",
-                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 @router.get("")

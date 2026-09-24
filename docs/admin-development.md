@@ -2,7 +2,9 @@
 
 ## 实现
 
-`admin.py` 作为 FastAPI 子路由挂在现有 `app.py` 的 `/admin`。页面由 Python 渲染 HTML，样式位于 `admin_static/style.css`；没有前端构建步骤。后台通过现有 `Storage` 操作 `memory_items`、`sessions` 和 `session_summaries`。
+`admin.py` 作为 FastAPI 子路由挂在现有 `app.py` 的 `/admin`。页面由 Python 渲染 HTML，样式源文件位于 `admin_static/style.css`；没有前端构建步骤。后台通过现有 `Storage` 操作 `memory_items`、`sessions` 和 `session_summaries`。
+
+导航使用普通链接，切页会加载完整 HTML。最初页面从 `/admin/style.css` 读取样式且响应为 `no-store`，每次切页都重新请求，浏览器短暂显示未着色内容。现在服务启动时读取约 8 KB 的样式，将其直接放入每页 `<head>`；CSP 使用对应的 SHA-256 哈希放行这份固定样式。页面仍保持 `no-store`，且切页不再依赖第二个样式请求。
 
 新增的 `runtime_settings(key, value_json, updated_at)` 保存可在线修改的记忆参数。启动顺序是建立 SQLite 连接、读取和校验覆盖值、应用到共享 `Settings` 对象，然后创建 `AgentManager`。表单保存时先整体校验，再写入 SQLite，最后更新进程中的 `Settings`；写入失败不会更新运行值。数据库迁移由 `CREATE TABLE IF NOT EXISTS` 完成。
 

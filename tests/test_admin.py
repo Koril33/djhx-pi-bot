@@ -123,6 +123,9 @@ class AdminTests(unittest.TestCase):
         response = self.client.get("/admin/memories?user_id=7")
         self.assertIn("&lt;img", response.text)
         self.assertNotIn("<img src=x", response.text)
+        self.assertIn("<style>", response.text)
+        self.assertNotIn('href="/admin/style.css"', response.text)
+        self.assertIn("style-src 'sha256-", response.headers["content-security-policy"])
         self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
 
 
