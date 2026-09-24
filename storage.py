@@ -112,6 +112,12 @@ CREATE TABLE IF NOT EXISTS session_recovery (
     updated_at     REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS runtime_settings (
+    key        TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS telegram_updates (
     update_id      INTEGER PRIMARY KEY,
     payload        TEXT,
@@ -163,6 +169,29 @@ class Storage:
         with self._lock:
             self._conn.execute(sql, params)
             self._conn.commit()
+
+    def get_runtime_settings(self) -> dict[str, object]:
+        return {row["key"]: json.loads(row["value_json"])
+                for row in self._query("SELECT key, value_json FROM runtime_settings")}
+
+    def save_runtime_settings(self, values: dict[str, object]) -> None:
+        with self._lock, self._conn:
+            for key, value in values.items():
+                self._conn.execute(
+                    "INSERT INTO runtime_settings (key, value_json, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                    (key, json.dumps(value, ensure_ascii=False), time.time()),
+                )
+
+    def list_admin_users(self) -> list[sqlite3.Row]:
+        return self._query("SELECT user_id, username FROM users ORDER BY user_id")
+
+    def list_admin_summaries(self, user_id: int) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT s.id, s.name, s.status, ss.summary_text, ss.covered_turn_id, ss.updated_at "
+            "FROM sessions AS s LEFT JOIN session_summaries AS ss ON ss.session_id = s.id "
+            "WHERE s.user_id = ? ORDER BY s.updated_at DESC", (user_id,),
+        )
 
     # ---------- users ----------
     def ensure_user(self, user_id: int, username: str | None) -> None:

@@ -1,5 +1,6 @@
 """配置加载：环境变量 + .env，不硬编码任何密钥。"""
 from functools import lru_cache
+import re
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -30,6 +31,10 @@ class Settings(BaseSettings):
     pricing_file: str = "pricing.json"  # 费率、峰谷时段与节假日，按官方变动更新
     cost_tracking_enabled: bool = True
     cost_auto_report: bool = True
+
+    # 单管理员后台；留空时后台登录关闭，密码仅存于 .env
+    admin_username: str = ""
+    admin_password: str = ""
 
     # SQLite 长期记忆与会话摘要；全部预算可通过环境变量调整
     memory_enabled: bool = True
@@ -95,6 +100,13 @@ class Settings(BaseSettings):
             raise ValueError("Webhook 队列容量或请求大小限制无效")
         if self.shutdown_drain_seconds <= 0:
             raise ValueError("SHUTDOWN_DRAIN_SECONDS 必须大于 0")
+        if bool(self.admin_username) != bool(self.admin_password):
+            raise ValueError("ADMIN_USERNAME 与 ADMIN_PASSWORD 必须同时配置")
+        if self.admin_username:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{3,32}", self.admin_username):
+                raise ValueError("ADMIN_USERNAME 必须是 3-32 位字母、数字、下划线或连字符")
+            if not 12 <= len(self.admin_password) <= 128:
+                raise ValueError("ADMIN_PASSWORD 必须是 12-128 个字符")
         if self.memory_enabled:
             limits = (
                 self.memory_batch_turns, self.memory_turn_retention,

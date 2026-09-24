@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response, status
 from telegram import Update
 
+from admin import apply_runtime_settings, router as admin_router
 from bot import AgentManager, build_application, register_command_menu
 from config import get_settings
 from logging_conf import get_logger, setup_logging
@@ -171,8 +172,9 @@ def _report_update_worker_exit(task: asyncio.Task) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings.validate_runtime()
     storage = Storage(settings.db_path)
+    apply_runtime_settings(settings, storage)
+    app.state.settings = settings
     storage.prune_updates()
     interrupted_turns = storage.fail_interrupted_turns()
     if interrupted_turns:
@@ -241,6 +243,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="djhx-pi-bot", lifespan=lifespan)
+app.include_router(admin_router)
 
 
 @app.get("/healthz")
