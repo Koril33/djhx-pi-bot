@@ -470,13 +470,16 @@ class AgentSession:
         memory_enabled = getattr(settings, "memory_enabled", False) and memory is not None
         if memory_enabled:
             memory.clear_context(user_id)
+        persona_file = Path(__file__).resolve().parent / "prompts" / "persona.md"
+        extra_args = ["--append-system-prompt", str(persona_file)]
+        if memory_enabled:
+            extra_args += ["--extension", str(Path(__file__).resolve().parent / "pi_extensions" / "memory-context.ts")]
         self.client = PiRpcClient(
             pi_cmd=settings.pi_cmd,
             session_dir=settings.pi_session_dir,
             provider=settings.pi_provider,
             model=settings.pi_model,
-            extra_args=(["--extension", str(Path(__file__).resolve().parent / "pi_extensions" / "memory-context.ts")]
-                        if memory_enabled else None),
+            extra_args=extra_args,
             extra_env=({"DJHX_MEMORY_CONTEXT_FILE": str(memory.context_path(user_id))}
                        if memory_enabled else None),
         )

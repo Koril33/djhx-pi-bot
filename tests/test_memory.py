@@ -189,6 +189,7 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
             await self.memory._summarize(7, self.sid)
         self.assertEqual(calls[0]["provider"], "deepseek")
         self.assertEqual(calls[0]["model"], "deepseek-flash")
+        self.assertNotIn("--append-system-prompt", calls[0]["extra_args"])
         self.assertEqual(self.storage.get_summary(self.sid)["summary_text"], "用户已打招呼")
         self.assertEqual(self.storage.list_memories(7)[0]["text"], "用户喜欢中文交流")
         run = self.storage.get_last_usage_run(7)
@@ -224,7 +225,17 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.storage.get_active_session(7)["id"], self.sid)
         self.assertEqual(self.storage.get_active_session(7)["pi_session_file"], "/new/history.jsonl")
         self.assertIn("旧会话已讨论问候", self.storage.get_session_recovery(self.sid,
-                                                     "/new/history.jsonl"))
+                                                        "/new/history.jsonl"))
+
+    async def test_chat_persona_is_versioned_and_loaded_only_for_chat(self):
+        with patch("bot.PiRpcClient") as client_type:
+            AgentSession(7, self.settings, self.storage, self.memory)
+        args = client_type.call_args.kwargs["extra_args"]
+        index = args.index("--append-system-prompt")
+        persona = Path(args[index + 1])
+        self.assertTrue(persona.is_absolute())
+        self.assertIn("小丁", persona.read_text(encoding="utf-8"))
+        self.assertIn("--extension", args)
 
     async def test_memory_delete_is_user_scoped_and_stops_injection(self):
         memory_id = self.storage.add_memory(7, "喜欢中文回答", limit=4)

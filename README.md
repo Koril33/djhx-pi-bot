@@ -43,6 +43,10 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 | `/summary show` / `/summary clear` | 当前会话摘要 |
 | `/cost` / `/cost today` | 最近一轮 / 今日模型 token 与估算费用 |
 
+## 聊天人格
+
+聊天 Pi 进程通过 `--append-system-prompt` 加载纳入 Git 的 [prompts/persona.md](prompts/persona.md)。文件只定义称呼、语气与相处方式；小丁的经历和偏好仍从 SQLite 长期记忆及会话摘要按需注入。独立的记忆维护模型不加载人格文件。修改人格后提交并推送，自动部署重启服务后生效；迁移时需同时保留仓库和 SQLite 数据库。文件会进入模型上下文，应保持简短且不要写入密钥或私密经历。
+
 ## 长期记忆与会话摘要
 
 - 自动记忆默认启用：每个会话积累指定数量的完整回合后，用独立、无工具的 DeepSeek Flash 调用更新该会话摘要，并提取跨会话稳定偏好。项目细节只留在会话摘要。维护调用单独计入 `/cost today`。
