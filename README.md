@@ -37,6 +37,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 | `/env list` / `/env use <name>` | 环境（V1 仅 server） |
 | `/session new [name]` / `list` / `use <id>` | 会话管理 |
 | `/model list` / `/model use <id>` | 模型切换 |
+| `/persona current` / `list` / `use <id>` | 查看和切换聊天人格 |
 | `/stop` | 中止当前任务 |
 | `/status` | 运行状态 |
 | `/memory list [页码]` / `add` / `edit` / `delete` / `pin` / `unpin` | 长期记忆管理 |
@@ -45,7 +46,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 
 ## 聊天人格
 
-聊天 Pi 进程通过 `--append-system-prompt` 加载纳入 Git 的 [prompts/persona.md](prompts/persona.md)。文件只定义称呼、语气与相处方式；小丁的经历和偏好仍从 SQLite 长期记忆及会话摘要按需注入。独立的记忆维护模型不加载人格文件。修改人格后提交并推送，自动部署重启服务后生效；迁移时需同时保留仓库和 SQLite 数据库。文件会进入模型上下文，应保持简短且不要写入密钥或私密经历。
+后台“人格管理”把身份、性格、沟通风格、行为规则、背景和偏好保存到 SQLite；可创建、编辑、停用、删除、预览生成的追加提示词，并使用独立的无工具 Pi 会话测试。每位 Telegram 用户可用 `/persona list`、`/persona use <id>` 切换当前人格，选择跨其所有会话生效。聊天 Pi 通过 `--append-system-prompt` 读取从 SQLite 生成的个人文件；下一条消息会检查变更并重载 Pi，原会话 JSONL 保留。初始默认人格从纳入 Git 的 [prompts/default-persona.json](prompts/default-persona.json) 种入数据库；之后只以 SQLite 为运行时来源。小丁的具体经历与偏好仍可由长期记忆和会话摘要按需注入。详见 [人格系统设计](docs/persona-product.md)。
 
 ## 长期记忆与会话摘要
 

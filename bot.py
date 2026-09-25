@@ -11,6 +11,7 @@ V1 拓扑：单个环境（服务器本机），每用户一个常驻 pi RPC 进
 """
 import asyncio
 import base64
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -37,6 +38,7 @@ from telegram.ext import (
 from config import Settings
 from costs import PricingCatalog, format_usd
 from memory import MemoryService, looks_secret, safe_turn_text
+from persona import persona_prompt_path, render_persona, write_prompt
 from logging_conf import get_logger
 from pi_bridge import PiBusyError, PiError, PiRpcClient
 from storage import Storage
@@ -471,8 +473,11 @@ class AgentSession:
         memory_enabled = getattr(settings, "memory_enabled", False) and memory is not None
         if memory_enabled:
             memory.clear_context(user_id)
-        persona_file = Path(__file__).resolve().parent / "prompts" / "persona.md"
-        extra_args = ["--append-system-prompt", str(persona_file)]
+        self.persona_file = persona_prompt_path(storage.db_path, user_id)
+        self._persona_digest = write_prompt(
+            self.persona_file, render_persona(storage.get_active_persona(user_id))
+        )
+        extra_args = ["--append-system-prompt", str(self.persona_file)]
         if memory_enabled:
             extra_args += ["--extension", str(Path(__file__).resolve().parent / "pi_extensions" / "memory-context.ts")]
         project_dir = Path(__file__).resolve().parent
@@ -501,6 +506,7 @@ class AgentSession:
 
     async def ensure_client(self) -> None:
         """确保 pi 进程在跑，且挂载正确的会话文件。"""
+        await self.refresh_persona()
         await self.ensure_default_session()
         active = self.storage.get_active_session(self.user_id)
         session_file = active["pi_session_file"] if active else None
@@ -526,6 +532,17 @@ class AgentSession:
                     self.storage.set_pi_session_file(active["id"], state["sessionFile"])
             except Exception as e:
                 logger.warning("同步会话文件失败", extra={"err": str(e)})
+
+    async def refresh_persona(self) -> None:
+        """SQLite 人格变更后重启空闲 RPC，使下一轮读取新的追加提示词。"""
+        text = render_persona(self.storage.get_active_persona(self.user_id))
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest == self._persona_digest:
+            return
+        if self.client.busy or self.prompt_pending:
+            raise PiBusyError("当前任务仍在运行，暂不能切换人格")
+        await self.client.stop()
+        self._persona_digest = write_prompt(self.persona_file, text)
 
 
 class AgentManager:
@@ -822,6 +839,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/session use <id> — 切换到指定会话\n"
         "/model list — 列出可用模型\n"
         "/model use <model_id> — 切换模型\n"
+        "/persona list — 列出人格\n"
+        "/persona use <id> — 切换人格\n"
         "/cost [last|today] — 查看模型用量与估算费用\n"
         "/memory — 查看和管理长期记忆\n"
         "/summary — 查看或清空当前会话摘要\n"
@@ -1049,6 +1068,41 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _cmd_model_unlocked(update, context)
 
 
+async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    storage = context.bot_data["storage"]
+    args = context.args or []
+    sub = args[0] if args else "current"
+    if sub in {"current", "list"}:
+        active = storage.get_active_persona(user.id)
+        if sub == "current":
+            await reply_text(update, f"当前人格：{active['name']} ({active['id']})\n用法：/persona list | /persona use <id>")
+            return
+        rows = [row for row in storage.list_personas() if row["enabled"]]
+        lines = ["可用人格："] + [
+            f"{'●' if row['id'] == active['id'] else '○'} {row['name']} ({row['id']})"
+            for row in rows
+        ]
+        lines.append("切换：/persona use <id>")
+        await reply_text(update, "\n".join(lines))
+        return
+    if sub != "use" or len(args) != 2:
+        await reply_text(update, "用法：/persona current | /persona list | /persona use <id>")
+        return
+    agent = context.bot_data["manager"].get(user.id)
+    async with agent.control_lock:
+        if agent.client.busy or agent.prompt_pending:
+            await reply_text(update, "⏳ 当前任务仍在运行，请完成或 /stop 后再切换人格")
+            return
+        try:
+            storage.set_active_persona(user.id, args[1])
+        except ValueError as exc:
+            await reply_text(update, str(exc))
+            return
+        selected = storage.get_active_persona(user.id)
+        await reply_text(update, f"已切换人格：{selected['name']}。下一条消息起生效。")
+
+
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     manager = context.bot_data["manager"]
@@ -1079,12 +1133,14 @@ async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYP
     proc_state = "运行中" if (proc and proc.returncode is None) else "未运行"
     active = storage.get_active_session(user.id)
     active_name = active["name"] if active else "-"
+    persona_name = storage.get_active_persona(user.id)["name"]
     lines = [
         "📊 状态：",
         f"  环境: server（本机）",
         f"  pi 进程: {proc_state}",
         f"  忙碌: {'是' if agent.client.busy else '否'}",
         f"  当前会话: {active_name}",
+        f"  当前人格: {persona_name}",
         f"  默认模型: {agent.settings.pi_model}",
     ]
     # 追加 pi 会话详情（消息数 / 压缩状态），拿不到不阻塞主状态展示
@@ -1117,6 +1173,7 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
     counts = {key: 0 for key in ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")}
     total_usd = Decimal(0)
     maintenance_usd = Decimal(0)
+    persona_test_usd = Decimal(0)
     prepared_context_bytes = 0
     unpriced = 0
     stale = False
@@ -1137,6 +1194,8 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
                 total_usd += Decimal(event["estimated_usd"])
                 if run["origin"] == "memory_maintenance":
                     maintenance_usd += Decimal(event["estimated_usd"])
+                if run["origin"] == "persona_test":
+                    persona_test_usd += Decimal(event["estimated_usd"])
             if event["price_tier"]:
                 tiers.add(event["price_tier"])
             stale |= event["price_status"] == "stale_price"
@@ -1165,6 +1224,8 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
         lines.append(f"⚠️ {unpriced} 次模型调用未计价；上方金额不是完整总额")
     if any(run["origin"] == "memory_maintenance" for run in runs):
         lines.append(f"其中记忆维护：{format_usd(maintenance_usd)}")
+    if any(run["origin"] == "persona_test" for run in runs):
+        lines.append(f"其中人格测试：{format_usd(persona_test_usd)}")
     if prepared_context_bytes:
         lines.append(
             f"各回合准备的记忆上下文合计：{prepared_context_bytes:,} 字节"
@@ -1723,6 +1784,7 @@ COMMAND_MENU = [
     ("env", "环境管理"),
     ("session", "会话管理"),
     ("model", "模型管理"),
+    ("persona", "人格切换"),
     ("status", "运行状态"),
     ("cost", "模型用量与费用"),
     ("memory", "长期记忆"),
@@ -1780,6 +1842,7 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         CommandHandler("env", cmd_env),
         CommandHandler("session", cmd_session),
         CommandHandler("model", cmd_model),
+        CommandHandler("persona", cmd_persona),
         CommandHandler("stop", cmd_stop),
         CommandHandler("status", cmd_status),
         CommandHandler("cost", cmd_cost),

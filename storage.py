@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 from costs import PriceResult, normalize_usage
+from persona import DEFAULT_PERSONA, FIELDS, validate_persona
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -128,6 +129,26 @@ CREATE TABLE IF NOT EXISTS smtp_settings (
     updated_at   REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS personas (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL UNIQUE,
+    identity            TEXT NOT NULL DEFAULT '',
+    personality         TEXT NOT NULL DEFAULT '',
+    communication_style TEXT NOT NULL DEFAULT '',
+    behavior_rules      TEXT NOT NULL DEFAULT '',
+    background          TEXT NOT NULL DEFAULT '',
+    preferences         TEXT NOT NULL DEFAULT '',
+    enabled             INTEGER NOT NULL DEFAULT 1,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_persona_selection (
+    user_id    INTEGER PRIMARY KEY,
+    persona_id TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS telegram_updates (
     update_id      INTEGER PRIMARY KEY,
     payload        TEXT,
@@ -173,6 +194,13 @@ class Storage:
             update_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(telegram_updates)")}
             if "acknowledged_at" not in update_columns:
                 self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN acknowledged_at REAL")
+            default = validate_persona(DEFAULT_PERSONA)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO personas (id, name, identity, personality, communication_style, "
+                "behavior_rules, background, preferences, enabled, created_at, updated_at) "
+                "VALUES ('default', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (default["name"], *(default[key] for key, _ in FIELDS), time.time(), time.time()),
+            )
             self._conn.commit()
 
     def _query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -212,6 +240,75 @@ class Storage:
             "password=excluded.password, from_address=excluded.from_address, updated_at=excluded.updated_at",
             (host, port, username, password, from_address, time.time()),
         )
+
+    # ---------- 人格 ----------
+    def list_personas(self) -> list[sqlite3.Row]:
+        return self._query("SELECT * FROM personas ORDER BY (id = 'default') DESC, enabled DESC, updated_at DESC")
+
+    def get_persona(self, persona_id: str) -> sqlite3.Row | None:
+        rows = self._query("SELECT * FROM personas WHERE id = ?", (persona_id,))
+        return rows[0] if rows else None
+
+    def get_active_persona(self, user_id: int) -> sqlite3.Row:
+        rows = self._query(
+            "SELECT p.* FROM user_persona_selection AS s JOIN personas AS p ON p.id = s.persona_id "
+            "WHERE s.user_id = ? AND p.enabled = 1", (user_id,),
+        )
+        return rows[0] if rows else self.get_persona("default")
+
+    def create_persona(self, values: dict[str, str]) -> str:
+        values = validate_persona(values)
+        persona_id = uuid.uuid4().hex[:12]
+        now = time.time()
+        self._exec(
+            "INSERT INTO personas (id, name, identity, personality, communication_style, behavior_rules, "
+            "background, preferences, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (persona_id, values["name"], *(values[key] for key, _ in FIELDS), now, now),
+        )
+        return persona_id
+
+    def update_persona(self, persona_id: str, values: dict[str, str]) -> bool:
+        values = validate_persona(values)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE personas SET name = ?, identity = ?, personality = ?, communication_style = ?, "
+                "behavior_rules = ?, background = ?, preferences = ?, updated_at = ? WHERE id = ?",
+                (values["name"], *(values[key] for key, _ in FIELDS), time.time(), persona_id),
+            )
+            return cur.rowcount == 1
+
+    def set_persona_enabled(self, persona_id: str, enabled: bool) -> bool:
+        if persona_id == "default" and not enabled:
+            raise ValueError("默认人格不能停用")
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE personas SET enabled = ?, updated_at = ? WHERE id = ?",
+                (int(enabled), time.time(), persona_id),
+            )
+            if cur.rowcount and not enabled:
+                self._conn.execute("DELETE FROM user_persona_selection WHERE persona_id = ?", (persona_id,))
+            return cur.rowcount == 1
+
+    def delete_persona(self, persona_id: str) -> bool:
+        if persona_id == "default":
+            raise ValueError("默认人格不能删除")
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM personas WHERE id = ?", (persona_id,))
+            if cur.rowcount:
+                self._conn.execute("DELETE FROM user_persona_selection WHERE persona_id = ?", (persona_id,))
+            return cur.rowcount == 1
+
+    def set_active_persona(self, user_id: int, persona_id: str) -> None:
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT enabled FROM personas WHERE id = ?", (persona_id,)).fetchone()
+            if row is None or not row["enabled"]:
+                raise ValueError("人格不存在或已停用")
+            self._conn.execute(
+                "INSERT INTO user_persona_selection (user_id, persona_id, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET persona_id = excluded.persona_id, "
+                "updated_at = excluded.updated_at",
+                (user_id, persona_id, time.time()),
+            )
 
     def list_admin_users(self) -> list[sqlite3.Row]:
         return self._query("SELECT user_id, username FROM users ORDER BY user_id")

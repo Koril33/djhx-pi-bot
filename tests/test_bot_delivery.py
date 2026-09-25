@@ -1,11 +1,14 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
 from telegram.error import BadRequest, NetworkError
 
 import bot
+from persona import DEFAULT_PERSONA
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -97,6 +100,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
                 manager.get.return_value = agent
                 storage = Mock()
                 storage.get_active_session.return_value = {"name": "current"}
+                storage.get_active_persona.return_value = DEFAULT_PERSONA
                 context = SimpleNamespace(args=args, bot_data={"manager": manager, "storage": storage})
                 update = SimpleNamespace(effective_user=SimpleNamespace(id=1))
                 with patch.object(bot, "reply_text", new_callable=AsyncMock):
@@ -109,7 +113,10 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ensure_client_restarts_with_active_session_file(self) -> None:
         storage = Mock()
-        storage.db_path = "data/test.db"
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        storage.db_path = str(Path(folder.name) / "test.db")
+        storage.get_active_persona.return_value = DEFAULT_PERSONA
         storage.get_active_session.return_value = {
             "id": "current", "pi_session_file": "/current.jsonl"
         }

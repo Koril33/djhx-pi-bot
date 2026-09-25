@@ -89,6 +89,49 @@ class AdminTests(unittest.TestCase):
         self.assertFalse(self.storage.enqueue_update(900, '{"update_id":900}'))
         self.assertNotIn("#900", self.client.get("/admin/overview").text)
 
+    def test_persona_create_preview_test_switch_and_disable(self):
+        self.login()
+        page = self.client.get("/admin/personas?user_id=7")
+        csrf = self.csrf(page)
+        self.assertIn("小丁的朋友", page.text)
+        values = {"csrf": csrf, "user_id": "7", "name": "理性朋友",
+                  "identity": "你是一位理性的朋友。", "communication_style": "先给结论。"}
+        preview = self.client.post("/admin/personas", data={**values, "action": "preview"})
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn("## 身份", preview.text)
+        self.assertEqual(len(self.storage.list_personas()), 1)
+        self.assertEqual(self.client.post("/admin/personas", data={**values, "csrf": "bad", "action": "save"}).status_code, 403)
+        created = self.client.post("/admin/personas", data={**values, "action": "save"},
+                                   follow_redirects=False)
+        self.assertEqual(created.status_code, 303)
+        row = next(item for item in self.storage.list_personas() if item["name"] == "理性朋友")
+        persona_id = row["id"]
+        detail = self.client.get(f"/admin/personas/{persona_id}?user_id=7")
+        self.assertIn("你是一位理性的朋友。", detail.text)
+        changed = self.client.post(f"/admin/personas/{persona_id}", data={
+            **values, "identity": "你是一位可靠的朋友。", "action": "save",
+        }, follow_redirects=False)
+        self.assertEqual(changed.status_code, 303)
+        self.assertIn("你是一位可靠的朋友。", self.client.get(f"/admin/personas/{persona_id}").text)
+        with patch("admin._run_persona_test", new_callable=AsyncMock, return_value="测试回复") as run:
+            result = self.client.post(f"/admin/personas/{persona_id}/test", data={
+                "csrf": csrf, "user_id": "7", "question": "你好",
+            })
+        self.assertIn("测试回复", result.text)
+        run.assert_awaited_once()
+        self.assertEqual(self.client.post(f"/admin/personas/{persona_id}/use", data={
+            "csrf": csrf, "user_id": "7",
+        }, follow_redirects=False).status_code, 303)
+        self.assertEqual(self.storage.get_active_persona(7)["id"], persona_id)
+        self.assertEqual(self.client.post(f"/admin/personas/{persona_id}/toggle", data={
+            "csrf": csrf, "enabled": "0",
+        }, follow_redirects=False).status_code, 303)
+        self.assertEqual(self.storage.get_active_persona(7)["id"], "default")
+        self.assertEqual(self.client.post(f"/admin/personas/{persona_id}/delete", data={
+            "csrf": csrf,
+        }, follow_redirects=False).status_code, 303)
+        self.assertIsNone(self.storage.get_persona(persona_id))
+
     def test_auth_csrf_and_memory_user_scope(self):
         self.assertEqual(self.client.get("/admin/memories", follow_redirects=False).status_code, 303)
         login = self.client.get("/admin/login")

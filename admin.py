@@ -10,6 +10,7 @@ import re
 import secrets
 import sqlite3
 import time
+import tempfile
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html import escape
@@ -21,11 +22,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import Settings
 from bot import create_user_session, switch_user_session
-from costs import format_usd
+from costs import PricingCatalog, format_usd
 from logging_conf import get_logger
 from mail_service import MailSendError, email_address, send_email, smtp_settings as validate_smtp_settings
 from memory import looks_secret
-from pi_bridge import PiBusyError, PiError
+from persona import FIELDS as PERSONA_FIELDS, render_persona, validate_persona, write_prompt
+from pi_bridge import PiBusyError, PiError, PiRpcClient
 from storage import Storage
 
 logger = get_logger("admin")
@@ -238,7 +240,7 @@ def _layout(title: str, active: str, body: str, csrf: str, user_id: int | None, 
 {_STYLE_TAG}</head><body>
 <div class="app-shell"><aside class="sidebar"><a class="brand" href="/admin/overview">
 <span class="brand-mark">P<span>·</span></span><span>PI<span class="brand-muted"> / ADMIN</span></span></a>
-<nav aria-label="主导航">{nav('overview', '概览', 'overview')}{nav('sessions', '会话管理', 'sessions')}{nav('usage', '用量费用', 'usage')}{nav('memories', '长期记忆', 'memories')}{nav('summaries', '会话摘要', 'summaries')}{nav('settings', '记忆设置', 'settings')}{nav('mail', '邮件设置', 'mail')}</nav>
+<nav aria-label="主导航">{nav('overview', '概览', 'overview')}{nav('sessions', '会话管理', 'sessions')}{nav('usage', '用量费用', 'usage')}{nav('memories', '长期记忆', 'memories')}{nav('summaries', '会话摘要', 'summaries')}{nav('personas', '人格管理', 'personas')}{nav('settings', '记忆设置', 'settings')}{nav('mail', '邮件设置', 'mail')}</nav>
 <div class="sidebar-bottom"><span class="admin-name">{_e(settings.admin_username)}</span>
 <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{_e(csrf)}">
 <button class="text-button" type="submit">退出</button></form></div></aside>
@@ -409,6 +411,8 @@ def _usage_page(request: Request, csrf: str, user_id: int | None, period: str) -
     total = sum((Decimal(row["estimated_usd"]) for row in events if row["estimated_usd"] is not None), Decimal(0))
     maintenance = sum((Decimal(row["estimated_usd"]) for row in events
                        if row["origin"] == "memory_maintenance" and row["estimated_usd"] is not None), Decimal(0))
+    persona_testing = sum((Decimal(row["estimated_usd"]) for row in events
+                           if row["origin"] == "persona_test" and row["estimated_usd"] is not None), Decimal(0))
     cache_base = counts["input_tokens"] + counts["cache_read_tokens"]
     cache_rate = f'{counts["cache_read_tokens"] / cache_base:.0%}' if cache_base else "—"
     range_links = "".join(
@@ -416,7 +420,8 @@ def _usage_page(request: Request, csrf: str, user_id: int | None, period: str) -
         for key, (title, _) in periods.items()
     )
     metrics = (("估算费用", format_usd(total)), ("聊天轮次", str(sum(r["origin"] == "chat" for r in runs))),
-               ("缓存命中", cache_rate), ("记忆维护", format_usd(maintenance)))
+               ("缓存命中", cache_rate), ("记忆维护", format_usd(maintenance)),
+               ("人格测试", format_usd(persona_testing)))
     metric_html = "".join(f'<div class="metric-card"><span>{_e(name)}</span><strong>{_e(value)}</strong></div>'
                           for name, value in metrics)
     by_model: dict[str, dict[str, object]] = {}
@@ -447,7 +452,7 @@ def _usage_page(request: Request, csrf: str, user_id: int | None, period: str) -
     for run in storage.get_recent_usage_runs(user_id) if user_id is not None else []:
         amount = sum((Decimal(event["estimated_usd"]) for event in storage.get_usage_events(run["id"])
                       if event["estimated_usd"] is not None), Decimal(0))
-        origin = "记忆维护" if run["origin"] == "memory_maintenance" else "聊天"
+        origin = {"memory_maintenance": "记忆维护", "persona_test": "人格测试"}.get(run["origin"], "聊天")
         recent.append(f'<div class="list-row"><span>{_e(_time_label(run["started_at"]))}</span>'
                       f'<span>{origin} · {_e(run["status"])}</span><strong>{_e(format_usd(amount))}</strong></div>')
     body = (f'<div class="page-heading"><div><p class="eyebrow">USAGE</p><h1>用量费用</h1></div>{picker}</div>'
@@ -500,6 +505,92 @@ def _summary_page(request: Request, csrf: str, user_id: int | None) -> HTMLRespo
     content = "".join(cards) if cards else '<p class="empty">暂无会话</p>'
     body = f'<div class="page-heading"><div><p class="eyebrow">SESSIONS</p><h1>会话摘要</h1></div>{picker}</div>{_notice(request)}<div class="card-list">{content}</div>'
     return _html(_layout("会话摘要", "summaries", body, csrf, user_id, settings))
+
+
+def _personas_page(request: Request, csrf: str, user_id: int | None, error: str = "") -> HTMLResponse:
+    storage, settings = _storage(request), _settings(request)
+    picker = _user_picker(storage, settings, user_id, "personas")
+    active = storage.get_active_persona(user_id) if user_id is not None else None
+    cards = []
+    for row in storage.list_personas():
+        persona_id = row["id"]
+        selected = bool(active and active["id"] == persona_id)
+        badge = ("当前" if selected else "默认" if persona_id == "default" else
+                 "可用" if row["enabled"] else "已停用")
+        activate = (f'<form method="post" action="/admin/personas/{persona_id}/use">'
+                    f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                    f'<input type="hidden" name="user_id" value="{user_id}">'
+                    f'<button class="text-button" type="submit">切换为当前人格</button></form>'
+                    if user_id is not None and row["enabled"] and not selected else "")
+        toggle = (f'<form method="post" action="/admin/personas/{persona_id}/toggle">'
+                  f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                  f'<input type="hidden" name="user_id" value="{user_id or ""}">'
+                  f'<input type="hidden" name="enabled" value="{0 if row["enabled"] else 1}">'
+                  f'<button class="text-button" type="submit">{"停用" if row["enabled"] else "启用"}</button></form>'
+                  if persona_id != "default" else "")
+        delete = (f'<details class="danger-details"><summary>删除</summary>'
+                  f'<form method="post" action="/admin/personas/{persona_id}/delete">'
+                  f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                  f'<input type="hidden" name="user_id" value="{user_id or ""}">'
+                  f'<button class="button danger" type="submit">确认删除</button></form></details>'
+                  if persona_id != "default" else "")
+        cards.append(f'<article class="memory-card"><div class="card-meta"><span class="badge">{badge}</span>'
+                     f'<span class="mono">{_e(persona_id)}</span></div><h2>{_e(row["name"])}</h2>'
+                     f'<p class="persona-excerpt">{_e(row["identity"][:180])}</p>'
+                     f'<div class="card-actions"><a href="/admin/personas/{persona_id}'
+                     f'{"?" + urlencode({"user_id": user_id}) if user_id is not None else ""}">编辑 · 预览 · 测试</a>'
+                     f'{activate}{toggle}{delete}</div></article>')
+    alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
+    body = (f'<div class="page-heading"><div><p class="eyebrow">PERSONAS</p><h1>人格管理</h1></div>{picker}</div>'
+            f'{alert}<div class="toolbar"><span class="count">{len(cards)} 个</span>'
+            f'<a class="button primary" href="/admin/personas/new'
+            f'{"?" + urlencode({"user_id": user_id}) if user_id is not None else ""}">创建人格</a></div>'
+            f'<div class="card-list">{"".join(cards)}</div>')
+    return _html(_layout("人格管理", "personas", body, csrf, user_id, settings),
+                 status_code=400 if error else 200)
+
+
+def _persona_form_page(request: Request, csrf: str, user_id: int | None, row=None,
+                       values: dict[str, str] | None = None, error: str = "",
+                       preview: str | None = None, test_result: str | None = None,
+                       question: str = "") -> HTMLResponse:
+    current = values if values is not None else (dict(row) if row is not None else {})
+    persona_id = row["id"] if row is not None else None
+    title = "编辑人格" if row is not None else "创建人格"
+    action = f"/admin/personas/{persona_id}" if persona_id else "/admin/personas"
+    fields = []
+    for key, label in PERSONA_FIELDS:
+        required = " required" if key == "identity" else ""
+        fields.append(f'<label class="persona-field"><span>{_e(label)}</span>'
+                      f'<textarea name="{key}" rows="4" maxlength="4000"{required}>'
+                      f'{_e(current.get(key, ""))}</textarea></label>')
+    actual = preview if preview is not None else (render_persona(row) if row is not None else "")
+    prompt_html = (f'<section class="settings-group"><div class="section-head"><h2>生成的追加提示词</h2>'
+                   f'<span class="muted">{len(actual.encode("utf-8")):,} 字节</span></div>'
+                   f'<pre class="persona-prompt">{_e(actual)}</pre></section>' if actual else "")
+    result_html = (f'<section class="settings-group"><h2>测试回复</h2>'
+                   f'<p class="persona-result">{_e(test_result)}</p></section>' if test_result is not None else "")
+    test_html = (f'<section class="settings-group"><h2>独立测试</h2>'
+                 f'<form method="post" action="/admin/personas/{persona_id}/test" class="persona-form">'
+                 f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                 f'<input type="hidden" name="user_id" value="{user_id or ""}">'
+                 f'<label class="persona-field"><span>测试消息</span>'
+                 f'<textarea name="question" rows="3" maxlength="1000" required>{_e(question)}</textarea></label>'
+                 f'<div class="form-footer"><button class="button subtle" type="submit">运行测试</button></div>'
+                 f'</form></section>' if persona_id else "")
+    alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
+    body = (f'<div class="page-heading"><div><p class="eyebrow">PERSONAS</p><h1>{title}</h1></div>'
+            f'<a class="button subtle" href="/admin/personas">返回列表</a></div>{alert}'
+            f'<section class="settings-group"><form method="post" action="{action}" class="persona-form">'
+            f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+            f'<input type="hidden" name="user_id" value="{user_id or ""}">'
+            f'<label class="persona-field"><span>名称</span><input name="name" value="{_e(current.get("name", ""))}" maxlength="60" required></label>'
+            f'{"".join(fields)}<div class="form-footer persona-actions">'
+            f'<button class="button subtle" type="submit" name="action" value="preview">预览提示词</button>'
+            f'<button class="button primary" type="submit" name="action" value="save">保存人格</button>'
+            f'</div></form></section>{prompt_html}{test_html}{result_html}')
+    return _html(_layout(title, "personas", body, csrf, user_id, _settings(request)),
+                 status_code=400 if error else 200)
 
 
 def _settings_page(request: Request, csrf: str, error: str = "") -> HTMLResponse:
@@ -882,6 +973,192 @@ async def save_mail(request: Request):
     storage.save_smtp_settings(**values)
     logger.info("后台保存 SMTP 配置", extra={"host": values["host"], "port": values["port"]})
     return _redirect("/admin/mail?status=saved")
+
+
+@router.get("/personas")
+async def personas_page(request: Request):
+    csrf = _session(request)
+    if not csrf:
+        return _redirect("/admin/login")
+    user_id = _selected_user(request.query_params.get("user_id"), _storage(request), _settings(request))
+    return _personas_page(request, csrf, user_id)
+
+
+@router.get("/personas/new")
+async def new_persona_page(request: Request):
+    csrf = _session(request)
+    if not csrf:
+        return _redirect("/admin/login")
+    user_id = _selected_user(request.query_params.get("user_id"), _storage(request), _settings(request))
+    return _persona_form_page(request, csrf, user_id)
+
+
+@router.post("/personas")
+async def create_persona(request: Request):
+    csrf, form = await _authorized_form(request)
+    storage, settings = _storage(request), _settings(request)
+    user_id = _selected_user(form.get("user_id"), storage, settings)
+    try:
+        values = validate_persona(form)
+        if form.get("action") == "preview":
+            return _persona_form_page(request, csrf, user_id, values=values,
+                                      preview=render_persona(values))
+        if form.get("action") != "save":
+            raise ValueError("操作无效")
+        persona_id = storage.create_persona(values)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        message = "人格名称已存在" if isinstance(exc, sqlite3.IntegrityError) else str(exc)
+        return _persona_form_page(request, csrf, user_id, values=form, error=message)
+    logger.info("后台创建人格", extra={"persona_id": persona_id})
+    return _redirect(f"/admin/personas/{persona_id}?{urlencode({'status': 'created', **({'user_id': user_id} if user_id is not None else {})})}")
+
+
+@router.get("/personas/{persona_id}")
+async def persona_detail(persona_id: str, request: Request):
+    csrf = _session(request)
+    if not csrf:
+        return _redirect("/admin/login")
+    row = _storage(request).get_persona(persona_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="人格不存在")
+    user_id = _selected_user(request.query_params.get("user_id"), _storage(request), _settings(request))
+    return _persona_form_page(request, csrf, user_id, row)
+
+
+@router.post("/personas/{persona_id}")
+async def edit_persona(persona_id: str, request: Request):
+    csrf, form = await _authorized_form(request)
+    storage, settings = _storage(request), _settings(request)
+    row = storage.get_persona(persona_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="人格不存在")
+    user_id = _selected_user(form.get("user_id"), storage, settings)
+    try:
+        values = validate_persona(form)
+        if form.get("action") == "preview":
+            return _persona_form_page(request, csrf, user_id, row, values=values,
+                                      preview=render_persona(values))
+        if form.get("action") != "save":
+            raise ValueError("操作无效")
+        storage.update_persona(persona_id, values)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        message = "人格名称已存在" if isinstance(exc, sqlite3.IntegrityError) else str(exc)
+        return _persona_form_page(request, csrf, user_id, row, values=form, error=message)
+    logger.info("后台更新人格", extra={"persona_id": persona_id})
+    return _redirect(f"/admin/personas/{persona_id}?{urlencode({'status': 'saved', **({'user_id': user_id} if user_id is not None else {})})}")
+
+
+@router.post("/personas/{persona_id}/use")
+async def use_persona(persona_id: str, request: Request):
+    _, form = await _authorized_form(request)
+    storage, settings = _storage(request), _settings(request)
+    user_id = _form_user(form, storage, settings)
+    try:
+        storage.set_active_persona(user_id, persona_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    logger.info("后台切换人格", extra={"user_id": user_id, "persona_id": persona_id})
+    return _redirect(f"/admin/personas?{urlencode({'user_id': user_id, 'status': 'switched'})}")
+
+
+@router.post("/personas/{persona_id}/toggle")
+async def toggle_persona(persona_id: str, request: Request):
+    _, form = await _authorized_form(request)
+    storage = _storage(request)
+    if form.get("enabled") not in {"0", "1"}:
+        raise HTTPException(status_code=400, detail="操作无效")
+    try:
+        changed = storage.set_persona_enabled(persona_id, form["enabled"] == "1")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not changed:
+        raise HTTPException(status_code=404, detail="人格不存在")
+    logger.info("后台调整人格状态", extra={"persona_id": persona_id, "enabled": form["enabled"] == "1"})
+    return _redirect("/admin/personas?status=saved")
+
+
+@router.post("/personas/{persona_id}/delete")
+async def delete_persona(persona_id: str, request: Request):
+    await _authorized_form(request)
+    try:
+        deleted = _storage(request).delete_persona(persona_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="人格不存在")
+    logger.info("后台删除人格", extra={"persona_id": persona_id})
+    return _redirect("/admin/personas?status=deleted")
+
+
+async def _run_persona_test(request: Request, row, user_id: int, question: str) -> str:
+    settings, storage = _settings(request), _storage(request)
+    manager = getattr(request.app.state, "manager", None)
+    agent = getattr(manager, "_agents", {}).get(user_id) if manager is not None else None
+    provider = (agent.client.provider if agent is not None else None) or settings.pi_provider
+    model = (agent.client.model if agent is not None else None) or settings.pi_model
+    with tempfile.TemporaryDirectory(prefix="dj-pi-persona-") as folder:
+        path = Path(folder) / "persona.md"
+        write_prompt(path, render_persona(row))
+        client = PiRpcClient(
+            settings.pi_cmd, str(Path(folder) / "sessions"),
+            provider=provider, model=model,
+            extra_args=["--no-session", "--no-tools", "--no-extensions", "--no-context-files",
+                        "--no-skills", "--no-prompt-templates", "--append-system-prompt", str(path)],
+        )
+        run_id = storage.start_usage_run(user_id, None, None, None, origin="persona_test")
+        seq = 0
+
+        def on_usage(event: dict) -> None:
+            nonlocal seq
+            seq += 1
+            price = PricingCatalog(settings.pricing_file).price(
+                event["provider"], event["model"], event["usage"], event["occurred_at"]
+            )
+            storage.record_usage_event(run_id, seq, event, price)
+
+        complete = False
+        try:
+            parts = []
+            async with asyncio.timeout(120):
+                async for part in client.prompt(question, on_usage=on_usage):
+                    parts.append(part)
+                    if sum(len(item) for item in parts) > 8000:
+                        raise ValueError("测试回复超过 8000 字符")
+            complete = True
+            answer = "".join(parts).strip() or "（模型没有返回文字）"
+            events = storage.get_usage_events(run_id)
+            prices = [Decimal(event["estimated_usd"]) for event in events
+                      if event["estimated_usd"] is not None]
+            cost = ("用量未返回" if not events else "未完整计价" if len(prices) < len(events)
+                    else format_usd(sum(prices, Decimal(0))))
+            return f"{answer}\n\n模型：{provider}/{model} · 测试估算费用：{cost}"
+        finally:
+            await client.stop()
+            storage.finish_usage_run(run_id, "complete" if complete else "failed", None)
+
+
+@router.post("/personas/{persona_id}/test")
+async def test_persona(persona_id: str, request: Request):
+    csrf, form = await _authorized_form(request)
+    storage, settings = _storage(request), _settings(request)
+    row = storage.get_persona(persona_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="人格不存在")
+    user_id = _form_user(form, storage, settings)
+    question = form.get("question", "").strip()
+    if not 1 <= len(question) <= 1000:
+        return _persona_form_page(request, csrf, user_id, row, error="测试消息须为 1–1000 字符")
+    try:
+        result = await _run_persona_test(request, row, user_id, question)
+    except (PiError, ValueError, TimeoutError) as exc:
+        return _persona_form_page(request, csrf, user_id, row,
+                                  error=f"测试失败：{str(exc)[:160]}", question=question)
+    except Exception:
+        logger.exception("后台人格测试失败", extra={"persona_id": persona_id, "user_id": user_id})
+        return _persona_form_page(request, csrf, user_id, row,
+                                  error="测试失败，请查看服务日志", question=question)
+    logger.info("后台人格测试完成", extra={"persona_id": persona_id, "user_id": user_id})
+    return _persona_form_page(request, csrf, user_id, row, test_result=result, question=question)
 
 
 @router.post("/mail/test")

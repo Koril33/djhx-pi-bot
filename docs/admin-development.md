@@ -4,6 +4,8 @@
 
 `admin.py` 作为 FastAPI 子路由挂在现有 `app.py` 的 `/admin`。页面由 Python 渲染 HTML，样式源文件位于 `admin_static/style.css`；没有前端构建步骤。后台通过现有 `Storage` 操作 `memory_items`、`sessions` 和 `session_summaries`。
 
+人格管理使用 `personas` 与 `user_persona_selection` 两张 SQLite 表。`persona.py` 校验六个字段并生成准确的追加提示词，`prompts/default-persona.json` 只在首次建表时播种默认人格。`AgentSession` 把当前用户的提示词原子写入数据库同目录下的 `persona-prompts/<user_id>.md`，文件权限为 `0600`，目录为 `0700`；提示词变化时重启空闲 Pi RPC 并沿用原会话文件。后台测试用临时目录与 `--no-tools --no-extensions --no-context-files` 独立调用 Pi，账本来源为 `persona_test`。完整产品边界见 [人格系统设计](persona-product.md)。
+
 邮件设置页使用相同的管理员会话与 CSRF 校验。`smtp_settings` 只有 `id=1` 一行；服务端从数据库读取授权码，表单不回填密码。`mail_service.py` 负责参数校验和 SMTP 发送，后台测试发送使用 `asyncio.to_thread`，避免同步 SMTP 阻塞 webhook 事件循环。`bot.py` 为聊天 Pi 加载 `pi_extensions/mail-tool.ts`；扩展将收件人、主题、正文写入 `mail_cli.py` 的标准输入，由该短生命周期 Python 进程从 SQLite 读取凭据并发送。扩展的工具参数和结果不接收、打印或返回授权码；Pi 运行账号仍可通过原有文件工具读取数据库，不能把工具边界当成操作系统级隔离。
 
 端口 465 通过 `SMTP_SSL` 在连接开始时完成 TLS；587 通过 `SMTP` 连接、`EHLO`、`STARTTLS`、再次 `EHLO` 后才认证。使用系统信任链验证证书；不允许明文回退。只接受单个邮箱、纯文本正文，限制主题和正文长度。SMTP 服务端接受后的退信不在本项目追踪范围内。工具执行的邮件发送属于外部副作用，Pi 回合被中断后也可能已发出；不要自动重放失败的 Telegram 更新。
