@@ -8,7 +8,7 @@
 
 端口 465 通过 `SMTP_SSL` 在连接开始时完成 TLS；587 通过 `SMTP` 连接、`EHLO`、`STARTTLS`、再次 `EHLO` 后才认证。使用系统信任链验证证书；不允许明文回退。只接受单个邮箱、纯文本正文，限制主题和正文长度。SMTP 服务端接受后的退信不在本项目追踪范围内。工具执行的邮件发送属于外部副作用，Pi 回合被中断后也可能已发出；不要自动重放失败的 Telegram 更新。
 
-概览使用 `update_stats()` 和最近失败更新的元数据，不读取原始 Telegram payload；Pi 状态只检查已有的 `AgentSession`，不因为打开页面启动新进程。会话新建与切换调用 `bot.py` 中供 Telegram 和后台共用的 `create_user_session()` / `switch_user_session()`，并在同一用户的 `control_lock` 下执行。后台重命名仅更改 SQLite 显示名。用量页按北京时间计算日界，通过 `usage_runs` / `usage_events` 汇总；金额使用 Decimal，记忆维护按 `origin` 单列。
+概览使用 `update_stats()` 和最近失败更新的元数据，不读取原始 Telegram payload；Pi 状态只检查已有的 `AgentSession`，不因为打开页面启动新进程。管理员核对失败更新后可提交带 CSRF 的“标记已处理”：`telegram_updates.state` 变为 `acknowledged` 并记录 `acknowledged_at`，`update_id` 保留用于去重，原消息不会重放。`/healthz` 的 `degraded` 只根据仍处于 `failed` 的记录及 worker 状态判断；30 天清理包含失败与已处理记录。会话新建与切换调用 `bot.py` 中供 Telegram 和后台共用的 `create_user_session()` / `switch_user_session()`，并在同一用户的 `control_lock` 下执行。后台重命名仅更改 SQLite 显示名。用量页按北京时间计算日界，通过 `usage_runs` / `usage_events` 汇总；金额使用 Decimal，记忆维护按 `origin` 单列。
 
 导航使用普通链接，切页会加载完整 HTML。最初页面从 `/admin/style.css` 读取样式且响应为 `no-store`，每次切页都重新请求，浏览器短暂显示未着色内容。现在服务启动时读取约 8 KB 的样式，将其直接放入每页 `<head>`；CSP 使用对应的 SHA-256 哈希放行这份固定样式。页面仍保持 `no-store`，且切页不再依赖第二个样式请求。
 

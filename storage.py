@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS telegram_updates (
     attempts       INTEGER NOT NULL DEFAULT 0,
     received_at    REAL NOT NULL,
     processed_at   REAL,
+    acknowledged_at REAL,
     last_error     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_telegram_updates_pending
@@ -169,6 +170,9 @@ class Storage:
                 self._conn.execute(
                     "ALTER TABLE conversation_turns ADD COLUMN interruption_notice_pending INTEGER NOT NULL DEFAULT 0"
                 )
+            update_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(telegram_updates)")}
+            if "acknowledged_at" not in update_columns:
+                self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN acknowledged_at REAL")
             self._conn.commit()
 
     def _query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -623,6 +627,16 @@ class Storage:
                 ),
             )
 
+    def acknowledge_failed_update(self, update_id: int) -> bool:
+        """保留记录与去重 ID，仅从待处理故障中移除。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE telegram_updates SET state = 'acknowledged', acknowledged_at = ? "
+                "WHERE update_id = ? AND state = 'failed'",
+                (time.time(), update_id),
+            )
+            return cur.rowcount == 1
+
     def update_stats(self) -> dict[str, int | float | None]:
         with self._lock:
             row = self._conn.execute(
@@ -652,7 +666,7 @@ class Storage:
         self._exec(
             "DELETE FROM telegram_updates WHERE "
             "(state = 'done' AND processed_at < ?) OR "
-            "(state = 'failed' AND processed_at < ?)",
+            "(state IN ('failed', 'acknowledged') AND processed_at < ?)",
             (
                 time.time() - keep_done_days * 86400,
                 time.time() - keep_failed_days * 86400,

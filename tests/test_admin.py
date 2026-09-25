@@ -75,6 +75,20 @@ class AdminTests(unittest.TestCase):
         send.assert_called_once()
         self.assertEqual(send.call_args.args[1], "admin@example.com")
 
+    def test_failed_update_can_be_acknowledged_without_deleting_dedup_id(self):
+        self.storage.enqueue_update(900, '{"update_id":900}')
+        self.storage.fail_update(900, "network")
+        self.login()
+        page = self.client.get("/admin/overview?user_id=7")
+        self.assertIn("#900", page.text)
+        self.assertEqual(self.client.post("/admin/updates/900/acknowledge", data={"csrf": "wrong"}).status_code, 403)
+        result = self.client.post("/admin/updates/900/acknowledge", data={"csrf": self.csrf(page)},
+                                  follow_redirects=False)
+        self.assertEqual(result.status_code, 303)
+        self.assertEqual(self.storage.update_stats()["failed"], 0)
+        self.assertFalse(self.storage.enqueue_update(900, '{"update_id":900}'))
+        self.assertNotIn("#900", self.client.get("/admin/overview").text)
+
     def test_auth_csrf_and_memory_user_scope(self):
         self.assertEqual(self.client.get("/admin/memories", follow_redirects=False).status_code, 303)
         login = self.client.get("/admin/login")

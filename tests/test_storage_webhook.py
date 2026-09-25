@@ -88,6 +88,20 @@ class StorageSessionTests(unittest.TestCase):
         self.assertIsNone(self.storage.next_update())
         self.assertEqual(self.storage.update_stats()["failed"], 1)
 
+    def test_acknowledge_keeps_dedup_record_without_health_failure(self):
+        self.storage.enqueue_update(1, '{"update_id":1}')
+        self.storage.claim_updates(1)
+        self.storage.fail_interrupted_updates()
+        self.assertTrue(self.storage.acknowledge_failed_update(1))
+        self.assertFalse(self.storage.acknowledge_failed_update(1))
+        self.assertEqual(self.storage.update_stats()["failed"], 0)
+        self.assertEqual(self.storage.get_recent_failed_updates(), [])
+        self.assertFalse(self.storage.enqueue_update(1, '{"update_id":1}'))
+        row = self.storage._query("SELECT state, payload, acknowledged_at FROM telegram_updates WHERE update_id = 1")[0]
+        self.assertEqual(row["state"], "acknowledged")
+        self.assertIsNone(row["payload"])
+        self.assertIsNotNone(row["acknowledged_at"])
+
 
 class WebhookTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

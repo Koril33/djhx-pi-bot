@@ -338,7 +338,10 @@ def _overview_page(request: Request, csrf: str, user_id: int | None) -> HTMLResp
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", reason):
                 reason = "处理失败"
         failed.append(f'<div class="list-row"><span class="mono">#{_e(row["update_id"])}</span>'
-                      f'<span>{_e(reason)}</span><span class="muted">{_e(_time_label(row["processed_at"]))}</span></div>')
+                      f'<span>{_e(reason)}</span><span class="muted">{_e(_time_label(row["processed_at"]))}</span>'
+                      f'<form method="post" action="/admin/updates/{row["update_id"]}/acknowledge">'
+                      f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                      f'<button class="text-button" type="submit">标记已处理</button></form></div>')
     failure_html = "".join(failed) or '<p class="empty small">没有失败更新</p>'
     body = (f'<div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1>概览</h1></div>{picker}</div>'
             f'<div class="metric-grid">{cards_html}</div>'
@@ -646,6 +649,15 @@ async def sessions(request: Request):
         return _redirect("/admin/login")
     user_id = _selected_user(request.query_params.get("user_id"), _storage(request), _settings(request))
     return _session_page(request, csrf, user_id)
+
+
+@router.post("/updates/{update_id}/acknowledge")
+async def acknowledge_update(update_id: int, request: Request):
+    await _authorized_form(request)
+    if not _storage(request).acknowledge_failed_update(update_id):
+        raise HTTPException(status_code=404, detail="失败更新不存在")
+    logger.info("后台标记失败更新已处理", extra={"update_id": update_id})
+    return _redirect("/admin/overview")
 
 
 def _session_name(raw: str | None) -> str:

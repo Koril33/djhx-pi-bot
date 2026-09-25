@@ -88,7 +88,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 
 ## 故障排查
 
-- `curl http://127.0.0.1:8128/healthz` 查看更新队列的待处理、处理中和失败数量。`degraded: true` 表示有更新需要检查。
+- `curl http://127.0.0.1:8128/healthz` 查看更新队列的待处理、处理中和未确认失败数量。`degraded: true` 表示 worker 异常或有尚未确认的失败更新。核对后可在后台概览将失败更新“标记已处理”；这保留去重记录，不会重放消息。失败与已处理记录均按 30 天保留。
 - `journalctl -u djhx-pi-bot --since '1 hour ago' --no-pager` 查看 bot、pi RPC 和 Telegram 发送错误；`logs/deploy.log` 记录部署过程。
 - 已开始处理的 Telegram 更新若因服务重启或异常而中断，会记录为失败，不会自动重放可能已执行工具的请求。确认结果后由用户重新发送。
 - SQLite 中仍处于 `running` 的旧回合会在启动时变为 `incomplete`，并在用户下一条普通消息时提醒一次；这不会恢复中断期间丢失的回复。
