@@ -23,6 +23,7 @@ from config import Settings
 from bot import create_user_session, switch_user_session
 from costs import format_usd
 from logging_conf import get_logger
+from mail_service import MailSendError, email_address, send_email, smtp_settings as validate_smtp_settings
 from memory import looks_secret
 from pi_bridge import PiBusyError, PiError
 from storage import Storage
@@ -231,13 +232,13 @@ def _layout(title: str, active: str, body: str, csrf: str, user_id: int | None, 
     suffix = f"?{urlencode({'user_id': user_id})}" if user_id is not None else ""
     def nav(path: str, label: str, key: str) -> str:
         cls = "nav-link active" if active == key else "nav-link"
-        return f'<a class="{cls}" href="/admin/{path}{suffix if path != "settings" else ""}">{label}</a>'
+        return f'<a class="{cls}" href="/admin/{path}{suffix if path not in {"settings", "mail"} else ""}">{label}</a>'
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{_e(title)} · Pi 管理</title>
 {_STYLE_TAG}</head><body>
 <div class="app-shell"><aside class="sidebar"><a class="brand" href="/admin/overview">
 <span class="brand-mark">P<span>·</span></span><span>PI<span class="brand-muted"> / ADMIN</span></span></a>
-<nav aria-label="主导航">{nav('overview', '概览', 'overview')}{nav('sessions', '会话管理', 'sessions')}{nav('usage', '用量费用', 'usage')}{nav('memories', '长期记忆', 'memories')}{nav('summaries', '会话摘要', 'summaries')}{nav('settings', '记忆设置', 'settings')}</nav>
+<nav aria-label="主导航">{nav('overview', '概览', 'overview')}{nav('sessions', '会话管理', 'sessions')}{nav('usage', '用量费用', 'usage')}{nav('memories', '长期记忆', 'memories')}{nav('summaries', '会话摘要', 'summaries')}{nav('settings', '记忆设置', 'settings')}{nav('mail', '邮件设置', 'mail')}</nav>
 <div class="sidebar-bottom"><span class="admin-name">{_e(settings.admin_username)}</span>
 <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{_e(csrf)}">
 <button class="text-button" type="submit">退出</button></form></div></aside>
@@ -286,7 +287,8 @@ def _user_picker(storage: Storage, settings: Settings, user_id: int | None, path
 
 def _notice(request: Request) -> str:
     labels = {"saved": "已保存", "deleted": "已删除", "pinned": "已更新", "cleared": "已清空",
-              "created": "会话已创建", "switched": "会话已切换", "recovered": "会话已从 SQLite 恢复"}
+              "created": "会话已创建", "switched": "会话已切换", "recovered": "会话已从 SQLite 恢复",
+              "sent": "测试邮件已提交给 SMTP 服务器"}
     value = labels.get(request.query_params.get("status", ""))
     return f'<p class="notice" role="status">{value}</p>' if value else ""
 
@@ -517,6 +519,34 @@ def _settings_page(request: Request, csrf: str, error: str = "") -> HTMLResponse
     body = f'''<div class="page-heading"><div><p class="eyebrow">CONFIGURATION</p><h1>记忆设置</h1></div><span class="source-label">{source}</span></div>{alert}
 <form method="post" action="/admin/settings" class="settings-form"><input type="hidden" name="csrf" value="{_e(csrf)}"><label class="switch-row"><span>自动提取</span><input type="checkbox" name="memory_auto_extract"{checked}></label>{''.join(sections)}<div class="form-footer"><button class="button primary" type="submit">保存设置</button></div></form>'''
     return _html(_layout("记忆设置", "settings", body, csrf, None, settings), status_code=400 if error else 200)
+
+
+def _mail_page(request: Request, csrf: str, error: str = "") -> HTMLResponse:
+    current = _storage(request).get_smtp_settings()
+    host = _e(current["host"] if current else "")
+    port = current["port"] if current else 465
+    username = _e(current["username"] if current else "")
+    from_address = _e(current["from_address"] if current else "")
+    secret_hint = "已保存，留空保持原值" if current else "SMTP 密码或授权码"
+    alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
+    test = (f'''<section class="settings-group"><h2>发送测试</h2>
+<form method="post" action="/admin/mail/test" class="mail-test-form">
+<input type="hidden" name="csrf" value="{_e(csrf)}">
+<label class="mail-field"><span>收件邮箱</span><input type="email" name="to" autocomplete="off" maxlength="254" required></label>
+<button class="button subtle" type="submit">发送测试邮件</button></form></section>''' if current else "")
+    body = f'''<div class="page-heading"><div><p class="eyebrow">CONFIGURATION</p><h1>邮件设置</h1></div>
+<span class="source-label">{'SQLite' if current else '未配置'}</span></div>{alert}
+<section class="settings-group"><h2>SMTP</h2>
+<form method="post" action="/admin/mail" class="mail-form">
+<input type="hidden" name="csrf" value="{_e(csrf)}">
+<label class="mail-field"><span>服务器</span><input name="host" value="{host}" maxlength="253" placeholder="mail.example.com" required></label>
+<label class="mail-field"><span>端口与加密</span><select name="port"><option value="465"{' selected' if port == 465 else ''}>465 · SSL/TLS</option><option value="587"{' selected' if port == 587 else ''}>587 · STARTTLS</option></select></label>
+<label class="mail-field"><span>用户名</span><input name="username" value="{username}" autocomplete="off" maxlength="254" required></label>
+<label class="mail-field"><span>发件邮箱</span><input type="email" name="from_address" value="{from_address}" autocomplete="off" maxlength="254" required></label>
+<label class="mail-field"><span>密码 / 授权码</span><input type="password" name="password" autocomplete="new-password" maxlength="1024" placeholder="{secret_hint}"{' required' if not current else ''}></label>
+<div class="form-footer"><button class="button primary" type="submit">保存配置</button></div></form></section>{test}'''
+    return _html(_layout("邮件设置", "mail", body, csrf, None, _settings(request)),
+                 status_code=400 if error else 200)
 
 
 def _client_ip(request: Request) -> str:
@@ -815,3 +845,43 @@ async def save_settings(request: Request):
         setattr(settings, key, value)
     logger.info("后台更新记忆参数", extra={"keys": sorted(values)})
     return _redirect("/admin/settings?status=saved")
+
+
+@router.get("/mail")
+async def mail_page(request: Request):
+    csrf = _session(request)
+    if not csrf:
+        return _redirect("/admin/login")
+    return _mail_page(request, csrf)
+
+
+@router.post("/mail")
+async def save_mail(request: Request):
+    csrf, form = await _authorized_form(request)
+    storage = _storage(request)
+    current = storage.get_smtp_settings()
+    password = form.get("password", "") or (current["password"] if current else "")
+    try:
+        values = validate_smtp_settings(form.get("host", ""), form.get("port", ""),
+                                        form.get("username", ""), password,
+                                        form.get("from_address", ""))
+    except ValueError as exc:
+        return _mail_page(request, csrf, str(exc))
+    storage.save_smtp_settings(**values)
+    logger.info("后台保存 SMTP 配置", extra={"host": values["host"], "port": values["port"]})
+    return _redirect("/admin/mail?status=saved")
+
+
+@router.post("/mail/test")
+async def test_mail(request: Request):
+    csrf, form = await _authorized_form(request)
+    config = _storage(request).get_smtp_settings()
+    if config is None:
+        return _mail_page(request, csrf, "请先保存 SMTP 配置")
+    try:
+        recipient = email_address(form.get("to", ""))
+        await asyncio.to_thread(send_email, config, recipient, "Pi 邮件功能测试", "这是一封来自 djhx-pi-bot 的 SMTP 测试邮件。")
+    except (ValueError, MailSendError) as exc:
+        return _mail_page(request, csrf, str(exc))
+    logger.info("后台发送 SMTP 测试邮件", extra={"recipient": recipient})
+    return _redirect("/admin/mail?status=sent")

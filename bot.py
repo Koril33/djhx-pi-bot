@@ -14,6 +14,7 @@ import base64
 import json
 from pathlib import Path
 import re
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -474,14 +475,22 @@ class AgentSession:
         extra_args = ["--append-system-prompt", str(persona_file)]
         if memory_enabled:
             extra_args += ["--extension", str(Path(__file__).resolve().parent / "pi_extensions" / "memory-context.ts")]
+        project_dir = Path(__file__).resolve().parent
+        extra_args += ["--extension", str(project_dir / "pi_extensions" / "mail-tool.ts")]
+        extra_env = {
+            "DJHX_MAIL_DB_PATH": str(Path(storage.db_path).resolve()),
+            "DJHX_MAIL_PYTHON": sys.executable,
+            "DJHX_MAIL_WORKDIR": str(project_dir),
+        }
+        if memory_enabled:
+            extra_env["DJHX_MEMORY_CONTEXT_FILE"] = str(memory.context_path(user_id))
         self.client = PiRpcClient(
             pi_cmd=settings.pi_cmd,
             session_dir=settings.pi_session_dir,
             provider=settings.pi_provider,
             model=settings.pi_model,
             extra_args=extra_args,
-            extra_env=({"DJHX_MEMORY_CONTEXT_FILE": str(memory.context_path(user_id))}
-                       if memory_enabled else None),
+            extra_env=extra_env,
         )
 
     async def ensure_default_session(self) -> None:

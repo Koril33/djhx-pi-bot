@@ -56,6 +56,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 - 会话 JSONL 没有迁移时，bot 会为原会话 ID 新建 pi 会话，并从 SQLite 摘要和近期文字回合恢复主要背景。无法恢复旧图片、工具输出或逐字历史；没有摘要时会明确提示为空白历史。
 - `MEMORY_*` 环境变量控制自动提取周期、原始回合保留数量、单条记忆长度和注入字节预算；维护模型不提供可覆盖项，见 [.env.example](.env.example)。完整设计及限制见 [产品设计文档](docs/memory-product.md)。
 - 单管理员后台位于 `/admin`，可查看运行概览、管理会话与记忆、查看用量费用、调整记忆预算。账号密码由 `.env` 的 `ADMIN_USERNAME`、`ADMIN_PASSWORD` 配置；后台保存的参数持久化到同一个 SQLite，并优先于相应的环境变量。见 [后台产品设计](docs/admin-product.md) 与 [开发运维文档](docs/admin-development.md)。
+- 后台“邮件设置”可配置 SMTP 服务器、465 SSL/TLS 或 587 STARTTLS、用户名、授权码及发件邮箱。配置保存在同一个 SQLite；授权码不会回显到页面或出现在发信工具的参数与结果中。保存后可在后台发送测试邮件。聊天中明确提出“给某邮箱发邮件”时，Pi 可调用 `send_email` 工具发送纯文本邮件；工具只接收收件人、主题和正文。SMTP 接受表示已提交给服务器，不保证最终入箱。数据库备份包含 SMTP 授权码，应按凭据保护。
 - 使用 `uv run python -m scripts.backup_db backup.db` 可生成一致的单文件 SQLite 备份。迁移记忆时拷贝这个数据库；新服务器仍需另行配置 bot 和模型凭证。
 
 ## 用量和费用

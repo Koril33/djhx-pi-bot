@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -50,6 +50,30 @@ class AdminTests(unittest.TestCase):
             "csrf": self.csrf(login), "username": "admin", "password": "test-password-12345",
         }, follow_redirects=False)
         self.assertEqual(response.status_code, 303)
+
+    def test_mail_settings_hide_secret_and_send_test(self):
+        self.login()
+        page = self.client.get("/admin/mail")
+        csrf = self.csrf(page)
+        values = {"csrf": csrf, "host": "mail.example.com", "port": "465",
+                  "username": "bot@example.com", "from_address": "bot@example.com",
+                  "password": "smtp-secret"}
+        self.assertEqual(self.client.post("/admin/mail", data={**values, "csrf": "wrong"}).status_code, 403)
+        saved = self.client.post("/admin/mail", data=values, follow_redirects=False)
+        self.assertEqual(saved.status_code, 303)
+        self.assertEqual(self.storage.get_smtp_settings()["password"], "smtp-secret")
+        page = self.client.get("/admin/mail")
+        self.assertIn("mail.example.com", page.text)
+        self.assertNotIn("smtp-secret", page.text)
+        self.assertEqual(self.client.post("/admin/mail", data={**values, "password": ""},
+                                          follow_redirects=False).status_code, 303)
+        self.assertEqual(self.storage.get_smtp_settings()["password"], "smtp-secret")
+        with patch("admin.send_email") as send:
+            result = self.client.post("/admin/mail/test", data={"csrf": csrf, "to": "admin@example.com"},
+                                      follow_redirects=False)
+        self.assertEqual(result.status_code, 303)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[1], "admin@example.com")
 
     def test_auth_csrf_and_memory_user_scope(self):
         self.assertEqual(self.client.get("/admin/memories", follow_redirects=False).status_code, 303)

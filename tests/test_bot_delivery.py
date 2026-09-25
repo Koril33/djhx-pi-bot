@@ -109,6 +109,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ensure_client_restarts_with_active_session_file(self) -> None:
         storage = Mock()
+        storage.db_path = "data/test.db"
         storage.get_active_session.return_value = {
             "id": "current", "pi_session_file": "/current.jsonl"
         }

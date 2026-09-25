@@ -118,6 +118,16 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS smtp_settings (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    host         TEXT NOT NULL,
+    port         INTEGER NOT NULL,
+    username     TEXT NOT NULL,
+    password     TEXT NOT NULL,
+    from_address TEXT NOT NULL,
+    updated_at   REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS telegram_updates (
     update_id      INTEGER PRIMARY KEY,
     payload        TEXT,
@@ -139,6 +149,7 @@ class UpdateQueueFull(Exception):
 
 class Storage:
     def __init__(self, db_path: str):
+        self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         # inbox 暂存 Telegram 消息正文，不能让同机其他用户读取数据库文件。
@@ -182,6 +193,21 @@ class Storage:
                     "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
                     (key, json.dumps(value, ensure_ascii=False), time.time()),
                 )
+
+    def get_smtp_settings(self) -> sqlite3.Row | None:
+        rows = self._query("SELECT host, port, username, password, from_address, updated_at "
+                           "FROM smtp_settings WHERE id = 1")
+        return rows[0] if rows else None
+
+    def save_smtp_settings(self, host: str, port: int, username: str,
+                           password: str, from_address: str) -> None:
+        self._exec(
+            "INSERT INTO smtp_settings (id, host, port, username, password, from_address, updated_at) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "host=excluded.host, port=excluded.port, username=excluded.username, "
+            "password=excluded.password, from_address=excluded.from_address, updated_at=excluded.updated_at",
+            (host, port, username, password, from_address, time.time()),
+        )
 
     def list_admin_users(self) -> list[sqlite3.Row]:
         return self._query("SELECT user_id, username FROM users ORDER BY user_id")
