@@ -474,10 +474,11 @@ class AgentSession:
         if memory_enabled:
             memory.clear_context(user_id)
         self.persona_file = persona_prompt_path(storage.db_path, user_id)
-        self._persona_digest = write_prompt(
-            self.persona_file, render_persona(storage.get_active_persona(user_id))
-        )
-        extra_args = ["--append-system-prompt", str(self.persona_file)]
+        active_persona = storage.get_active_persona(user_id)
+        self._persona_digest = (write_prompt(self.persona_file, render_persona(active_persona))
+                                if active_persona is not None else None)
+        extra_args = (["--append-system-prompt", str(self.persona_file)]
+                      if active_persona is not None else [])
         if memory_enabled:
             extra_args += ["--extension", str(Path(__file__).resolve().parent / "pi_extensions" / "memory-context.ts")]
         project_dir = Path(__file__).resolve().parent
@@ -535,14 +536,24 @@ class AgentSession:
 
     async def refresh_persona(self) -> None:
         """SQLite 人格变更后重启空闲 RPC，使下一轮读取新的追加提示词。"""
-        text = render_persona(self.storage.get_active_persona(self.user_id))
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        active_persona = self.storage.get_active_persona(self.user_id)
+        text = render_persona(active_persona) if active_persona is not None else None
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None
         if digest == self._persona_digest:
             return
         if self.client.busy or self.prompt_pending:
             raise PiBusyError("当前任务仍在运行，暂不能切换人格")
         await self.client.stop()
-        self._persona_digest = write_prompt(self.persona_file, text)
+        args = self.client.extra_args
+        if "--append-system-prompt" in args:
+            index = args.index("--append-system-prompt")
+            del args[index:index + 2]
+        if text is not None:
+            self._persona_digest = write_prompt(self.persona_file, text)
+            args[:0] = ["--append-system-prompt", str(self.persona_file)]
+        else:
+            self._persona_digest = None
+            self.persona_file.unlink(missing_ok=True)
 
 
 class AgentManager:
@@ -840,7 +851,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model list — 列出可用模型\n"
         "/model use <model_id> — 切换模型\n"
         "/persona list — 列出人格\n"
-        "/persona use <id> — 切换人格\n"
+        "/persona use <id|none> — 切换人格或恢复 Pi 默认\n"
         "/cost [last|today] — 查看模型用量与估算费用\n"
         "/memory — 查看和管理长期记忆\n"
         "/summary — 查看或清空当前会话摘要\n"
@@ -1076,18 +1087,19 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if sub in {"current", "list"}:
         active = storage.get_active_persona(user.id)
         if sub == "current":
-            await reply_text(update, f"当前人格：{active['name']} ({active['id']})\n用法：/persona list | /persona use <id>")
+            current = f"{active['name']} ({active['id']})" if active is not None else "无人格（Pi 默认）"
+            await reply_text(update, f"当前人格：{current}\n用法：/persona list | /persona use <id|none>")
             return
         rows = [row for row in storage.list_personas() if row["enabled"]]
-        lines = ["可用人格："] + [
-            f"{'●' if row['id'] == active['id'] else '○'} {row['name']} ({row['id']})"
+        lines = ["可用人格：", f"{'●' if active is None else '○'} 无人格（Pi 默认）(none)"] + [
+            f"{'●' if active is not None and row['id'] == active['id'] else '○'} {row['name']} ({row['id']})"
             for row in rows
         ]
-        lines.append("切换：/persona use <id>")
+        lines.append("切换：/persona use <id|none>")
         await reply_text(update, "\n".join(lines))
         return
     if sub != "use" or len(args) != 2:
-        await reply_text(update, "用法：/persona current | /persona list | /persona use <id>")
+        await reply_text(update, "用法：/persona current | /persona list | /persona use <id|none>")
         return
     agent = context.bot_data["manager"].get(user.id)
     async with agent.control_lock:
@@ -1100,7 +1112,8 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await reply_text(update, str(exc))
             return
         selected = storage.get_active_persona(user.id)
-        await reply_text(update, f"已切换人格：{selected['name']}。下一条消息起生效。")
+        name = selected["name"] if selected is not None else "无人格（Pi 默认）"
+        await reply_text(update, f"已切换人格：{name}。下一条消息起生效。")
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1133,7 +1146,8 @@ async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYP
     proc_state = "运行中" if (proc and proc.returncode is None) else "未运行"
     active = storage.get_active_session(user.id)
     active_name = active["name"] if active else "-"
-    persona_name = storage.get_active_persona(user.id)["name"]
+    active_persona = storage.get_active_persona(user.id)
+    persona_name = active_persona["name"] if active_persona is not None else "无人格（Pi 默认）"
     lines = [
         "📊 状态：",
         f"  环境: server（本机）",

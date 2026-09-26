@@ -511,8 +511,20 @@ def _personas_page(request: Request, csrf: str, user_id: int | None, error: str 
     storage, settings = _storage(request), _settings(request)
     picker = _user_picker(storage, settings, user_id, "personas")
     active = storage.get_active_persona(user_id) if user_id is not None else None
+    personas = storage.list_personas()
     cards = []
-    for row in storage.list_personas():
+    if user_id is not None:
+        none_selected = active is None
+        activate_none = (f'<form method="post" action="/admin/personas/none/use">'
+                         f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                         f'<input type="hidden" name="user_id" value="{user_id}">'
+                         f'<button class="text-button" type="submit">切换为当前人格</button></form>'
+                         if not none_selected else "")
+        cards.append(f'<article class="memory-card"><div class="card-meta">'
+                     f'<span class="badge">{"当前" if none_selected else "可用"}</span>'
+                     f'<span class="mono">none</span></div><h2>无人格 · Pi 默认</h2>'
+                     f'<div class="card-actions">{activate_none}</div></article>')
+    for row in personas:
         persona_id = row["id"]
         selected = bool(active and active["id"] == persona_id)
         badge = ("当前" if selected else "默认" if persona_id == "default" else
@@ -542,7 +554,7 @@ def _personas_page(request: Request, csrf: str, user_id: int | None, error: str 
                      f'{activate}{toggle}{delete}</div></article>')
     alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
     body = (f'<div class="page-heading"><div><p class="eyebrow">PERSONAS</p><h1>人格管理</h1></div>{picker}</div>'
-            f'{alert}<div class="toolbar"><span class="count">{len(cards)} 个</span>'
+            f'{alert}<div class="toolbar"><span class="count">{len(personas)} 个</span>'
             f'<a class="button primary" href="/admin/personas/new'
             f'{"?" + urlencode({"user_id": user_id}) if user_id is not None else ""}">创建人格</a></div>'
             f'<div class="card-list">{"".join(cards)}</div>')

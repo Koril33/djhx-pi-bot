@@ -249,7 +249,10 @@ class Storage:
         rows = self._query("SELECT * FROM personas WHERE id = ?", (persona_id,))
         return rows[0] if rows else None
 
-    def get_active_persona(self, user_id: int) -> sqlite3.Row:
+    def get_active_persona(self, user_id: int) -> sqlite3.Row | None:
+        selection = self._query("SELECT persona_id FROM user_persona_selection WHERE user_id = ?", (user_id,))
+        if selection and selection[0]["persona_id"] == "none":
+            return None
         rows = self._query(
             "SELECT p.* FROM user_persona_selection AS s JOIN personas AS p ON p.id = s.persona_id "
             "WHERE s.user_id = ? AND p.enabled = 1", (user_id,),
@@ -300,9 +303,10 @@ class Storage:
 
     def set_active_persona(self, user_id: int, persona_id: str) -> None:
         with self._lock, self._conn:
-            row = self._conn.execute("SELECT enabled FROM personas WHERE id = ?", (persona_id,)).fetchone()
-            if row is None or not row["enabled"]:
-                raise ValueError("人格不存在或已停用")
+            if persona_id != "none":
+                row = self._conn.execute("SELECT enabled FROM personas WHERE id = ?", (persona_id,)).fetchone()
+                if row is None or not row["enabled"]:
+                    raise ValueError("人格不存在或已停用")
             self._conn.execute(
                 "INSERT INTO user_persona_selection (user_id, persona_id, updated_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(user_id) DO UPDATE SET persona_id = excluded.persona_id, "

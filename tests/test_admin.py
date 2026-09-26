@@ -94,6 +94,11 @@ class AdminTests(unittest.TestCase):
         page = self.client.get("/admin/personas?user_id=7")
         csrf = self.csrf(page)
         self.assertIn("小丁的朋友", page.text)
+        self.assertIn("无人格 · Pi 默认", page.text)
+        self.assertEqual(self.client.post("/admin/personas/none/use", data={
+            "csrf": csrf, "user_id": "7",
+        }, follow_redirects=False).status_code, 303)
+        self.assertIsNone(self.storage.get_active_persona(7))
         values = {"csrf": csrf, "user_id": "7", "name": "理性朋友",
                   "identity": "你是一位理性的朋友。", "communication_style": "先给结论。"}
         preview = self.client.post("/admin/personas", data={**values, "action": "preview"})
