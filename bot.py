@@ -479,6 +479,7 @@ class AgentSession:
         self.settings = settings
         self.storage = storage
         self.prompt_pending = False
+        self.turn_started_at: float | None = None
         self.active_turn_id: int | None = None
         self.recovery_notice: str | None = None
         self.control_lock = asyncio.Lock()
@@ -1254,14 +1255,23 @@ async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYP
     active_name = active["name"] if active else "-"
     active_persona = storage.get_active_persona(user.id)
     persona_name = active_persona["name"] if active_persona is not None else "无人格（Pi 默认）"
+    started_at = getattr(agent, "turn_started_at", None)
+    busy = bool(agent.client.busy or getattr(agent, "prompt_pending", False) or started_at is not None)
+    elapsed = max(0, int(time.monotonic() - started_at)) if started_at is not None else None
+    provider = getattr(agent.client, "provider", None) or getattr(agent.settings, "pi_provider", None)
+    model_id = getattr(agent.client, "model", None) or getattr(agent.settings, "pi_model", None)
+    configured_model = "/".join(part for part in (provider, model_id) if part) or "未知"
+    model_detail = "下次启动使用" if proc_state == "未运行" else "未实时确认"
     lines = [
         "📊 状态：",
-        f"  环境: server（本机）",
+        "  环境: server（本机）",
         f"  pi 进程: {proc_state}",
-        f"  忙碌: {'是' if agent.client.busy else '否'}",
+        f"  忙碌: {'是' if busy else '否'}",
+        f"  当前任务耗时: {elapsed // 60} 分 {elapsed % 60} 秒" if elapsed is not None else "  当前任务耗时: -",
+        f"  排队: {storage.count_user_queue(user.id)} 条",
         f"  当前会话: {active_name}",
         f"  当前人格: {persona_name}",
-        f"  默认模型: {agent.settings.pi_model}",
+        f"  当前模型: {configured_model}（{model_detail}）",
     ]
     # 追加 pi 会话详情（消息数 / 压缩状态），拿不到不阻塞主状态展示
     try:
@@ -1269,6 +1279,12 @@ async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYP
             raise PiError("pi 进程未运行")
         await agent.ensure_client()
         state = await agent.client.get_state()
+        actual = state.get("model")
+        if isinstance(actual, dict):
+            actual_provider = actual.get("provider") or provider
+            actual_id = actual.get("id") or actual.get("modelId")
+            if actual_id:
+                lines[8] = f"  当前模型: {'/'.join(part for part in (actual_provider, actual_id) if part)}"
         mc = state.get("messageCount")
         if mc is not None:
             pending = state.get("pendingMessageCount") or 0
@@ -1787,6 +1803,7 @@ async def _process_text(
     keepalive = asyncio.create_task(typing_keepalive())
 
     try:
+        agent.turn_started_at = time.monotonic()
         # 与 /model、/session 共用锁，保证图片能力检查和下载期间模型、会话不切换。
         async with agent.control_lock:
             update_id = getattr(update, "update_id", None)
@@ -1950,6 +1967,7 @@ async def _process_text(
                 except Exception:
                     logger.exception("完成用量记录失败", extra={"user_id": user.id, "run_id": usage_run_id})
             agent.prompt_pending = False
+        agent.turn_started_at = None
         stop_typing.set()
         keepalive.cancel()
         try:
