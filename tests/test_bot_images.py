@@ -273,7 +273,7 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
     def test_photo_and_image_document_reach_image_handler(self):
         settings = SimpleNamespace(bot_token="123:ABC", allowed_ids={1})
         app = bot.build_application(settings, self.storage, self.manager)
-        handler = app.handlers[0][-2]
+        handler = app.handlers[0][-3]
         base = {
             "update_id": 1,
             "message": {
@@ -294,7 +294,7 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         app = bot.build_application(settings, self.storage, self.manager)
         self.message.chat = SimpleNamespace(type="private")
         self.update.callback_query = None
-        await app.handlers[0][-2].callback(self.update, self.context)
+        await app.handlers[0][-3].callback(self.update, self.context)
         self.message.reply_text.assert_awaited_once()
         self.manager.get.assert_not_called()
 

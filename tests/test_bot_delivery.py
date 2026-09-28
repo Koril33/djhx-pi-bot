@@ -48,7 +48,7 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
             callback_query=None,
         )
         context = SimpleNamespace()
-        await app.handlers[0][-1].callback(update, context)
+        await app.handlers[0][-2].callback(update, context)
         message.reply_text.assert_awaited_once()
         manager.get.assert_not_called()
 

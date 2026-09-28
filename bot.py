@@ -1876,6 +1876,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             agent.turn_tail = None
 
 
+async def on_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """给已授权用户的未支持消息类型明确反馈，避免静默丢失。"""
+    message = update.message
+    if message is None:
+        return
+    if message.voice or message.audio:
+        hint = "暂不支持语音或音频。请把内容转成文字后发送。"
+    elif message.video or message.video_note or message.animation:
+        hint = "暂不支持视频或动图。请发送一张关键画面，或用文字描述。"
+    elif message.sticker:
+        hint = "暂不支持贴纸。请发送文字或单张图片。"
+    else:
+        hint = "暂不支持这种消息类型。请发送文字或单张图片；输入 /help 查看用法。"
+    await reply_text(update, f"⚠️ {hint}")
+
+
 # ================= Application 组装 =================
 
 COMMAND_MENU = [
@@ -1969,5 +1985,6 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         lambda u, c: auth_guard(u, c, on_text),
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: auth_guard(u, c, on_text)))
+    app.add_handler(MessageHandler(filters.ALL, lambda u, c: auth_guard(u, c, on_unsupported)))
 
     return app
