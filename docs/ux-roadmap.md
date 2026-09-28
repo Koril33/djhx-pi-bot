@@ -26,7 +26,7 @@
 | UX-11 | /stop 可取消待启动任务并显示状态 | 已部署验证 | b6786b8：服务器 6 项队列测试通过；真实 webhook 排队消息被 /stop 取消、无会话回合，健康正常 |
 | UX-12 | /help 首屏精简，分类查看命令 | 已部署验证 | 04bd425：服务器 2 项测试通过；真实 /help 与 /help memory 更新 done，健康正常 |
 | UX-13 | 单环境时避免 /env use 的误导性“已切换” | 已部署验证 | 4649ca7：服务器 3 项帮助/环境测试通过；真实 /env use server 更新 done，健康正常 |
-| UX-14 | 模型列表显示当前项、提供商、能力与估算价格；选择无歧义 | 进行中 | 展示 RPC 元数据并使用完整 provider/model；待验证 |
+| UX-14 | 模型列表显示当前项、提供商、能力与估算价格；选择无歧义 | 已部署验证 | 79a115f：服务器 5 项测试通过；真实 /model list 与完整 ID 切换均 done，模型偏好与健康正常 |
 | UX-15 | 图片模型不兼容时便捷切换并提示重发 | 待做 | — |
 | UX-16 | Telegram 会话列表分页、搜索、重命名 | 待做 | — |
 | UX-17 | 默认会话自动命名过滤敏感内容 | 待做 | — |
@@ -74,6 +74,8 @@
 | 2026-09-29 | UX-12 完成 | 146 项测试通过；uv lock、py_compile、diff --check 通过 | 04bd425；服务器 2 项帮助测试通过；真实 /help 与 /help memory 更新 done，/healthz 正常 | 下一项 UX-13；UX-09 真实 SMTP 仍等待授权测试邮箱 |
 
 | 2026-09-29 | UX-13 完成 | 147 项测试通过（首次完整测试出现偶发失败，重跑通过）；uv lock、py_compile、diff --check 通过 | 4649ca7；服务器 3 项帮助/环境测试通过；真实 /env use server 更新 done，/healthz 正常 | 下一项 UX-14；UX-09 真实 SMTP 仍等待授权测试邮箱 |
+
+| 2026-09-29 | UX-14 完成 | 149 项测试通过；uv lock、py_compile、diff --check 通过 | 79a115f；服务器 5 项模型测试通过；RPC 元数据确有价格与能力；真实 /model list、/model use deepseek/deepseek-flash 更新 done，用户偏好保持，/healthz 正常 | 下一项 UX-15；UX-09 真实 SMTP 仍等待授权测试邮箱 |
 
 ## 恢复工作时先做
 
