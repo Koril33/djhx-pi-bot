@@ -13,6 +13,7 @@ import asyncio
 import base64
 import hashlib
 import json
+from sqlite3 import Row
 from pathlib import Path
 import re
 import sys
@@ -503,11 +504,16 @@ class AgentSession:
         }
         if memory_enabled:
             extra_env["DJHX_MEMORY_CONTEXT_FILE"] = str(memory.context_path(user_id))
+        selected_model = storage.get_user_model(user_id)
+        if isinstance(selected_model, (dict, Row)):
+            provider, model = selected_model["provider"], selected_model["model_id"]
+        else:
+            provider, model = settings.pi_provider, settings.pi_model
         self.client = PiRpcClient(
             pi_cmd=settings.pi_cmd,
             session_dir=settings.pi_session_dir,
-            provider=settings.pi_provider,
-            model=settings.pi_model,
+            provider=provider,
+            model=model,
             extra_args=extra_args,
             extra_env=extra_env,
         )
@@ -1078,8 +1084,20 @@ async def _cmd_model_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         try:
             await agent.ensure_client()
+            previous = (agent.client.provider, agent.client.model)
             await agent.client.set_model(args[1])
-            await reply_text(update, f"✅ 已切换模型: {args[1]}")
+            try:
+                context.bot_data["storage"].set_user_model(
+                    user.id, agent.client.provider, agent.client.model,
+                )
+            except Exception:
+                if all(previous):
+                    try:
+                        await agent.client.set_model(f"{previous[0]}/{previous[1]}")
+                    except Exception:
+                        logger.exception("模型持久化失败后回滚模型失败", extra={"user_id": user.id})
+                raise
+            await reply_text(update, f"✅ 已切换模型: {agent.client.provider}/{agent.client.model}（重启后保持）")
         except Exception as e:
             logger.error("切换模型失败", extra={"err": str(e)[:300]})
             await reply_text(update, f"切换模型失败: {e}")

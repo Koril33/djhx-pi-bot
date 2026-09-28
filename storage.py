@@ -148,6 +148,12 @@ CREATE TABLE IF NOT EXISTS user_persona_selection (
     persona_id TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS user_model_selection (
+    user_id    INTEGER PRIMARY KEY,
+    provider   TEXT NOT NULL,
+    model_id   TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS telegram_updates (
     update_id      INTEGER PRIMARY KEY,
@@ -338,6 +344,23 @@ class Storage:
         self._exec(
             "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
             (user_id, username),
+        )
+
+    def get_user_model(self, user_id: int) -> sqlite3.Row | None:
+        rows = self._query(
+            "SELECT provider, model_id FROM user_model_selection WHERE user_id = ?",
+            (user_id,),
+        )
+        return rows[0] if rows else None
+
+    def set_user_model(self, user_id: int, provider: str, model_id: str) -> None:
+        if not provider or not model_id:
+            raise ValueError("模型 provider 和 id 不能为空")
+        self._exec(
+            "INSERT INTO user_model_selection (user_id, provider, model_id, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+            "provider = excluded.provider, model_id = excluded.model_id, updated_at = excluded.updated_at",
+            (user_id, provider, model_id, time.time()),
         )
 
     # ---------- sessions ----------

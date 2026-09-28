@@ -38,7 +38,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 | `/help` | 帮助 |
 | `/env list` / `/env use <name>` | 环境（V1 仅 server） |
 | `/session new [name]` / `list` / `use <id>` | 会话管理 |
-| `/model list` / `/model use <id>` | 模型切换 |
+| `/model list` / `/model use <id>` | 模型切换；用户选择在服务重启后保持 |
 | `/persona current` / `list` / `use <id\|none>` | 查看和切换聊天人格；`none` 使用 Pi 默认提示词 |
 | `/stop` | 中止当前任务 |
 | `/steer <内容>` | 明确将指令插入正在运行的任务；图片可在 caption 中使用 |
