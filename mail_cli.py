@@ -1,11 +1,11 @@
-"""Pi 邮件工具的窄接口：stdin JSON，仅含收件人、主题、正文。"""
+"""Pi 邮件工具的窄接口：只保存待确认草稿，不直接连接 SMTP。"""
 
 import json
 import os
 from pathlib import Path
 import sys
 
-from mail_service import MailSendError, send_email
+from mail_service import MailSendError, validate_email_request
 from storage import Storage
 
 
@@ -20,21 +20,26 @@ def main() -> int:
         request = json.loads(raw)
         if not isinstance(request, dict) or set(request) != {"to", "subject", "body"}:
             raise ValueError("邮件参数无效")
+        user_id = int(os.environ["DJHX_MAIL_USER_ID"])
+        if user_id <= 0:
+            raise ValueError("邮件用户无效")
+        recipient, subject, body = validate_email_request(
+            request["to"], request["subject"], request["body"],
+        )
         storage = Storage(str(db_path))
         try:
-            config = storage.get_smtp_settings()
+            if storage.get_smtp_settings() is None:
+                raise MailSendError("请先在管理后台配置 SMTP")
+            draft_id = storage.create_mail_draft(user_id, recipient, subject, body)
         finally:
             storage._conn.close()
-        if config is None:
-            raise MailSendError("请先在管理后台配置 SMTP")
-        send_email(config, request["to"], request["subject"], request["body"])
-        result = {"ok": True, "message": "邮件已提交给 SMTP 服务器", "to": request["to"]}
+        result = {"ok": True, "message": "邮件草稿已创建，请在 Telegram 预览后确认发送", "draft_id": draft_id}
         code = 0
     except (KeyError, TypeError, ValueError, MailSendError, json.JSONDecodeError) as exc:
         result = {"ok": False, "message": str(exc)}
         code = 1
     except Exception:
-        result = {"ok": False, "message": "发送失败，请检查服务日志"}
+        result = {"ok": False, "message": "创建草稿失败，请检查服务日志"}
         code = 1
     print(json.dumps(result, ensure_ascii=False))
     return code

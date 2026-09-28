@@ -128,6 +128,20 @@ CREATE TABLE IF NOT EXISTS smtp_settings (
     from_address TEXT NOT NULL,
     updated_at   REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS mail_drafts (
+    id           TEXT PRIMARY KEY,
+    user_id      INTEGER NOT NULL,
+    recipient    TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    body         TEXT NOT NULL,
+    state        TEXT NOT NULL DEFAULT 'pending',
+    created_at   REAL NOT NULL,
+    previewed_at REAL,
+    confirmed_at REAL,
+    finished_at  REAL
+);
+CREATE INDEX IF NOT EXISTS idx_mail_drafts_user_state
+    ON mail_drafts(user_id, state, created_at);
 
 CREATE TABLE IF NOT EXISTS personas (
     id                  TEXT PRIMARY KEY,
@@ -345,6 +359,64 @@ class Storage:
             "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
             (user_id, username),
         )
+
+    # ---------- model-created mail drafts ----------
+    def create_mail_draft(self, user_id: int, recipient: str, subject: str, body: str) -> str:
+        draft_id = uuid.uuid4().hex[:12]
+        self._exec(
+            "INSERT INTO mail_drafts (id, user_id, recipient, subject, body, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (draft_id, user_id, recipient, subject, body, time.time()),
+        )
+        return draft_id
+
+    def list_pending_mail_drafts(self, user_id: int, *, unpreviewed_only: bool = False) -> list[sqlite3.Row]:
+        condition = " AND previewed_at IS NULL" if unpreviewed_only else ""
+        return self._query(
+            "SELECT id, recipient, subject, body, created_at FROM mail_drafts "
+            "WHERE user_id = ? AND state = 'pending' AND created_at > ?"
+            + condition + " ORDER BY created_at LIMIT 10",
+            (user_id, time.time() - 86400),
+        )
+
+    def get_mail_draft(self, user_id: int, draft_id: str) -> sqlite3.Row | None:
+        rows = self._query(
+            "SELECT * FROM mail_drafts WHERE user_id = ? AND id = ?",
+            (user_id, draft_id),
+        )
+        return rows[0] if rows else None
+
+    def mark_mail_previewed(self, user_id: int, draft_id: str) -> None:
+        self._exec(
+            "UPDATE mail_drafts SET previewed_at = ? "
+            "WHERE user_id = ? AND id = ? AND state = 'pending'",
+            (time.time(), user_id, draft_id),
+        )
+
+    def claim_mail_draft(self, user_id: int, draft_id: str) -> bool:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE mail_drafts SET state = 'sending', confirmed_at = ? "
+                "WHERE user_id = ? AND id = ? AND state = 'pending' AND created_at > ?",
+                (time.time(), user_id, draft_id, time.time() - 86400),
+            )
+            return cursor.rowcount == 1
+
+    def finish_mail_draft(self, user_id: int, draft_id: str, *, sent: bool) -> None:
+        self._exec(
+            "UPDATE mail_drafts SET state = ?, finished_at = ? "
+            "WHERE user_id = ? AND id = ? AND state = 'sending'",
+            ("sent" if sent else "failed", time.time(), user_id, draft_id),
+        )
+
+    def cancel_mail_draft(self, user_id: int, draft_id: str) -> bool:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE mail_drafts SET state = 'cancelled', finished_at = ? "
+                "WHERE user_id = ? AND id = ? AND state = 'pending'",
+                (time.time(), user_id, draft_id),
+            )
+            return cursor.rowcount == 1
 
     def get_user_model(self, user_id: int) -> sqlite3.Row | None:
         rows = self._query(

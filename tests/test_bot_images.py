@@ -167,6 +167,7 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         self.storage.pending_interruption_notice_count.return_value = 0
         self.storage.begin_update.return_value = True
         self.storage.count_user_queue.return_value = 1
+        self.storage.list_pending_mail_drafts.return_value = []
         self.calls = []
 
         async def prompt(text, **kwargs):
@@ -242,6 +243,23 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         instruction = self.client.steer.await_args.args[0]
         self.assertIn("safe test content", instruction)
         self.assertIn("请参考附件", instruction)
+
+    async def test_prompt_completion_delivers_pending_mail_preview(self):
+        draft = {
+            "id": "abcdef012345", "recipient": "owner@example.com",
+            "subject": "测试", "body": "确认前不得发送",
+        }
+        self.storage.list_pending_mail_drafts.return_value = [draft]
+
+        async def consume(_update, stream, *_args, **_kwargs):
+            _ = [part async for part in stream]
+
+        with patch.object(bot, "stream_reply", side_effect=consume):
+            await bot.on_text(self.update, self.context)
+        preview = "".join(call.args[0] for call in self.message.reply_text.await_args_list)
+        self.assertIn("收件人：owner@example.com", preview)
+        self.assertIn("确认前不得发送", preview)
+        self.storage.mark_mail_previewed.assert_called_once_with(1, "abcdef012345")
 
     async def test_photo_caption_is_sent_with_image_to_prompt(self):
         replies = []

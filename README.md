@@ -43,6 +43,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 | `/stop` | 中止当前任务 |
 | `/steer <内容>` | 明确将指令插入正在运行的任务；图片可在 caption 中使用 |
 | `/queue` / `/queue clear` | 查看或取消尚未开始的排队消息；普通消息依次成为新回合 |
+| `/mail` | 预览、确认或取消 pi 创建的邮件草稿；24 小时有效 |
 | `/status` | 实际模型、任务耗时、排队与运行状态 |
 | `/memory list [页码]` / `add` / `edit` / `delete` / `pin` / `unpin` | 长期记忆管理 |
 | `/summary show` / `/summary clear` | 当前会话摘要 |
@@ -61,7 +62,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 - 会话 JSONL 没有迁移时，bot 会为原会话 ID 新建 pi 会话，并从 SQLite 摘要和近期文字回合恢复主要背景。无法恢复旧图片、工具输出或逐字历史；没有摘要时会明确提示为空白历史。
 - `MEMORY_*` 环境变量控制自动提取周期、原始回合保留数量、单条记忆长度和注入字节预算；维护模型不提供可覆盖项，见 [.env.example](.env.example)。完整设计及限制见 [产品设计文档](docs/memory-product.md)。
 - 单管理员后台位于 `/admin`，可查看运行概览、管理会话与记忆、查看用量费用、调整记忆预算。账号密码由 `.env` 的 `ADMIN_USERNAME`、`ADMIN_PASSWORD` 配置；后台保存的参数持久化到同一个 SQLite，并优先于相应的环境变量。见 [后台产品设计](docs/admin-product.md) 与 [开发运维文档](docs/admin-development.md)。
-- 后台“邮件设置”可配置 SMTP 服务器、465 SSL/TLS 或 587 STARTTLS、用户名、授权码及发件邮箱。配置保存在同一个 SQLite；授权码不会回显到页面或出现在发信工具的参数与结果中。保存后可在后台发送测试邮件。聊天中明确提出“给某邮箱发邮件”时，Pi 可调用 `send_email` 工具发送纯文本邮件；工具只接收收件人、主题和正文。SMTP 接受表示已提交给服务器，不保证最终入箱。数据库备份包含 SMTP 授权码，应按凭据保护。
+- 后台“邮件设置”可配置 SMTP 服务器、465 SSL/TLS 或 587 STARTTLS、用户名、授权码及发件邮箱。配置保存在同一个 SQLite；授权码不会回显到页面或出现在发信工具的参数与结果中。保存后可在后台发送测试邮件。聊天中明确提出“给某邮箱发邮件”时，Pi 的 `send_email` 工具只创建纯文本草稿；Bot 随后完整预览收件人、主题、正文，用户点击确认或使用 `/mail confirm <草稿 ID>` 后才连接 SMTP。可用 `/mail cancel <草稿 ID>` 取消；草稿 24 小时有效，发送状态不确定时不会自动重发。SMTP 接受表示已提交给服务器，不保证最终入箱。数据库备份包含 SMTP 授权码，应按凭据保护。
 - 使用 `uv run python -m scripts.backup_db backup.db` 可生成一致的单文件 SQLite 备份。迁移记忆时拷贝这个数据库；新服务器仍需另行配置 bot 和模型凭证。
 
 ## 用量和费用

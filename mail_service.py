@@ -41,7 +41,7 @@ def smtp_settings(host: str, port: int | str, username: str,
             "password": password, "from_address": email_address(from_address)}
 
 
-def send_email(config, to: str, subject: str, body: str) -> None:
+def validate_email_request(to: str, subject: str, body: str) -> tuple[str, str, str]:
     recipient = email_address(to)
     if not isinstance(subject, str) or not 1 <= len(subject.strip()) <= 200 or any(
         char in "\r\n\x00" for char in subject
@@ -49,6 +49,11 @@ def send_email(config, to: str, subject: str, body: str) -> None:
         raise ValueError("邮件主题须为 1–200 个字符，不能包含换行")
     if not isinstance(body, str) or not 1 <= len(body) <= 20000 or "\x00" in body:
         raise ValueError("邮件正文须为 1–20000 个字符")
+    return recipient, subject.strip(), body
+
+
+def send_email(config, to: str, subject: str, body: str) -> None:
+    recipient, subject, body = validate_email_request(to, subject, body)
 
     message = EmailMessage()
     message["From"] = email_address(config["from_address"])

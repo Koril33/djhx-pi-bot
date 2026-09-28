@@ -41,6 +41,7 @@ from costs import PricingCatalog, format_usd
 from memory import MemoryService, looks_secret, safe_turn_text
 from persona import persona_prompt_path, render_persona, write_prompt
 from logging_conf import get_logger
+from mail_service import send_email
 from pi_bridge import PiBusyError, PiError, PiRpcClient
 from storage import Storage
 
@@ -485,6 +486,7 @@ class AgentSession:
         extra_args += ["--extension", str(project_dir / "pi_extensions" / "mail-tool.ts")]
         extra_env = {
             "DJHX_MAIL_DB_PATH": str(Path(storage.db_path).resolve()),
+            "DJHX_MAIL_USER_ID": str(user_id),
             "DJHX_MAIL_PYTHON": sys.executable,
             "DJHX_MAIL_WORKDIR": str(project_dir),
         }
@@ -865,6 +867,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/stop — 中止当前任务\n"
         "/steer <内容> — 插入当前任务\n"
         "/queue [clear] — 查看或取消排队消息\n"
+        "/mail — 查看与确认待发邮件\n"
         "/status — 查看运行状态\n"
         "/help — 帮助"
     )
@@ -1229,6 +1232,101 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _mail_buttons(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ 确认发送", callback_data=f"mail_confirm:{draft_id}"),
+        InlineKeyboardButton("❌ 取消", callback_data=f"mail_cancel:{draft_id}"),
+    ]])
+
+
+async def _mail_preview(update: Update, storage: Storage, draft) -> None:
+    """以纯文本完整预览；确认按钮只放在最后一段。"""
+    text = (
+        f"📧 待确认邮件（24 小时内有效）\n"
+        f"草稿 ID：{draft['id']}\n"
+        f"收件人：{draft['recipient']}\n"
+        f"主题：{draft['subject']}\n"
+        f"正文：\n{draft['body']}\n"
+        "—— 预览结束 ——"
+    )
+    target = update.callback_query.message if update.callback_query is not None else update.message
+    send_fn = target.reply_text if target is not None else update.effective_chat.send_message
+    chunks = [text[offset:offset + 3500] for offset in range(0, len(text), 3500)]
+    for index, chunk in enumerate(chunks):
+        markup = _mail_buttons(draft["id"]) if index == len(chunks) - 1 else None
+        for attempt in range(3):
+            try:
+                await send_fn(chunk, parse_mode=None, reply_markup=markup)
+                break
+            except RetryAfter as exc:
+                if attempt == 2:
+                    raise
+                delay = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
+                await asyncio.sleep(max(0.5, delay))
+            except _TG_NET_EXC:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.5 * (attempt + 1))
+    storage.mark_mail_previewed(update.effective_user.id, draft["id"])
+
+
+async def _show_unpreviewed_mail_drafts(update: Update, storage: Storage, user_id: int) -> None:
+    for draft in storage.list_pending_mail_drafts(user_id, unpreviewed_only=True):
+        await _mail_preview(update, storage, draft)
+
+
+async def cmd_mail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """查看待确认草稿；只有用户确认后才执行 SMTP。"""
+    storage = context.bot_data["storage"]
+    user_id = update.effective_user.id
+    args = context.args or []
+    action = args[0] if args else "list"
+    if action == "list" and len(args) <= 1:
+        drafts = storage.list_pending_mail_drafts(user_id)
+        if not drafts:
+            await reply_text(update, "当前没有待确认邮件")
+            return
+        for draft in drafts:
+            await _mail_preview(update, storage, draft)
+        return
+    if action not in {"confirm", "cancel"} or len(args) != 2 or not re.fullmatch(r"[0-9a-f]{12}", args[1]):
+        await reply_text(update, "用法：/mail [list|confirm <草稿 ID>|cancel <草稿 ID>]")
+        return
+    draft_id = args[1]
+    draft = storage.get_mail_draft(user_id, draft_id)
+    if draft is None or draft["state"] != "pending":
+        await reply_text(update, "草稿不存在或已处理；使用 /mail 查看待确认邮件")
+        return
+    if action == "cancel":
+        cancelled = storage.cancel_mail_draft(user_id, draft_id)
+        await reply_text(update, "已取消邮件草稿" if cancelled else "草稿已处理，未重复取消")
+        return
+    if draft["previewed_at"] is None:
+        await _mail_preview(update, storage, draft)
+        await reply_text(update, "请先完整阅读预览，再点击确认发送")
+        return
+    config = storage.get_smtp_settings()
+    if config is None:
+        await reply_text(update, "SMTP 尚未配置，草稿仍待确认")
+        return
+    await reply_text(update, "📤 正在发送已确认的邮件…")
+    if not storage.claim_mail_draft(user_id, draft_id):
+        await reply_text(update, "草稿已处理或超过 24 小时，未重复发送")
+        return
+    try:
+        await asyncio.to_thread(
+            send_email, config, draft["recipient"], draft["subject"], draft["body"],
+        )
+    except Exception as exc:
+        storage.finish_mail_draft(user_id, draft_id, sent=False)
+        logger.warning("邮件发送未确认", extra={"user_id": user_id, "draft_id": draft_id,
+                                             "err_type": type(exc).__name__})
+        await reply_text(update, "⚠️ 发送状态未确认。为避免重复发送，请先检查收件箱，再重新创建草稿。")
+        return
+    storage.finish_mail_draft(user_id, draft_id, sent=True)
+    await reply_text(update, f"✅ 邮件已提交给 SMTP 服务器：{draft['recipient']}")
+
+
 async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     manager = context.bot_data["manager"]
@@ -1528,6 +1626,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data.startswith("model_use:"):
         context.args = ["use", data.split(":", 1)[1]]
         await cmd_model(update, context)
+        return
+    if data.startswith("mail_confirm:"):
+        context.args = ["confirm", data.split(":", 1)[1]]
+        await cmd_mail(update, context)
+        return
+    if data.startswith("mail_cancel:"):
+        context.args = ["cancel", data.split(":", 1)[1]]
+        await cmd_mail(update, context)
         return
     entry = actions.get(data)
     if entry is None:
@@ -1951,6 +2057,10 @@ async def _process_text(
                                 logger.exception("发送用量摘要失败", extra={"user_id": user.id})
                 except Exception:
                     logger.exception("完成用量记录失败", extra={"user_id": user.id, "run_id": usage_run_id})
+            try:
+                await _show_unpreviewed_mail_drafts(update, storage, user.id)
+            except Exception:
+                logger.exception("邮件草稿预览发送失败", extra={"user_id": user.id})
             agent.prompt_pending = False
         agent.turn_started_at = None
         stop_typing.set()
@@ -2094,6 +2204,7 @@ COMMAND_MENU = [
     ("stop", "中止任务"),
     ("steer", "插入当前任务"),
     ("queue", "查看或取消排队"),
+    ("mail", "邮件草稿与确认"),
 ]
 
 
@@ -2150,6 +2261,7 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         CommandHandler("stop", cmd_stop),
         CommandHandler("steer", cmd_steer),
         CommandHandler("queue", cmd_queue),
+        CommandHandler("mail", cmd_mail),
         CommandHandler("status", cmd_status),
         CommandHandler("cost", cmd_cost),
         CommandHandler("memory", cmd_memory),
