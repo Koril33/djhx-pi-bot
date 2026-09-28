@@ -45,6 +45,32 @@ class ImageDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot._image_dimensions(b"GIF89a\x20\x00\x10\x00" + b"\x00" * 3, "image/gif"), (32, 16))
         self.assertEqual(bot._image_dimensions(webp, "image/webp"), (32, 16))
 
+    async def test_text_document_size_and_encoding_are_checked(self):
+        document = media_with_data(b"hello", file_size=bot.MAX_TEXT_FILE_BYTES + 1)
+        document.file_name = "large.log"
+        document.mime_type = "text/plain"
+        with self.assertRaisesRegex(ValueError, "64 KiB"):
+            await bot._download_text_document(document)
+        document.get_file.assert_not_awaited()
+
+        document = media_with_data(b"\xff\xfe")
+        document.file_name = "invalid.txt"
+        document.mime_type = "text/plain"
+        with self.assertRaisesRegex(ValueError, "UTF-8"):
+            await bot._download_text_document(document)
+
+        document = media_with_data(b"hello\x00world")
+        document.file_name = "binary.txt"
+        document.mime_type = "text/plain"
+        with self.assertRaisesRegex(ValueError, "二进制"):
+            await bot._download_text_document(document)
+
+        document = media_with_data(b"%PDF-1.7 test")
+        document.file_name = "renamed.txt"
+        document.mime_type = "text/plain"
+        with self.assertRaisesRegex(ValueError, "二进制"):
+            await bot._download_text_document(document)
+
     async def test_photo_uses_largest_size_and_real_mime(self):
         small = media_with_data(b"bad")
         large = media_with_data(PNG)
@@ -169,6 +195,53 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
             "storage": self.storage,
             "manager": self.manager,
         })
+
+    async def test_text_document_reaches_prompt_without_image_requirement(self):
+        data = "print('你好')\n".encode()
+        self.media = media_with_data(data)
+        self.media.file_name = "example.py"
+        self.media.mime_type = "text/x-python"
+        self.message.photo = []
+        self.message.document = self.media
+        self.message.caption = "解释这段代码"
+
+        async def consume(_update, stream, *_args, **_kwargs):
+            _ = [part async for part in stream]
+
+        with patch.object(bot, "stream_reply", side_effect=consume):
+            await bot.on_text(self.update, self.context)
+        prompt, kwargs = self.calls[0]
+        self.assertIn("解释这段代码", prompt)
+        self.assertIn("example.py", prompt)
+        self.assertIn("print('你好')", prompt)
+        self.assertIsNone(kwargs["images"])
+        self.client.get_state.assert_not_awaited()
+
+    async def test_unsupported_document_is_explained_before_download(self):
+        self.media.file_name = "report.pdf"
+        self.media.mime_type = "application/pdf"
+        self.message.photo = []
+        self.message.document = self.media
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.on_text(self.update, self.context)
+        self.assertIn("PDF", reply.await_args.args[1])
+        self.media.get_file.assert_not_awaited()
+        self.agent.ensure_client.assert_not_awaited()
+        self.assertEqual(self.calls, [])
+
+    async def test_text_document_caption_can_steer(self):
+        self.media = media_with_data(b"safe test content")
+        self.media.file_name = "notes.txt"
+        self.media.mime_type = "text/plain"
+        self.message.photo = []
+        self.message.document = self.media
+        self.message.caption = "/steer 请参考附件"
+        self.client.busy = True
+        with patch.object(bot, "reply_text", new_callable=AsyncMock):
+            await bot.on_text(self.update, self.context)
+        instruction = self.client.steer.await_args.args[0]
+        self.assertIn("safe test content", instruction)
+        self.assertIn("请参考附件", instruction)
 
     async def test_photo_caption_is_sent_with_image_to_prompt(self):
         replies = []

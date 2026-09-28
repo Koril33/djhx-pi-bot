@@ -48,6 +48,15 @@ logger = get_logger("bot")
 MAX_HTML_LEN = 3900  # Telegram 消息上限 4096，转义/标签会膨胀，留余量
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 8192  # DeepSeek 单张图片的长/宽上限
+MAX_TEXT_FILE_BYTES = 64 * 1024
+MAX_TEXT_FILE_CHARS = 30_000
+TEXT_FILE_SUFFIXES = frozenset({
+    ".txt", ".md", ".log", ".py", ".js", ".jsx", ".ts", ".tsx", ".json",
+    ".yaml", ".yml", ".toml", ".csv", ".sh", ".html", ".css", ".sql",
+    ".xml", ".ini", ".cfg", ".go", ".rs", ".java", ".c", ".h", ".cpp",
+    ".hpp", ".rb", ".php", ".ps1", ".bat", ".kt", ".swift",
+})
+IMAGE_FILE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
 
 
 class _ImageTooLarge(ValueError):
@@ -841,8 +850,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🤖 djhx-pi-bot — 通过 Telegram 控制 pi 编码代理\n\n"
-        "直接发文字或单张图片即可与 pi 对话；图片可附说明文字。\n"
-        "图片支持 JPEG、PNG、GIF、WebP，最大 10 MiB；当前模型须支持图片输入。\n\n"
+        "直接发文字、单张图片或文本附件即可与 pi 对话；可附说明文字。\n"
+        "图片支持 JPEG、PNG、GIF、WebP，最大 10 MiB；当前模型须支持图片输入。\n"
+        "文本、代码、日志附件须为 UTF-8，最多 64 KiB / 30000 字符。\n\n"
         "命令：\n"
         "/env list — 查看可用环境\n"
         "/env use <name> — 切换环境（V1 仅 server）\n"
@@ -1162,9 +1172,16 @@ async def cmd_steer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await reply_text(update, "当前没有正在运行的任务；直接发送消息即可开始下一轮")
             return
         images = None
-        if message and (message.photo or message.document):
+        if message and (message.photo or _is_image_document(message.document)):
             try:
                 images = await _prepare_images(agent.client, message, user_id=user.id)
+            except ValueError as exc:
+                await reply_text(update, f"⚠️ {exc}")
+                return
+        elif message and message.document:
+            try:
+                content = await _download_text_document(message.document, user_id=user.id)
+                instruction = _with_text_document(instruction, message.document, content)
             except ValueError as exc:
                 await reply_text(update, f"⚠️ {exc}")
                 return
@@ -1558,6 +1575,70 @@ def _image_dimensions(data: bytes | bytearray, mime_type: str) -> tuple[int, int
     return None
 
 
+def _is_image_document(document) -> bool:
+    if document is None:
+        return False
+    mime_type = (document.mime_type or "").lower()
+    filename = (document.file_name or "").lower()
+    return mime_type.startswith("image/") or Path(filename).suffix in IMAGE_FILE_SUFFIXES
+
+
+def _is_text_document(document) -> bool:
+    return document is not None and Path((document.file_name or "").lower()).suffix in TEXT_FILE_SUFFIXES
+
+
+def _safe_document_name(document) -> str:
+    raw = (document.file_name or "attachment.txt").replace("\\", "/").rsplit("/", 1)[-1]
+    return re.sub(r"[^\w .()+-]", "_", raw)[:80] or "attachment.txt"
+
+
+def _with_text_document(instruction: str, document, content: str) -> str:
+    request = instruction.strip() or "请阅读并分析这个文本附件。"
+    return f"{request}\n\n[文本附件：{_safe_document_name(document)}]\n{content}\n[附件结束]"
+
+
+async def _download_text_document(document, *, user_id: int | None = None) -> str:
+    """仅接收小型 UTF-8 文本文件；在提交模型前验证大小与内容。"""
+    if not _is_text_document(document):
+        raise ValueError("仅支持常见文本、代码或日志文件；不支持 PDF、Office 或二进制附件")
+    if document.file_size is not None and document.file_size > MAX_TEXT_FILE_BYTES:
+        raise ValueError("文本附件超过 64 KiB 限制，请拆分后重发")
+    for attempt in range(3):
+        try:
+            file = await document.get_file()
+            if file.file_size is not None and file.file_size > MAX_TEXT_FILE_BYTES:
+                raise _ImageTooLarge("文本附件超过 64 KiB 限制，请拆分后重发")
+            data = await file.download_as_bytearray(read_timeout=60, connect_timeout=20)
+            break
+        except _ImageTooLarge:
+            raise
+        except (*_TG_NET_EXC, RetryAfter) as exc:
+            if attempt == 2:
+                logger.warning("Telegram 文本附件下载重试耗尽", extra={"user_id": user_id, "err_type": type(exc).__name__})
+                raise ValueError("文本附件下载失败，请稍后重发") from None
+            if isinstance(exc, RetryAfter):
+                delay = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
+                await asyncio.sleep(max(0.5, delay))
+            else:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        except Exception as exc:
+            logger.warning("Telegram 文本附件下载失败", extra={"user_id": user_id, "err_type": type(exc).__name__})
+            raise ValueError("文本附件下载失败，请稍后重发") from None
+    if not data or len(data) > MAX_TEXT_FILE_BYTES:
+        raise ValueError("文本附件为空或超过 64 KiB 限制，请重发")
+    if bytes(data).startswith((b"%PDF-", b"PK"+bytes((3, 4)), bytes((31, 139)), b"GIF8", bytes((137, 80, 78, 71)), bytes((255, 216, 255)))):
+        raise ValueError("附件实际内容是二进制格式，请发送 UTF-8 纯文本")
+    try:
+        content = bytes(data).decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise ValueError("文本附件必须使用 UTF-8 编码，请转换后重发") from None
+    if len(content) > MAX_TEXT_FILE_CHARS:
+        raise ValueError("文本附件超过 30000 字符限制，请拆分后重发")
+    if any(ord(char) < 32 and char not in "\t\n\r" for char in content):
+        raise ValueError("附件包含二进制或控制字符，请发送 UTF-8 纯文本")
+    return content
+
+
 async def _download_image(message, *, user_id: int | None = None) -> dict[str, str]:
     """下载一张 Telegram 图片，验证字节数及文件头后组装 pi RPC 请求。"""
     media = message.photo[-1] if message.photo else message.document
@@ -1619,10 +1700,18 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     storage = context.bot_data["storage"]
     manager = context.bot_data["manager"]
     message = update.message
-    has_image = bool(message.photo or message.document)
+    has_image = bool(message.photo or _is_image_document(message.document))
+    has_text_document = bool(message.document and not has_image)
     text = message.text or message.caption or ""
     if has_image and not text.strip():
         text = "请分析这张图片。"
+    if has_text_document:
+        if not _is_text_document(message.document):
+            await reply_text(update, "⚠️ 仅支持常见文本、代码或日志文件（UTF-8，最多 64 KiB）；PDF、Office 与二进制附件暂不支持。")
+            return
+        if not text.strip():
+            text = "请阅读并分析这个文本附件。"
+    naming_text = text if not has_text_document else (message.caption or "分析文本附件")
     chat = update.effective_chat
     owns_prompt = False
     usage_run_id: str | None = None
@@ -1691,15 +1780,18 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             # 图片下载可能耗时，先完成校验，再依据最新的 busy 状态选择 steer 或 prompt。
             # 否则当前回合可能在下载期间结束，图片被提交到空闲 steer 队列。
             images = None
-            if has_image:
-                try:
+            try:
+                if has_image:
                     images = await _prepare_images(agent.client, message, user_id=user.id)
-                except ValueError as exc:
-                    await reply_text(update, f"⚠️ {exc}")
-                    return
+                elif has_text_document:
+                    content = await _download_text_document(message.document, user_id=user.id)
+                    text = _with_text_document(text, message.document, content)
+            except ValueError as exc:
+                await reply_text(update, f"⚠️ {exc}")
+                return
 
-            # 会话自动命名：默认会话的第一条消息作为会话名
-            await _auto_name_session(storage, user.id, text)
+            # 附件正文不用于会话名，避免长代码或日志出现在列表。
+            await _auto_name_session(storage, user.id, naming_text)
 
             # 普通消息按到达顺序独立处理；插入当前任务只由 /steer 执行。
             if agent.client.busy or agent.prompt_pending:
