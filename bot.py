@@ -372,25 +372,10 @@ _TOOL_ICONS = {
 
 
 def _tool_activity(tool_name: str, phase: str, args: dict | None) -> str | None:
-    """工具执行事件 → 友好活动描述；phase == "end" 返回 None（表示活动结束）。"""
+    """只展示固定工具类别；路径、命令、查询及自定义工具名均不进入聊天。"""
     if phase == "end":
         return None
-    args = args or {}
-    target = ""
-    for key in ("path", "file", "filePath", "command", "pattern", "query"):
-        v = args.get(key)
-        if isinstance(v, str) and v.strip():
-            target = v.strip()
-            break
-    if not target:
-        for v in args.values():
-            if isinstance(v, str) and v.strip():
-                target = v.strip()
-                break
-    label = _TOOL_ICONS.get(tool_name, f"🔧 {tool_name or '工具'}")
-    if target:
-        return f"{label}: {target[:60]}"
-    return label
+    return _TOOL_ICONS.get(tool_name, "🔧 正在调用工具")
 
 
 def _friendly_error(e: Exception) -> str:

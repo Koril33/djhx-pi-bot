@@ -205,20 +205,8 @@ class PiRpcClient:
                 routed = {"type": "message_update", "assistantMessageEvent":
                           {"type": "error", "error": str(update.get("error") or update.get("reason") or "")[:500]}}
         elif etype == "tool_execution_start":
-            args = event.get("args") or {}
-            short_args = {}
-            if isinstance(args, dict):
-                for key in ("path", "file", "filePath", "command", "pattern", "query"):
-                    value = args.get(key)
-                    if isinstance(value, str) and value.strip():
-                        short_args[key] = value[:160]
-                        break
-                if not short_args:
-                    for key, value in args.items():
-                        if isinstance(value, str) and value.strip():
-                            short_args[str(key)[:40]] = value[:160]
-                            break
-            routed = {"type": etype, "toolName": str(event.get("toolName") or "")[:80], "args": short_args}
+            # 工具参数可能包含命令、文件路径和凭据；界面只需要工具类别。
+            routed = {"type": etype, "toolName": str(event.get("toolName") or "")[:80]}
         elif etype == "tool_execution_end":
             routed = {"type": etype, "toolName": str(event.get("toolName") or "")[:80]}
         elif etype == "message_end":
