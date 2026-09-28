@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import bot
 from storage import Storage
+from pi_bridge import PiError, PiRpcClient
 
 
 class ModelPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -18,6 +19,38 @@ class ModelPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.storage._conn.close()
         self.temp.cleanup()
+
+    async def test_catalog_shows_current_capabilities_prices_and_full_ids(self):
+        models = [
+            {"provider": "one", "id": "shared", "name": "Alpha", "input": ["text", "image"],
+             "reasoning": True, "cost": {"input": 0.3, "output": 1.2}},
+            {"provider": "two", "id": "shared", "name": "Beta", "input": ["text"],
+             "cost": {"input": 1.0, "output": 2.0}},
+        ]
+        text, markup = bot.model_catalog_view(models, "two", "shared")
+        self.assertIn("○ Alpha", text)
+        self.assertIn("● Beta", text)
+        self.assertIn("图片", text)
+        self.assertIn("推理", text)
+        self.assertIn("$0.3", text)
+        self.assertIn("one/shared", text)
+        self.assertIn("two/shared", text)
+        self.assertNotIn(chr(92) + "n", text)
+        self.assertEqual(
+            [row[0].callback_data for row in markup.inline_keyboard],
+            ["model_use:one/shared", "model_use:two/shared"],
+        )
+
+    async def test_bare_model_id_rejects_ambiguous_provider(self):
+        client = PiRpcClient("pi", self.temp.name, provider="one")
+        client.get_available_models = AsyncMock(return_value=[
+            {"provider": "one", "id": "shared"},
+            {"provider": "two", "id": "shared"},
+        ])
+        client._command = AsyncMock()
+        with self.assertRaisesRegex(PiError, "多个提供商"):
+            await client.set_model("shared")
+        client._command.assert_not_awaited()
 
     async def test_saved_user_model_is_used_after_storage_reopen(self):
         self.storage.set_user_model(7, "other", "model-id")

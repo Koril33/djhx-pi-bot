@@ -1104,6 +1104,44 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _cmd_session_unlocked(update, context)
 
 
+def model_catalog_view(
+    models: list[dict], current_provider: str | None, current_model: str | None,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    lines = ["🧠 可用模型", "单价为 pi 元数据中的参考值（USD/百万 token）；实际费用可能随时段、缓存等变化。"]
+    buttons = []
+    shown = 0
+    for item in models:
+        provider, model_id = item.get("provider"), item.get("id")
+        if not isinstance(provider, str) or not isinstance(model_id, str) or not provider or not model_id:
+            continue
+        full_id = f"{provider}/{model_id}"
+        marker = "●" if (provider, model_id) == (current_provider, current_model) else "○"
+        name = str(item.get("name") or model_id)[:80]
+        inputs = item.get("input") or []
+        abilities = ["文本"]
+        if "image" in inputs:
+            abilities.append("图片")
+        if item.get("reasoning"):
+            abilities.append("推理")
+        lines.append(f"{marker} {name}\n  {full_id} · {' / '.join(abilities)}")
+        cost = item.get("cost") or {}
+        if isinstance(cost, dict) and all(isinstance(cost.get(key), (int, float)) for key in ("input", "output")):
+            lines.append(
+                f"  参考价：输入 {format_usd(str(cost['input']))}，输出 {format_usd(str(cost['output']))}"
+            )
+        else:
+            lines.append("  参考价：未知")
+        callback = f"model_use:{full_id}"
+        if len(callback.encode("utf-8")) <= 64:
+            buttons.append([InlineKeyboardButton(f"{marker} {full_id}"[:60], callback_data=callback)])
+        shown += 1
+    if not shown:
+        lines.append("暂无可用模型")
+    else:
+        lines.append("选择按钮，或发送 /model use <provider/model_id>。")
+    return "\n".join(lines), InlineKeyboardMarkup(buttons) if buttons else None
+
+
 async def _cmd_model_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     manager = context.bot_data["manager"]
@@ -1119,11 +1157,8 @@ async def _cmd_model_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await agent.ensure_client()
             models = await agent.client.get_available_models()
-            buttons = []
-            for m in models:
-                images = "🖼 " if "image" in (m.get("input") or []) else ""
-                buttons.append([InlineKeyboardButton(f"{images}{m['id']}", callback_data=f"model_use:{m['id']}")])
-            await reply_text(update, "🧠 可用模型（点击切换）：", reply_markup=InlineKeyboardMarkup(buttons))
+            text, buttons = model_catalog_view(models, agent.client.provider, agent.client.model)
+            await reply_text(update, text, reply_markup=buttons)
         except Exception as e:
             logger.error("模型列表失败", extra={"err": str(e)[:300]})
             await reply_text(update, f"获取模型列表失败: {e}")

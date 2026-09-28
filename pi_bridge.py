@@ -525,11 +525,13 @@ class PiRpcClient:
         provider, separator, bare_id = model_id.partition("/")
         if not separator:
             bare_id, provider = provider, None
-            for model in await self.get_available_models():
-                if model.get("id") == bare_id:
-                    provider = model.get("provider")
-                    break
-            provider = provider or self.provider
+            matches = {
+                model.get("provider") for model in await self.get_available_models()
+                if model.get("id") == bare_id and model.get("provider")
+            }
+            if len(matches) > 1:
+                raise PiError(f"模型 {bare_id} 属于多个提供商，请使用 provider/model_id")
+            provider = next(iter(matches)) if matches else self.provider
         if not provider or not bare_id:
             raise PiError(f"无法确定模型的 provider: {model_id}")
         data = await self._command("set_model", provider=provider, modelId=bare_id)
