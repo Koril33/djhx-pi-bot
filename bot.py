@@ -945,7 +945,7 @@ async def cmd_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await reply_text(update, "用法：/env use <name>")
             return
         if args[1] == "server":
-            await reply_text(update, "已切换到环境 server（当前唯一环境）")
+            await reply_text(update, "当前只有 server 环境，且已经在此环境；无需切换。")
         else:
             await reply_text(update, f"未知环境：{args[1]}")
         return

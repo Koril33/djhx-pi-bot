@@ -21,6 +21,15 @@ class HelpTests(unittest.IsolatedAsyncioTestCase):
             callbacks,
         )
 
+    async def test_single_environment_does_not_claim_a_switch(self):
+        update = SimpleNamespace()
+        context = SimpleNamespace(args=["use", "server"])
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_env(update, context)
+        content = reply.await_args.args[1]
+        self.assertIn("已经在此环境", content)
+        self.assertNotIn("已切换", content)
+
     async def test_help_category_and_callback_route(self):
         query = SimpleNamespace(data="help:memory", answer=AsyncMock())
         update = SimpleNamespace(callback_query=query)
