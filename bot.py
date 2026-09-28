@@ -615,6 +615,29 @@ async def reply_text(update: Update, text: str, reply_markup=None) -> None:
             await _send(update.effective_chat.send_message, chunk, reply_markup=markup)
 
 
+def failure_notice_text(notice) -> str:
+    session_name = (notice["session_name"] or "当前会话")[:50]
+    return (
+        f"⚠️ 一条消息未能确认处理完成（会话：{session_name}）。"
+        "部分操作可能已经执行；请先核对结果。Bot 不会自动重发这条消息。"
+    )
+
+
+async def notify_failed_updates(update: Update, storage: Storage, user_id: int) -> None:
+    notices = storage.get_pending_failure_notices(user_id)
+    if not notices:
+        return
+    session_names = sorted({(row["session_name"] or "当前会话")[:50] for row in notices})
+    names = "、".join(session_names[:3])
+    await reply_text(
+        update,
+        f"⚠️ 之前有 {len(notices)} 条消息未能确认处理完成（会话：{names}）。"
+        "部分操作可能已经执行；请先核对结果。Bot 不会自动重发。",
+    )
+    for notice in notices:
+        storage.mark_failure_notice_sent(notice["update_id"])
+
+
 async def notify_interrupted_turns(update: Update, storage: Storage, user_id: int) -> None:
     """下一条普通消息到来时告知上次中断；发送成功后才清除通知。"""
     count = storage.pending_interruption_notice_count(user_id)
@@ -1910,6 +1933,16 @@ async def _process_text(
                 logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
                 await reply_text(update, f"⚠️ pi 进程启动失败: {_friendly_error(e)}")
                 return
+            active_session = storage.get_active_session(user.id)
+            if active_session is not None:
+                ids = [item.update_id for item in album_updates] if album_updates else [update_id]
+                for item_id in ids:
+                    if isinstance(item_id, int):
+                        storage.set_update_session(item_id, active_session["id"])
+            try:
+                await notify_failed_updates(update, storage, user.id)
+            except Exception:
+                logger.warning("历史失败更新通知暂未送达", extra={"user_id": user.id})
             await notify_interrupted_turns(update, storage, user.id)
             if getattr(agent, "recovery_notice", None):
                 await reply_text(update, agent.recovery_notice)

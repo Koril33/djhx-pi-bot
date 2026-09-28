@@ -175,7 +175,10 @@ CREATE TABLE IF NOT EXISTS telegram_updates (
     state          TEXT NOT NULL DEFAULT 'pending',
     priority       INTEGER NOT NULL DEFAULT 0,
     user_id        INTEGER,
+    session_id     TEXT,
     queueable      INTEGER NOT NULL DEFAULT 0,
+    failure_notice_pending INTEGER NOT NULL DEFAULT 0,
+    failure_notice_sent_at REAL,
     safe_to_retry  INTEGER NOT NULL DEFAULT 0,
     attempts       INTEGER NOT NULL DEFAULT 0,
     received_at    REAL NOT NULL,
@@ -223,6 +226,14 @@ class Storage:
                 self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN user_id INTEGER")
             if "queueable" not in update_columns:
                 self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN queueable INTEGER NOT NULL DEFAULT 0")
+            if "session_id" not in update_columns:
+                self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN session_id TEXT")
+            if "failure_notice_pending" not in update_columns:
+                self._conn.execute(
+                    "ALTER TABLE telegram_updates ADD COLUMN failure_notice_pending INTEGER NOT NULL DEFAULT 0"
+                )
+            if "failure_notice_sent_at" not in update_columns:
+                self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN failure_notice_sent_at REAL")
             default = validate_persona(DEFAULT_PERSONA)
             self._conn.execute(
                 "INSERT OR IGNORE INTO personas (id, name, identity, personality, communication_style, "
@@ -753,7 +764,8 @@ class Storage:
     # 更新先持久化再 ACK；重启后未处理记录仍可重放。
     def enqueue_update(
         self, update_id: int, payload: str, *, capacity: int = 1000, priority: int = 0,
-        user_id: int | None = None, queueable: bool = False,
+        user_id: int | None = None, session_id: str | None = None,
+        queueable: bool = False,
     ) -> bool:
         """返回 False 表示 update_id 已接收；队列满时抛 UpdateQueueFull。"""
         with self._lock, self._conn:
@@ -767,9 +779,9 @@ class Storage:
             if pending >= capacity:
                 raise UpdateQueueFull(f"Telegram 更新队列已满 ({pending})")
             self._conn.execute(
-                "INSERT INTO telegram_updates (update_id, payload, priority, user_id, queueable, received_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (update_id, payload, priority, user_id, int(queueable), time.time()),
+                "INSERT INTO telegram_updates (update_id, payload, priority, user_id, session_id, queueable, received_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (update_id, payload, priority, user_id, session_id, int(queueable), time.time()),
             )
             return True
 
@@ -815,6 +827,37 @@ class Storage:
             )
             return True
 
+    def set_update_session(self, update_id: int, session_id: str) -> None:
+        self._exec(
+            "UPDATE telegram_updates SET session_id = ? WHERE update_id = ? AND state = 'processing'",
+            (session_id, update_id),
+        )
+
+    def get_failure_notice(self, update_id: int) -> sqlite3.Row | None:
+        rows = self._query(
+            "SELECT u.update_id, u.user_id, u.session_id, s.name AS session_name "
+            "FROM telegram_updates AS u LEFT JOIN sessions AS s ON s.id = u.session_id "
+            "WHERE u.update_id = ? AND u.failure_notice_pending = 1",
+            (update_id,),
+        )
+        return rows[0] if rows else None
+
+    def get_pending_failure_notices(self, user_id: int) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT u.update_id, u.user_id, u.session_id, s.name AS session_name "
+            "FROM telegram_updates AS u LEFT JOIN sessions AS s ON s.id = u.session_id "
+            "WHERE u.user_id = ? AND u.failure_notice_pending = 1 "
+            "AND u.state IN ('failed', 'acknowledged') ORDER BY u.received_at LIMIT 10",
+            (user_id,),
+        )
+
+    def mark_failure_notice_sent(self, update_id: int) -> None:
+        self._exec(
+            "UPDATE telegram_updates SET failure_notice_pending = 0, failure_notice_sent_at = ? "
+            "WHERE update_id = ? AND failure_notice_pending = 1",
+            (time.time(), update_id),
+        )
+
     def count_user_queue(self, user_id: int) -> int:
         """尚未开始的普通消息数量，含待分发和已分发但仍在等待的更新。"""
         rows = self._query(
@@ -844,6 +887,7 @@ class Storage:
             )
             cur = self._conn.execute(
                 "UPDATE telegram_updates SET state = 'failed', payload = NULL, processed_at = ?, "
+                "failure_notice_pending = CASE WHEN user_id IS NOT NULL THEN 1 ELSE 0 END, "
                 "last_error = '服务重启时更新执行状态不确定；未自动重放' "
                 "WHERE state = 'processing'",
                 (time.time(),),
@@ -884,6 +928,7 @@ class Storage:
                 raise ValueError(f"更新不存在: {update_id}")
             self._conn.execute(
                 "UPDATE telegram_updates SET state = 'failed', payload = NULL, attempts = ?, "
+                "failure_notice_pending = CASE WHEN user_id IS NOT NULL THEN 1 ELSE 0 END, "
                 "last_error = ?, processed_at = ? WHERE update_id = ?",
                 (
                     row["attempts"] + 1,

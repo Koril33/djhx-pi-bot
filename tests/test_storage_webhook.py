@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from telegram import Bot, Update
@@ -117,6 +117,22 @@ class StorageSessionTests(unittest.TestCase):
         self.assertEqual([row["safe_to_retry"] for row in rows], [0, 0])
         self.storage.complete_update(10)
         self.assertFalse(self.storage.begin_album_updates([10, 11]))
+
+    def test_failed_update_keeps_user_session_and_pending_safe_notice(self):
+        session_id = self.storage.create_session(7, "项目会话")
+        self.storage.set_active(session_id)
+        self.storage.enqueue_update(
+            99, '{"update_id":99}', user_id=7, session_id=session_id,
+        )
+        self.storage.claim_updates(1)
+        self.storage.fail_update(99, "RuntimeError: internal-secret")
+        notice = self.storage.get_failure_notice(99)
+        self.assertEqual(notice["user_id"], 7)
+        self.assertEqual(notice["session_id"], session_id)
+        self.assertEqual(notice["session_name"], "项目会话")
+        self.assertEqual(len(self.storage.get_pending_failure_notices(7)), 1)
+        self.storage.mark_failure_notice_sent(99)
+        self.assertEqual(self.storage.get_pending_failure_notices(7), [])
 
     def test_acknowledge_keeps_dedup_record_without_health_failure(self):
         self.storage.enqueue_update(1, '{"update_id":1}')
@@ -309,6 +325,62 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NetworkError", rows[0]["last_error"])
         self.assertEqual(self.processed, [2])
         self.assertEqual(self.update_errors, {})
+
+    async def test_failed_update_notifies_authorized_user_without_internal_error(self):
+        session_id = self.storage.create_session(1, "工作会话")
+        self.storage.set_active(session_id)
+        self.storage.enqueue_update(
+            91, '{"update_id":91}', user_id=1, session_id=session_id,
+        )
+        self.tg_app.bot = SimpleNamespace(send_message=AsyncMock())
+
+        async def fail(_update):
+            raise RuntimeError("internal-secret")
+
+        self.tg_app.process_update = fail
+        stopping = asyncio.Event()
+        worker = asyncio.create_task(
+            bot_app.process_queued_updates(
+                self.storage, self.tg_app, asyncio.Event(), stopping, self.update_errors,
+            )
+        )
+        try:
+            for _ in range(30):
+                if self.storage.update_stats()["pending"] == 0:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            stopping.set()
+            await asyncio.wait_for(worker, timeout=2)
+        call = self.tg_app.bot.send_message.await_args
+        self.assertEqual(call.kwargs["chat_id"], 1)
+        self.assertIn("工作会话", call.kwargs["text"])
+        self.assertNotIn("internal-secret", call.kwargs["text"])
+        self.assertEqual(self.storage.get_pending_failure_notices(1), [])
+
+    async def test_failed_update_keeps_notice_when_telegram_send_fails(self):
+        self.storage.enqueue_update(92, '{"update_id":92}', user_id=1)
+        self.tg_app.bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("network")))
+
+        async def fail(_update):
+            raise RuntimeError("internal-secret")
+
+        self.tg_app.process_update = fail
+        stopping = asyncio.Event()
+        worker = asyncio.create_task(
+            bot_app.process_queued_updates(
+                self.storage, self.tg_app, asyncio.Event(), stopping, self.update_errors,
+            )
+        )
+        try:
+            for _ in range(30):
+                if self.storage.update_stats()["pending"] == 0:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            stopping.set()
+            await asyncio.wait_for(worker, timeout=2)
+        self.assertEqual(len(self.storage.get_pending_failure_notices(1)), 1)
 
     async def test_plain_text_keeps_order_and_explicit_steer_has_control_capacity(self):
         data = {

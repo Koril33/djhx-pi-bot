@@ -168,6 +168,7 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         self.storage.begin_update.return_value = True
         self.storage.count_user_queue.return_value = 1
         self.storage.list_pending_mail_drafts.return_value = []
+        self.storage.get_pending_failure_notices.return_value = []
         self.calls = []
 
         async def prompt(text, **kwargs):

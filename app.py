@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request, Response, status
 from telegram import Update
 
 from admin import apply_runtime_settings, router as admin_router
-from bot import AgentManager, build_application, register_command_menu
+from bot import AgentManager, build_application, failure_notice_text, register_command_menu
 from config import get_settings
 from logging_conf import get_logger, setup_logging
 from storage import Storage, UpdateQueueFull
@@ -78,6 +78,18 @@ async def process_queued_updates(
                 "Telegram 更新处理失败",
                 extra={"update_id": update_id, "attempt": row["attempts"] + 1},
             )
+            notice = storage.get_failure_notice(update_id)
+            if notice is not None and notice["user_id"] in settings.allowed_ids:
+                try:
+                    await tg_app.bot.send_message(
+                        chat_id=notice["user_id"], text=failure_notice_text(notice),
+                    )
+                    storage.mark_failure_notice_sent(update_id)
+                except Exception as notify_exc:
+                    logger.warning(
+                        "失败更新通知暂未送达",
+                        extra={"update_id": update_id, "err_type": type(notify_exc).__name__},
+                    )
         else:
             storage.complete_update(update_id)
 
@@ -285,12 +297,15 @@ async def webhook(secret: str, request: Request) -> Response:
             and (message_text or message.photo or message.document)
             and not message_text.lstrip().startswith("/")
         )
+        user_id = update.effective_user.id if update.effective_user is not None else None
+        active_session = request.app.state.storage.get_active_session(user_id) if user_id is not None else None
         inserted = request.app.state.storage.enqueue_update(
             update.update_id,
             body.decode("utf-8"),
             capacity=settings.webhook_queue_capacity,
             priority=_update_priority(update, getattr(request.app.state, "manager", None)),
-            user_id=update.effective_user.id if update.effective_user is not None else None,
+            user_id=user_id,
+            session_id=active_session["id"] if active_session is not None else None,
             queueable=is_plain_message,
         )
     except UpdateQueueFull:
