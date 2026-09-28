@@ -99,6 +99,31 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(asyncio.gather(*tasks), 1)
         self.assertEqual(processed, [1, 2, 3])
 
+    async def test_steer_waits_for_prompt_start(self):
+        client = SimpleNamespace(busy=False, steer=AsyncMock())
+        agent = SimpleNamespace(
+            client=client, control_lock=asyncio.Lock(), prompt_pending=True,
+            active_turn_id=None,
+        )
+        manager = Mock()
+        manager.get.return_value = agent
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=7),
+            message=SimpleNamespace(photo=None, document=None),
+        )
+        context = SimpleNamespace(
+            args=["调整方向"],
+            bot_data={"manager": manager, "storage": Mock()},
+        )
+
+        async def start_prompt(_seconds):
+            client.busy = True
+
+        with patch.object(bot.asyncio, "sleep", side_effect=start_prompt):
+            with patch.object(bot, "reply_text", new_callable=AsyncMock):
+                await bot.cmd_steer(update, context)
+        client.steer.assert_awaited_once_with("调整方向", images=None)
+
     async def test_queue_clear_only_requests_cancellation_of_unstarted_messages(self):
         storage = Mock()
         storage.cancel_user_queue.return_value = 2

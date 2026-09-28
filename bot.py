@@ -1153,6 +1153,11 @@ async def cmd_steer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_text(update, "用法：/steer <要插入当前任务的指令>")
         return
     async with agent.control_lock:
+        if agent.prompt_pending and not agent.client.busy:
+            for _ in range(100):
+                if agent.client.busy or not agent.prompt_pending:
+                    break
+                await asyncio.sleep(0.05)
         if not agent.client.busy:
             await reply_text(update, "当前没有正在运行的任务；直接发送消息即可开始下一轮")
             return
