@@ -154,6 +154,9 @@ CREATE TABLE IF NOT EXISTS telegram_updates (
     payload        TEXT,
     state          TEXT NOT NULL DEFAULT 'pending',
     priority       INTEGER NOT NULL DEFAULT 0,
+    user_id        INTEGER,
+    queueable      INTEGER NOT NULL DEFAULT 0,
+    safe_to_retry  INTEGER NOT NULL DEFAULT 0,
     attempts       INTEGER NOT NULL DEFAULT 0,
     received_at    REAL NOT NULL,
     processed_at   REAL,
@@ -194,6 +197,12 @@ class Storage:
             update_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(telegram_updates)")}
             if "acknowledged_at" not in update_columns:
                 self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN acknowledged_at REAL")
+            if "safe_to_retry" not in update_columns:
+                self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN safe_to_retry INTEGER NOT NULL DEFAULT 0")
+            if "user_id" not in update_columns:
+                self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN user_id INTEGER")
+            if "queueable" not in update_columns:
+                self._conn.execute("ALTER TABLE telegram_updates ADD COLUMN queueable INTEGER NOT NULL DEFAULT 0")
             default = validate_persona(DEFAULT_PERSONA)
             self._conn.execute(
                 "INSERT OR IGNORE INTO personas (id, name, identity, personality, communication_style, "
@@ -648,7 +657,8 @@ class Storage:
     # ---------- Telegram webhook inbox ----------
     # 更新先持久化再 ACK；重启后未处理记录仍可重放。
     def enqueue_update(
-        self, update_id: int, payload: str, *, capacity: int = 1000, priority: int = 0
+        self, update_id: int, payload: str, *, capacity: int = 1000, priority: int = 0,
+        user_id: int | None = None, queueable: bool = False,
     ) -> bool:
         """返回 False 表示 update_id 已接收；队列满时抛 UpdateQueueFull。"""
         with self._lock, self._conn:
@@ -662,8 +672,9 @@ class Storage:
             if pending >= capacity:
                 raise UpdateQueueFull(f"Telegram 更新队列已满 ({pending})")
             self._conn.execute(
-                "INSERT INTO telegram_updates (update_id, payload, priority, received_at) VALUES (?, ?, ?, ?)",
-                (update_id, payload, priority, time.time()),
+                "INSERT INTO telegram_updates (update_id, payload, priority, user_id, queueable, received_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (update_id, payload, priority, user_id, int(queueable), time.time()),
             )
             return True
 
@@ -675,9 +686,49 @@ class Storage:
         )
         return rows[0] if rows else None
 
+    def begin_update(self, update_id: int) -> bool:
+        """准备执行用户消息；取消后的消息不得开始。无 inbox 行供单元调用。"""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT state FROM telegram_updates WHERE update_id = ?", (update_id,)
+            ).fetchone()
+            if row is None:
+                return True
+            if row["state"] != "processing":
+                return False
+            self._conn.execute(
+                "UPDATE telegram_updates SET safe_to_retry = 0 WHERE update_id = ?",
+                (update_id,),
+            )
+            return True
+
+    def count_user_queue(self, user_id: int) -> int:
+        """尚未开始的普通消息数量，含待分发和已分发但仍在等待的更新。"""
+        rows = self._query(
+            "SELECT count(*) AS n FROM telegram_updates WHERE user_id = ? AND queueable = 1 "
+            "AND (state = 'pending' OR (state = 'processing' AND safe_to_retry = 1))",
+            (user_id,),
+        )
+        return rows[0]["n"]
+
+    def cancel_user_queue(self, user_id: int) -> int:
+        """取消本用户尚未开始的普通消息；保留去重 ID。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE telegram_updates SET state = 'done', payload = NULL, "
+                "safe_to_retry = 0, processed_at = ? WHERE user_id = ? AND queueable = 1 "
+                "AND (state = 'pending' OR (state = 'processing' AND safe_to_retry = 1))",
+                (time.time(), user_id),
+            )
+            return cur.rowcount
+
     def fail_interrupted_updates(self) -> int:
         """进程中断后的执行结果不确定，不能自动重放可能有副作用的指令。"""
         with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE telegram_updates SET state = 'pending', safe_to_retry = 0 "
+                "WHERE state = 'processing' AND safe_to_retry = 1"
+            )
             cur = self._conn.execute(
                 "UPDATE telegram_updates SET state = 'failed', payload = NULL, processed_at = ?, "
                 "last_error = '服务重启时更新执行状态不确定；未自动重放' "
@@ -697,7 +748,8 @@ class Storage:
                 (priority, limit),
             ).fetchall()
             self._conn.executemany(
-                "UPDATE telegram_updates SET state = 'processing' WHERE update_id = ?",
+                "UPDATE telegram_updates SET state = 'processing', safe_to_retry = queueable "
+                "WHERE update_id = ?",
                 ((row["update_id"],) for row in rows),
             )
             return rows

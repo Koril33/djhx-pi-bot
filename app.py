@@ -54,7 +54,7 @@ async def process_queued_updates(
     stopping: asyncio.Event,
     update_errors: dict[int, Exception],
 ) -> None:
-    """有界并发分发；为 steer 和 /stop 保留处理容量。"""
+    """有界并发分发；普通消息按 update_id 排队，为控制命令保留容量。"""
 
     async def process_one(row) -> None:
         update_id = row["update_id"]
@@ -127,21 +127,17 @@ async def process_queued_updates(
 
 
 def _update_priority(update: Update, manager: AgentManager | None) -> int:
-    """/stop 独占保留槽；忙碌会话里的新文本或图片使用 steer 保留槽。"""
+    """/stop 独占保留槽；/steer 和 /queue 使用控制槽。"""
     message = update.message
-    text = (message.text or "") if message is not None else ""
-    has_image = bool(message and (message.photo or message.document))
+    text = (message.text or message.caption or "") if message is not None else ""
     callback = update.callback_query
-    if text.strip() and text.split(maxsplit=1)[0].split("@", 1)[0] == "/stop":
+    command = text.split(maxsplit=1)[0].split("@", 1)[0] if text.strip() else ""
+    if command == "/stop" or (callback is not None and callback.data == "cmd:stop"):
         return 2
-    if callback is not None and callback.data == "cmd:stop":
-        return 2
-    user = update.effective_user
-    if (text or has_image) and user is not None and manager is not None:
-        agent = manager._agents.get(user.id)
-        if agent is not None and (agent.client.busy or getattr(agent, "prompt_pending", False)):
-            return 1
+    if command in {"/steer", "/queue"}:
+        return 1
     return 0
+
 
 
 def _spawn_deploy(*, catch_up: bool = False) -> subprocess.Popen:
@@ -282,11 +278,20 @@ async def webhook(secret: str, request: Request) -> Response:
         logger.warning("Telegram 更新格式无效", extra={"err_type": type(exc).__name__})
         return Response(status_code=status.HTTP_400_BAD_REQUEST)
     try:
+        message = update.message
+        message_text = (message.text or message.caption or "") if message is not None else ""
+        is_plain_message = bool(
+            message is not None
+            and (message_text or message.photo or message.document)
+            and not message_text.lstrip().startswith("/")
+        )
         inserted = request.app.state.storage.enqueue_update(
             update.update_id,
             body.decode("utf-8"),
             capacity=settings.webhook_queue_capacity,
             priority=_update_priority(update, getattr(request.app.state, "manager", None)),
+            user_id=update.effective_user.id if update.effective_user is not None else None,
+            queueable=is_plain_message,
         )
     except UpdateQueueFull:
         logger.error("Telegram 更新队列已满", extra={"update_id": update.update_id})

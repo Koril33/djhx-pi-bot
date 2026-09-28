@@ -134,11 +134,13 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         self.chat = SimpleNamespace(id=1, send_chat_action=AsyncMock())
         self.update = SimpleNamespace(
             effective_user=SimpleNamespace(id=1, username="tester"),
-            effective_chat=self.chat, message=self.message,
+            effective_chat=self.chat, message=self.message, callback_query=None,
         )
         self.storage = Mock()
         self.storage.get_active_session.return_value = {"id": "s1", "name": "已命名"}
         self.storage.pending_interruption_notice_count.return_value = 0
+        self.storage.begin_update.return_value = True
+        self.storage.count_user_queue.return_value = 1
         self.calls = []
 
         async def prompt(text, **kwargs):
@@ -153,10 +155,12 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         )
         self.agent = SimpleNamespace(
             client=self.client, ensure_client=AsyncMock(), prompt_pending=False,
-            control_lock=asyncio.Lock(), storage=self.storage,
+            control_lock=asyncio.Lock(), turn_tail=None,
+            active_turn_id=None, storage=self.storage,
         )
         self.manager = Mock()
         self.manager.get.return_value = self.agent
+        self.manager.memory = None
         self.context = SimpleNamespace(bot_data={
             "settings": SimpleNamespace(
                 stream_edit_interval=0.1, stream_initial_delay=0,
@@ -204,15 +208,16 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("无法确认", reply.await_args.args[1])
         self.media.get_file.assert_not_awaited()
 
-    async def test_busy_photo_steers_with_image(self):
+    async def test_explicit_steer_photo_uses_image(self):
         self.client.busy = True
+        self.message.caption = "/steer 图片里是什么颜色？"
         with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
             await bot.on_text(self.update, self.context)
         self.client.steer.assert_awaited_once()
         args, kwargs = self.client.steer.await_args
         self.assertEqual(args, ("图片里是什么颜色？",))
         self.assertEqual(kwargs["images"][0]["mimeType"], "image/png")
-        self.assertIn("已收到", reply.await_args.args[1])
+        self.assertIn("已插入当前任务", reply.await_args.args[1])
 
     async def test_busy_turn_finishing_during_download_uses_new_prompt(self):
         self.client.busy = True

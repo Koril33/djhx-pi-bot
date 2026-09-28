@@ -39,6 +39,8 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 | `/model list` / `/model use <id>` | 模型切换 |
 | `/persona current` / `list` / `use <id\|none>` | 查看和切换聊天人格；`none` 使用 Pi 默认提示词 |
 | `/stop` | 中止当前任务 |
+| `/steer <内容>` | 明确将指令插入正在运行的任务；图片可在 caption 中使用 |
+| `/queue` / `/queue clear` | 查看或取消尚未开始的排队消息；普通消息依次成为新回合 |
 | `/status` | 运行状态 |
 | `/memory list [页码]` / `add` / `edit` / `delete` / `pin` / `unpin` | 长期记忆管理 |
 | `/summary show` / `/summary clear` | 当前会话摘要 |

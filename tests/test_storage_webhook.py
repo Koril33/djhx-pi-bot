@@ -88,6 +88,22 @@ class StorageSessionTests(unittest.TestCase):
         self.assertIsNone(self.storage.next_update())
         self.assertEqual(self.storage.update_stats()["failed"], 1)
 
+    def test_waiting_messages_survive_restart_and_can_be_cancelled(self):
+        for update_id, user_id in ((1, 7), (2, 7), (3, 8), (4, 7)):
+            self.storage.enqueue_update(
+                update_id, f'{{"update_id":{update_id}}}',
+                user_id=user_id, queueable=True,
+            )
+        self.storage.claim_updates(3)
+        self.assertTrue(self.storage.begin_update(1))  # 已开始，不能取消或重放
+        self.assertEqual(self.storage.count_user_queue(7), 2)
+        self.assertEqual(self.storage.cancel_user_queue(7), 2)  # 等待中的 2 和待分发的 4
+        self.assertFalse(self.storage.begin_update(2))
+        self.assertEqual(self.storage.fail_interrupted_updates(), 1)
+        self.assertEqual(self.storage.next_update()["update_id"], 3)  # 仍未开始，安全重放
+        self.assertEqual(self.storage.update_stats()["failed"], 1)
+        self.assertEqual(self.storage.count_user_queue(7), 0)
+
     def test_acknowledge_keeps_dedup_record_without_health_failure(self):
         self.storage.enqueue_update(1, '{"update_id":1}')
         self.storage.claim_updates(1)
@@ -280,7 +296,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.processed, [2])
         self.assertEqual(self.update_errors, {})
 
-    async def test_busy_user_text_uses_reserved_steer_capacity(self):
+    async def test_plain_text_keeps_order_and_explicit_steer_has_control_capacity(self):
         data = {
             "update_id": 7,
             "message": {
@@ -295,11 +311,13 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         manager = SimpleNamespace(
             _agents={1: SimpleNamespace(client=SimpleNamespace(busy=True), prompt_pending=False)}
         )
-        self.assertEqual(bot_app._update_priority(update, manager), 1)
+        self.assertEqual(bot_app._update_priority(update, manager), 0)
+        data["message"]["text"] = "/steer 调整当前任务"
+        self.assertEqual(bot_app._update_priority(Update.de_json(data, self.tg_app.bot), manager), 1)
         data["message"]["text"] = "/stop"
         self.assertEqual(bot_app._update_priority(Update.de_json(data, self.tg_app.bot), manager), 2)
 
-    async def test_busy_user_photo_uses_reserved_steer_capacity(self):
+    async def test_plain_photo_keeps_order_and_caption_steer_has_control_capacity(self):
         data = {
             "update_id": 8,
             "message": {
@@ -315,7 +333,9 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         manager = SimpleNamespace(
             _agents={1: SimpleNamespace(client=SimpleNamespace(busy=True), prompt_pending=False)}
         )
-        self.assertEqual(bot_app._update_priority(update, manager), 1)
+        self.assertEqual(bot_app._update_priority(update, manager), 0)
+        data["message"]["caption"] = "/steer 看看这张图片"
+        self.assertEqual(bot_app._update_priority(Update.de_json(data, self.tg_app.bot), manager), 1)
 
 
 if __name__ == "__main__":

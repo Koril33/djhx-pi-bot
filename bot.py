@@ -469,6 +469,7 @@ class AgentSession:
         self.active_turn_id: int | None = None
         self.recovery_notice: str | None = None
         self.control_lock = asyncio.Lock()
+        self.turn_tail: asyncio.Future[None] | None = None
         self.memory = memory
         memory_enabled = getattr(settings, "memory_enabled", False) and memory is not None
         if memory_enabled:
@@ -856,6 +857,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/memory — 查看和管理长期记忆\n"
         "/summary — 查看或清空当前会话摘要\n"
         "/stop — 中止当前任务\n"
+        "/steer <内容> — 插入当前任务\n"
+        "/queue [clear] — 查看或取消排队消息\n"
         "/status — 查看运行状态\n"
         "/help — 帮助"
     )
@@ -883,6 +886,8 @@ async def create_user_session(agent: AgentSession, storage: Storage, user_id: in
     """供 Telegram 和后台共用的建会话流程；失败时恢复旧 Pi 会话。"""
     if agent.client.busy or agent.prompt_pending:
         raise PiBusyError("当前任务仍在运行")
+    if storage.count_user_queue(user_id):
+        raise PiBusyError("仍有排队消息，请先等待或用 /queue clear 取消")
     await agent.ensure_client()
     previous = storage.get_active_session(user_id)
     previous_file = previous["pi_session_file"] if previous else None
@@ -972,8 +977,8 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
     args = context.args
     sub = args[0] if args else ""
 
-    if sub in {"new", "use"} and (agent.client.busy or agent.prompt_pending):
-        await reply_text(update, "⏳ 当前任务仍在运行，请完成或 /stop 后再切换会话")
+    if sub in {"new", "use"} and (agent.client.busy or agent.prompt_pending or storage.count_user_queue(user.id)):
+        await reply_text(update, "⏳ 仍有运行或排队的消息；请等待完成，或用 /stop 和 /queue clear 后再切换会话")
         return
 
     if sub == "new":
@@ -1036,8 +1041,8 @@ async def _cmd_model_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE
     args = context.args
     sub = args[0] if args else ""
 
-    if sub == "use" and (agent.client.busy or agent.prompt_pending):
-        await reply_text(update, "⏳ 当前任务仍在运行，请完成或 /stop 后再切换模型")
+    if sub == "use" and (agent.client.busy or agent.prompt_pending or context.bot_data["storage"].count_user_queue(user.id)):
+        await reply_text(update, "⏳ 仍有运行或排队的消息；请等待完成，或用 /stop 和 /queue clear 后再切换模型")
         return
 
     if sub == "list":
@@ -1103,8 +1108,8 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     agent = context.bot_data["manager"].get(user.id)
     async with agent.control_lock:
-        if agent.client.busy or agent.prompt_pending:
-            await reply_text(update, "⏳ 当前任务仍在运行，请完成或 /stop 后再切换人格")
+        if agent.client.busy or agent.prompt_pending or storage.count_user_queue(user.id):
+            await reply_text(update, "⏳ 仍有运行或排队的消息；请等待完成，或用 /stop 和 /queue clear 后再切换人格")
             return
         try:
             storage.set_active_persona(user.id, args[1])
@@ -1135,6 +1140,63 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_text(update, f"中止任务失败：{_friendly_error(e)}")
         return
     await reply_text(update, "⏹ pi 已确认中止指令")
+
+
+async def cmd_steer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """明确要求修改正在运行的任务；普通消息始终作为下一轮处理。"""
+    user = update.effective_user
+    agent = context.bot_data["manager"].get(user.id)
+    message = update.message
+    args = context.args or []
+    instruction = " ".join(args).strip()
+    if not instruction:
+        await reply_text(update, "用法：/steer <要插入当前任务的指令>")
+        return
+    async with agent.control_lock:
+        if not agent.client.busy:
+            await reply_text(update, "当前没有正在运行的任务；直接发送消息即可开始下一轮")
+            return
+        images = None
+        if message and (message.photo or message.document):
+            try:
+                images = await _prepare_images(agent.client, message, user_id=user.id)
+            except ValueError as exc:
+                await reply_text(update, f"⚠️ {exc}")
+                return
+        if not agent.client.busy:
+            await reply_text(update, "当前任务已结束；请将这条指令作为普通消息重新发送")
+            return
+        try:
+            await agent.client.steer(instruction, images=images)
+            turn_id = agent.active_turn_id
+            if turn_id is not None:
+                settings = context.bot_data["settings"]
+                context.bot_data["storage"].append_turn_steer(
+                    turn_id, safe_turn_text(instruction, settings.memory_turn_user_chars),
+                )
+        except Exception as exc:
+            logger.exception("插入指令失败", extra={"user_id": user.id})
+            await reply_text(update, f"⚠️ 插入指令失败：{_friendly_error(exc)}")
+            return
+    await reply_text(update, "↩️ 已插入当前任务；这条消息不会成为独立的新回合")
+
+
+async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """查看或取消仍未开始处理的本用户消息。"""
+    storage = context.bot_data["storage"]
+    args = context.args or []
+    if args and args[0] == "clear":
+        removed = storage.cancel_user_queue(update.effective_user.id)
+        await reply_text(update, f"已取消 {removed} 条尚未开始的排队消息；运行中的任务不受影响")
+        return
+    if args:
+        await reply_text(update, "用法：/queue [clear]")
+        return
+    await reply_text(
+        update,
+        f"排队等待：{storage.count_user_queue(update.effective_user.id)} 条。直接发送的消息会依次成为新回合；"
+        "用 /steer <内容> 插入正在运行的任务，用 /queue clear 取消等待。",
+    )
 
 
 async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1546,7 +1608,7 @@ async def _prepare_images(client: PiRpcClient, message, *, user_id: int | None =
         raise ValueError("当前模型不支持图片输入，请用 /model list 选择带 🖼 标记的模型后重发")
     return [await _download_image(message, user_id=user_id)]
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     settings = context.bot_data["settings"]
     storage = context.bot_data["storage"]
@@ -1605,13 +1667,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keepalive = asyncio.create_task(typing_keepalive())
 
     try:
-        if agent.control_lock.locked():
-            await reply_text(update, "⏳ 正在准备上一条消息或切换会话/模型，请稍后再发")
-            return
-
         # 与 /model、/session 共用锁，保证图片能力检查和下载期间模型、会话不切换。
-        # 在锁内依据最新 busy 状态选择 steer 或保留下一次 prompt。
         async with agent.control_lock:
+            update_id = getattr(update, "update_id", None)
+            if isinstance(update_id, int) and not storage.begin_update(update_id):
+                return  # /queue clear 已取消这条尚未开始的更新
             try:
                 await agent.ensure_client()
             except Exception as e:
@@ -1636,31 +1696,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             # 会话自动命名：默认会话的第一条消息作为会话名
             await _auto_name_session(storage, user.id, text)
 
-            # 流式中途介入：pi 忙时插入 steer 而非拒绝
-            if agent.prompt_pending and not agent.client.busy:
-                for _ in range(100):
-                    if agent.client.busy or not agent.prompt_pending:
-                        break
-                    await asyncio.sleep(0.05)
-            if agent.client.busy:
-                try:
-                    if has_image:
-                        await agent.client.steer(text, images=images)
-                    else:
-                        await agent.client.steer(text)
-                    if getattr(agent, "active_turn_id", None) is not None:
-                        storage.append_turn_steer(
-                            agent.active_turn_id,
-                            safe_turn_text(text, getattr(settings, "memory_turn_user_chars", 4000)),
-                        )
-                    await reply_text(update, "↩️ pi 已收到新指令，将在当前任务中处理")
-                except Exception as e:
-                    logger.exception("插入指令失败", extra={"user_id": user.id})
-                    await reply_text(update, f"⚠️ 插入指令失败: {_friendly_error(e)}")
-                return
-            if agent.prompt_pending:
-                await reply_text(update, "⏳ 当前任务正在启动，请稍后再发")
-                return
+            # 普通消息按到达顺序独立处理；插入当前任务只由 /steer 执行。
+            if agent.client.busy or agent.prompt_pending:
+                raise PiBusyError("当前任务仍在结束，请稍后重试")
             agent.prompt_pending = True
             owns_prompt = True
             memory = getattr(manager, "memory", None)
@@ -1790,6 +1828,49 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """每位用户的普通消息按到达顺序独立处理，回执速度不影响顺序。"""
+    message = update.message
+    if message and (message.photo or message.document) and message.media_group_id:
+        await _process_text(update, context)
+        return
+    caption = (message.caption or "") if message else ""
+    caption_parts = caption.split(maxsplit=1)
+    if caption_parts and caption_parts[0].split("@", 1)[0] == "/steer":
+        context.args = caption_parts[1].split() if len(caption_parts) > 1 else []
+        await cmd_steer(update, context)
+        return
+
+    user_id = update.effective_user.id
+    agent = context.bot_data["manager"].get(user_id)
+    storage = context.bot_data["storage"]
+    previous = agent.turn_tail
+    finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    agent.turn_tail = finished  # 在首个 await 之前登记顺序
+    waiting = (
+        (previous is not None and not previous.done())
+        or agent.control_lock.locked() or agent.prompt_pending or agent.client.busy
+    )
+    try:
+        if waiting:
+            try:
+                await reply_text(
+                    update,
+                    f"📥 已排队为下一轮（当前等待 {storage.count_user_queue(user_id)} 条）。"
+                    "发送 /steer <内容> 可修改当前任务；/queue clear 可取消等待。",
+                )
+            except Exception:
+                logger.exception("排队回执发送失败", extra={"user_id": user_id})
+        if previous is not None:
+            await previous
+        await _process_text(update, context)
+    finally:
+        if not finished.done():
+            finished.set_result(None)
+        if agent.turn_tail is finished:
+            agent.turn_tail = None
+
+
 # ================= Application 组装 =================
 
 COMMAND_MENU = [
@@ -1804,6 +1885,8 @@ COMMAND_MENU = [
     ("memory", "长期记忆"),
     ("summary", "当前会话摘要"),
     ("stop", "中止任务"),
+    ("steer", "插入当前任务"),
+    ("queue", "查看或取消排队"),
 ]
 
 
@@ -1858,6 +1941,8 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         CommandHandler("model", cmd_model),
         CommandHandler("persona", cmd_persona),
         CommandHandler("stop", cmd_stop),
+        CommandHandler("steer", cmd_steer),
+        CommandHandler("queue", cmd_queue),
         CommandHandler("status", cmd_status),
         CommandHandler("cost", cmd_cost),
         CommandHandler("memory", cmd_memory),

@@ -37,6 +37,7 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_text_handler_rejects_unauthorized_user_before_agent_lookup(self) -> None:
         settings = SimpleNamespace(bot_token="123:ABC", allowed_ids={1})
         storage = Mock()
+        storage.count_user_queue.return_value = 0
         manager = Mock()
         app = bot.build_application(settings, storage, manager)
         message = SimpleNamespace(reply_text=AsyncMock(), chat=SimpleNamespace(type="private"))
@@ -63,6 +64,7 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
 class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_using_active_session_does_not_repeat_missing_jsonl_recovery(self) -> None:
         storage = Mock()
+        storage.count_user_queue.return_value = 0
         storage.get_session.return_value = {
             "id": "current", "user_id": 1, "pi_session_file": "/missing.jsonl",
         }
@@ -99,6 +101,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
                 manager = Mock()
                 manager.get.return_value = agent
                 storage = Mock()
+                storage.count_user_queue.return_value = 0
                 storage.get_active_session.return_value = {"name": "current"}
                 storage.get_active_persona.return_value = DEFAULT_PERSONA
                 context = SimpleNamespace(args=args, bot_data={"manager": manager, "storage": storage})
@@ -113,6 +116,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ensure_client_restarts_with_active_session_file(self) -> None:
         storage = Mock()
+        storage.count_user_queue.return_value = 0
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         storage.db_path = str(Path(folder.name) / "test.db")
@@ -131,6 +135,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_new_session_keeps_previous_active_record(self) -> None:
         storage = Mock()
+        storage.count_user_queue.return_value = 0
         storage.get_active_session.return_value = {"pi_session_file": "/old.jsonl"}
         client = SimpleNamespace(
             busy=False,
@@ -158,6 +163,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_session_error_before_return_restores_previous_pi_session(self) -> None:
         storage = Mock()
+        storage.count_user_queue.return_value = 0
         storage.get_active_session.return_value = {"id": "old", "pi_session_file": "/old.jsonl"}
         client = SimpleNamespace(
             busy=False,
@@ -183,6 +189,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_session_activates_only_after_pi_returns_file(self) -> None:
         storage = Mock()
+        storage.count_user_queue.return_value = 0
         storage.get_active_session.return_value = {"id": "old", "pi_session_file": "/old.jsonl"}
         storage.create_session_with_file_and_activate.return_value = "new"
         client = SimpleNamespace(
@@ -210,6 +217,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_use_restores_previous_pi_session_if_storage_update_fails(self) -> None:
         storage = Mock()
+        storage.count_user_queue.return_value = 0
         storage.get_session.return_value = {
             "id": "new", "user_id": 1, "name": "next", "pi_session_file": "/new.jsonl",
         }
@@ -235,6 +243,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_use_restores_previous_pi_session_if_switch_result_is_lost(self) -> None:
         storage = Mock()
+        storage.count_user_queue.return_value = 0
         storage.get_session.return_value = {
             "id": "new", "user_id": 1, "name": "next", "pi_session_file": "/new.jsonl",
         }
