@@ -845,13 +845,57 @@ async def stream_reply(
 
 # ================= 快捷菜单 =================
 
+HELP_SECTIONS = {
+    "chat": (
+        "💬 对话与任务\n"
+        "直接发送文字、图片或 UTF-8 文本附件；可附说明文字。\n"
+        "图片支持 JPEG、PNG、GIF、WebP，每张最大 10 MiB；相册最多 4 张、合计 20 MiB。"
+        "文本附件最多 64 KiB / 30000 字符。\n\n"
+        "/stop — 中止运行任务并取消待启动消息\n"
+        "/steer <内容> — 插入正在运行的任务\n"
+        "/queue [clear] — 查看或取消排队消息\n"
+        "/status — 查看运行状态\n"
+        "/mail — 预览并确认待发邮件"
+    ),
+    "sessions": (
+        "📁 会话、模型与环境\n"
+        "/session new [名称] — 新建会话\n"
+        "/session list — 列出会话\n"
+        "/session use <id> — 切换会话\n"
+        "/model list — 列出可用模型\n"
+        "/model use <model_id> — 切换模型\n"
+        "/env list — 查看可用环境"
+    ),
+    "memory": (
+        "🧠 人格与记忆\n"
+        "/persona list — 列出人格\n"
+        "/persona use <id|none> — 切换人格\n"
+        "/memory — 查看记忆管理用法\n"
+        "/memory add <内容> — 保存记忆\n"
+        "/memory list — 列出记忆\n"
+        "/memory edit <id> <内容> — 编辑记忆\n"
+        "/memory delete <id> — 删除记忆\n"
+        "/summary [show|clear] — 查看或清空当前会话摘要"
+    ),
+    "other": (
+        "📊 用量与帮助\n"
+        "/cost [last|today] — 查看模型用量与估算费用\n"
+        "/help [chat|sessions|memory|other] — 查看分类帮助"
+    ),
+}
+
+
 def quick_menu() -> InlineKeyboardMarkup:
-    """/start 与 /help 附带的内联快捷键盘。"""
+    """首页快捷键盘。"""
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("📁 会话列表", callback_data="cmd:session_list"),
-                InlineKeyboardButton("🧠 模型列表", callback_data="cmd:model_list"),
+                InlineKeyboardButton("💬 对话与任务", callback_data="help:chat"),
+                InlineKeyboardButton("📁 会话与模型", callback_data="help:sessions"),
+            ],
+            [
+                InlineKeyboardButton("🧠 人格与记忆", callback_data="help:memory"),
+                InlineKeyboardButton("📊 用量与帮助", callback_data="help:other"),
             ],
             [
                 InlineKeyboardButton("📊 状态", callback_data="cmd:status"),
@@ -864,37 +908,31 @@ def quick_menu() -> InlineKeyboardMarkup:
 # ================= 命令处理器 =================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.args = []
     await cmd_help(update, context)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "🤖 djhx-pi-bot — 通过 Telegram 控制 pi 编码代理\n\n"
-        "直接发文字、单张图片或文本附件即可与 pi 对话；可附说明文字。\n"
-        "图片支持 JPEG、PNG、GIF、WebP，最大 10 MiB；当前模型须支持图片输入。\n"
-        "文本、代码、日志附件须为 UTF-8，最多 64 KiB / 30000 字符。\n"
-        "相册最多 4 张图片、合计 20 MiB；收齐后一次处理。\n\n"
-        "命令：\n"
-        "/env list — 查看可用环境\n"
-        "/env use <name> — 切换环境（V1 仅 server）\n"
-        "/session new [名称] — 新建会话\n"
-        "/session list — 列出我的会话\n"
-        "/session use <id> — 切换到指定会话\n"
-        "/model list — 列出可用模型\n"
-        "/model use <model_id> — 切换模型\n"
-        "/persona list — 列出人格\n"
-        "/persona use <id|none> — 切换人格或恢复 Pi 默认\n"
-        "/cost [last|today] — 查看模型用量与估算费用\n"
-        "/memory — 查看和管理长期记忆\n"
-        "/summary — 查看或清空当前会话摘要\n"
-        "/stop — 中止当前任务并取消待启动消息\n"
-        "/steer <内容> — 插入当前任务\n"
-        "/queue [clear] — 查看或取消排队消息\n"
-        "/mail — 查看与确认待发邮件\n"
-        "/status — 查看运行状态\n"
-        "/help — 帮助"
+    section = context.args[0].lower() if context.args else ""
+    if section in HELP_SECTIONS:
+        await reply_text(
+            update, HELP_SECTIONS[section],
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("← 帮助首页", callback_data="help:home")]
+            ]),
+        )
+        return
+    if section and section != "home":
+        await reply_text(update, "未知分类。请选择下方分类，或使用 /help chat|sessions|memory|other。", reply_markup=quick_menu())
+        return
+    await reply_text(
+        update,
+        "🤖 djhx-pi-bot\n"
+        "直接发送文字、图片或文本附件与 pi 对话。\n"
+        "运行中用 /steer 插入指令；用 /stop 中止并取消排队消息。\n"
+        "点击分类查看完整命令，或输入 /help chat|sessions|memory|other。",
+        reply_markup=quick_menu(),
     )
-    await reply_text(update, text, reply_markup=quick_menu())
 
 
 async def cmd_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1654,6 +1692,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "cmd:stop": (cmd_stop, []),
     }
     data = query.data or ""
+    if data.startswith("help:"):
+        context.args = [data.split(":", 1)[1]]
+        await cmd_help(update, context)
+        return
     # 列表按钮直接触发切换操作
     if data.startswith("session_use:"):
         context.args = ["use", data.split(":", 1)[1]]
