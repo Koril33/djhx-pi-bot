@@ -48,6 +48,9 @@ logger = get_logger("bot")
 MAX_HTML_LEN = 3900  # Telegram 消息上限 4096，转义/标签会膨胀，留余量
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 8192  # DeepSeek 单张图片的长/宽上限
+MAX_ALBUM_IMAGES = 4
+MAX_ALBUM_BYTES = 20 * 1024 * 1024
+ALBUM_QUIET_SECONDS = 1.5
 MAX_TEXT_FILE_BYTES = 64 * 1024
 MAX_TEXT_FILE_CHARS = 30_000
 TEXT_FILE_SUFFIXES = frozenset({
@@ -852,7 +855,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 djhx-pi-bot — 通过 Telegram 控制 pi 编码代理\n\n"
         "直接发文字、单张图片或文本附件即可与 pi 对话；可附说明文字。\n"
         "图片支持 JPEG、PNG、GIF、WebP，最大 10 MiB；当前模型须支持图片输入。\n"
-        "文本、代码、日志附件须为 UTF-8，最多 64 KiB / 30000 字符。\n\n"
+        "文本、代码、日志附件须为 UTF-8，最多 64 KiB / 30000 字符。\n"
+        "相册最多 4 张图片、合计 20 MiB；收齐后一次处理。\n\n"
         "命令：\n"
         "/env list — 查看可用环境\n"
         "/env use <name> — 切换环境（V1 仅 server）\n"
@@ -1694,17 +1698,39 @@ async def _prepare_images(client: PiRpcClient, message, *, user_id: int | None =
         raise ValueError("当前模型不支持图片输入，请用 /model list 选择带 🖼 标记的模型后重发")
     return [await _download_image(message, user_id=user_id)]
 
-async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _process_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    *, album_updates: list[Update] | None = None,
+) -> None:
     user = update.effective_user
     settings = context.bot_data["settings"]
     storage = context.bot_data["storage"]
     manager = context.bot_data["manager"]
     message = update.message
-    has_image = bool(message.photo or _is_image_document(message.document))
+    album_messages = [item.message for item in album_updates] if album_updates else []
+    has_image = bool(album_messages or message.photo or _is_image_document(message.document))
     has_text_document = bool(message.document and not has_image)
-    text = message.text or message.caption or ""
+    text = next((item.caption for item in album_messages if item.caption), None) if album_messages else None
+    text = text or message.text or message.caption or ""
+    if album_messages:
+        if len(album_messages) > MAX_ALBUM_IMAGES:
+            await reply_text(update, f"⚠️ 相册共 {len(album_messages)} 张，最多支持 {MAX_ALBUM_IMAGES} 张；请拆分后重发")
+            return
+        if any(not (item.photo or _is_image_document(item.document)) for item in album_messages):
+            await reply_text(update, "⚠️ 相册只支持照片或图片文件，请把普通文件单独发送")
+            return
+        declared_bytes = sum(
+            (item.photo[-1] if item.photo else item.document).file_size or 0
+            for item in album_messages
+        )
+        if declared_bytes > MAX_ALBUM_BYTES:
+            await reply_text(update, "⚠️ 相册总大小超过 20 MiB，请压缩或拆分后重发")
+            return
+        if text.lstrip().startswith("/steer"):
+            await reply_text(update, "⚠️ 相册暂不支持 /steer；请作为普通相册发送")
+            return
     if has_image and not text.strip():
-        text = "请分析这张图片。"
+        text = "请分析这组图片。" if album_messages else "请分析这张图片。"
     if has_text_document:
         if not _is_text_document(message.document):
             await reply_text(update, "⚠️ 仅支持常见文本、代码或日志文件（UTF-8，最多 64 KiB）；PDF、Office 与二进制附件暂不支持。")
@@ -1721,24 +1747,6 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     memory_session_id: str | None = None
     assistant_text = ""
     injected_bytes = 0
-
-    # 相册由多条独立 Update 组成；逐条提交会丢失图片顺序或让后续图片撞上忙碌状态。
-    # 当前明确要求单张发送，并在同一相册内只提示一次。
-    if has_image and message.media_group_id:
-        notices = context.bot_data.setdefault("image_album_notices", {})
-        now = time.monotonic()
-        for key, seen_at in list(notices.items()):
-            if now - seen_at > 300:
-                del notices[key]
-        key = (user.id, message.media_group_id)
-        if key not in notices:
-            notices[key] = now
-            try:
-                await reply_text(update, "⚠️ 暂不支持相册合并处理，请将图片逐张发送")
-            except Exception:
-                notices.pop(key, None)
-                raise
-        return
 
     agent = manager.get(user.id)
     storage.ensure_user(user.id, user.username)
@@ -1764,7 +1772,11 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # 与 /model、/session 共用锁，保证图片能力检查和下载期间模型、会话不切换。
         async with agent.control_lock:
             update_id = getattr(update, "update_id", None)
-            if isinstance(update_id, int) and not storage.begin_update(update_id):
+            if album_updates:
+                album_ids = [item.update_id for item in album_updates]
+                if not storage.begin_album_updates(album_ids):
+                    return  # /queue clear 已取消整组或其中一条更新
+            elif isinstance(update_id, int) and not storage.begin_update(update_id):
                 return  # /queue clear 已取消这条尚未开始的更新
             try:
                 await agent.ensure_client()
@@ -1781,7 +1793,14 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             # 否则当前回合可能在下载期间结束，图片被提交到空闲 steer 队列。
             images = None
             try:
-                if has_image:
+                if album_messages:
+                    if not await _model_accepts_images(agent.client):
+                        raise ValueError("当前模型不支持图片输入，请用 /model list 选择带 🖼 标记的模型后重发")
+                    images = [await _download_image(item, user_id=user.id) for item in album_messages]
+                    actual_bytes = sum((len(image["data"]) // 4) * 3 - image["data"].count("=") for image in images)
+                    if actual_bytes > MAX_ALBUM_BYTES:
+                        raise ValueError("相册总大小超过 20 MiB，请压缩或拆分后重发")
+                elif has_image:
                     images = await _prepare_images(agent.client, message, user_id=user.id)
                 elif has_text_document:
                     content = await _download_text_document(message.document, user_id=user.id)
@@ -1928,12 +1947,35 @@ async def _process_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """每位用户的普通消息按到达顺序独立处理，回执速度不影响顺序。"""
     message = update.message
-    if message and (message.photo or message.document) and message.media_group_id:
-        await _process_text(update, context)
-        return
+    album_group = None
+    album_leader = False
+    if message and message.media_group_id:
+        key = (update.effective_user.id, message.media_group_id)
+        closed = context.bot_data.setdefault("closed_albums", {})
+        now = time.monotonic()
+        for old_key, seen_at in list(closed.items()):
+            if now - seen_at > 300:
+                del closed[old_key]
+        if key in closed:
+            await reply_text(update, "⚠️ 这张图片到达时前一组相册已收齐，未纳入处理；请单独重发")
+            return
+        groups = context.bot_data.setdefault("album_groups", {})
+        album_group = groups.get(key)
+        if album_group is None:
+            album_group = {
+                "updates": [], "changed": asyncio.Event(),
+                "done": asyncio.get_running_loop().create_future(),
+            }
+            groups[key] = album_group
+            album_leader = True
+        album_group["updates"].append(update)
+        album_group["changed"].set()
+        if not album_leader:
+            await album_group["done"]
+            return
     caption = (message.caption or "") if message else ""
     caption_parts = caption.split(maxsplit=1)
-    if caption_parts and caption_parts[0].split("@", 1)[0] == "/steer":
+    if album_group is None and caption_parts and caption_parts[0].split("@", 1)[0] == "/steer":
         context.args = caption_parts[1].split() if len(caption_parts) > 1 else []
         await cmd_steer(update, context)
         return
@@ -1958,10 +2000,41 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             except Exception:
                 logger.exception("排队回执发送失败", extra={"user_id": user_id})
+        if album_group is not None:
+            while True:
+                album_group["changed"].clear()
+                try:
+                    await asyncio.wait_for(album_group["changed"].wait(), timeout=ALBUM_QUIET_SECONDS)
+                except TimeoutError:
+                    break
+            album_updates = sorted(
+                album_group["updates"], key=lambda item: item.message.message_id,
+            )
+            context.bot_data["album_groups"].pop(key, None)
+            context.bot_data["closed_albums"][key] = time.monotonic()
+            await reply_text(
+                update,
+                f"📚 收到相册 {len(album_updates)} 张（最多 {MAX_ALBUM_IMAGES} 张，总计不超过 20 MiB），正在检查。",
+            )
+        else:
+            album_updates = None
         if previous is not None:
             await previous
-        await _process_text(update, context)
+        if album_updates is None:
+            await _process_text(update, context)
+        else:
+            await _process_text(update, context, album_updates=album_updates)
+    except Exception as exc:
+        if album_group is not None and not album_group["done"].done():
+            album_group["done"].set_exception(exc)
+            album_group["done"].add_done_callback(lambda future: future.exception())
+        raise
     finally:
+        if album_group is not None:
+            context.bot_data["album_groups"].pop(key, None)
+            context.bot_data["closed_albums"][key] = time.monotonic()
+            if not album_group["done"].done():
+                album_group["done"].set_result(None)
         if not finished.done():
             finished.set_result(None)
         if agent.turn_tail is finished:

@@ -104,6 +104,20 @@ class StorageSessionTests(unittest.TestCase):
         self.assertEqual(self.storage.update_stats()["failed"], 1)
         self.assertEqual(self.storage.count_user_queue(7), 0)
 
+    def test_album_updates_start_atomically(self):
+        for update_id in (10, 11):
+            self.storage.enqueue_update(
+                update_id, f'{{"update_id":{update_id}}}', user_id=7, queueable=True,
+            )
+        self.storage.claim_updates(2)
+        self.assertTrue(self.storage.begin_album_updates([10, 11]))
+        rows = self.storage._query(
+            "SELECT safe_to_retry FROM telegram_updates WHERE update_id IN (10, 11)"
+        )
+        self.assertEqual([row["safe_to_retry"] for row in rows], [0, 0])
+        self.storage.complete_update(10)
+        self.assertFalse(self.storage.begin_album_updates([10, 11]))
+
     def test_acknowledge_keeps_dedup_record_without_health_failure(self):
         self.storage.enqueue_update(1, '{"update_id":1}')
         self.storage.claim_updates(1)

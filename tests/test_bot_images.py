@@ -334,13 +334,50 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, 1)
         self.assertEqual(len(self.calls), 1)
 
-    async def test_album_is_rejected_once_without_starting_agent(self):
+    async def test_album_is_combined_in_message_order(self):
         self.message.media_group_id = "album-1"
+        self.message.message_id = 2
+        self.update.update_id = 102
+        self.storage.begin_album_updates.return_value = True
+        other_message = SimpleNamespace(
+            photo=[media_with_data(PNG)], document=None, text=None,
+            caption="按顺序看这组图片", media_group_id="album-1",
+            message_id=1, reply_text=AsyncMock(),
+        )
+        other_update = SimpleNamespace(
+            update_id=101, effective_user=self.update.effective_user,
+            effective_chat=self.chat, message=other_message, callback_query=None,
+        )
+
+        async def consume(_update, stream, *_args, **_kwargs):
+            _ = [part async for part in stream]
+
+        with patch.object(bot, "ALBUM_QUIET_SECONDS", 0.02), patch.object(
+            bot, "stream_reply", side_effect=consume,
+        ), patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            first = asyncio.create_task(bot.on_text(self.update, self.context))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(bot.on_text(other_update, self.context))
+            await asyncio.wait_for(asyncio.gather(first, second), 2)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls[0][1]["images"]), 2)
+        self.assertEqual(self.calls[0][0], "按顺序看这组图片")
+        self.storage.begin_album_updates.assert_called_once_with([101, 102])
+        self.assertTrue(any("相册 2 张" in call.args[1] for call in reply.await_args_list))
+
+    async def test_album_over_limit_is_rejected_before_download(self):
+        self.message.media_group_id = "album-2"
+        updates = []
+        for number in range(5):
+            item = SimpleNamespace(
+                photo=[self.media], document=None, text=None, caption=None,
+                media_group_id="album-2", message_id=number,
+            )
+            updates.append(SimpleNamespace(message=item, update_id=number))
         with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
-            await bot.on_text(self.update, self.context)
-            await bot.on_text(self.update, self.context)
-        reply.assert_awaited_once()
-        self.assertIn("相册", reply.await_args.args[1])
+            await bot._process_text(self.update, self.context, album_updates=updates)
+        self.assertIn("相册共 5 张", reply.await_args.args[1])
+        self.media.get_file.assert_not_awaited()
         self.manager.get.assert_not_called()
 
     def test_photo_and_image_document_reach_image_handler(self):

@@ -13,7 +13,7 @@ Telegram ←→ nginx(TLS) ←→ FastAPI webhook ←→ python-telegram-bot
 - V1 单环境（服务器本机）：bot 进程直接管理常驻 pi RPC 子进程
 - 常驻 RPC 消除每次对话的冷启动成本，支持流式输出
 - 未支持的语音、音频、视频、贴纸等消息会收到明确提示；可发送文字、单张图片及受限文本附件。
-- 可发送单张 Telegram 照片或图片文件，可附文字说明；支持 JPEG、PNG、GIF、WebP，单张最大 10 MiB、宽高各不超过 8192 像素。使用 `/model list` 查看带 🖼 标记的图片模型。Telegram 相册请拆成单张发送。
+- 可发送单张 Telegram 照片或图片文件，可附文字说明；支持 JPEG、PNG、GIF、WebP，单张最大 10 MiB、宽高各不超过 8192 像素。使用 `/model list` 查看带 🖼 标记的图片模型。Telegram 相册最多 4 张图片、总计不超过 20 MiB，按组一次处理。
 - 可发送 UTF-8 文本、代码或日志附件（如 .txt、.md、.py、.json、.log 等），最大 64 KiB 且不超过 30000 字符；可在说明文字中提问。PDF、Office 和二进制文件会得到明确提示。
 - 多环境（Windows/Debian worker）规划在后续版本引入
 

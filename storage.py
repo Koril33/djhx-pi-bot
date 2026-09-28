@@ -702,6 +702,24 @@ class Storage:
             )
             return True
 
+    def begin_album_updates(self, update_ids: list[int]) -> bool:
+        """整组相册只在全部更新仍可处理时启动，并一起标记为不可安全重放。"""
+        if not update_ids or len(set(update_ids)) != len(update_ids):
+            return False
+        placeholders = ",".join("?" for _ in update_ids)
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                f"SELECT state FROM telegram_updates WHERE update_id IN ({placeholders})",
+                tuple(update_ids),
+            ).fetchall()
+            if len(rows) != len(update_ids) or any(row["state"] != "processing" for row in rows):
+                return False
+            self._conn.execute(
+                f"UPDATE telegram_updates SET safe_to_retry = 0 WHERE update_id IN ({placeholders})",
+                tuple(update_ids),
+            )
+            return True
+
     def count_user_queue(self, user_id: int) -> int:
         """尚未开始的普通消息数量，含待分发和已分发但仍在等待的更新。"""
         rows = self._query(
