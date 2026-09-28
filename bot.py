@@ -887,7 +887,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cost [last|today] — 查看模型用量与估算费用\n"
         "/memory — 查看和管理长期记忆\n"
         "/summary — 查看或清空当前会话摘要\n"
-        "/stop — 中止当前任务\n"
+        "/stop — 中止当前任务并取消待启动消息\n"
         "/steer <内容> — 插入当前任务\n"
         "/queue [clear] — 查看或取消排队消息\n"
         "/mail — 查看与确认待发邮件\n"
@@ -1168,22 +1168,35 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     manager = context.bot_data["manager"]
+    storage = context.bot_data["storage"]
     agent = manager.get(user.id)
+    cancelled = storage.cancel_user_queue(user.id)
     if agent.prompt_pending and not agent.client.busy:
         for _ in range(100):
             if agent.client.busy or not agent.prompt_pending:
                 break
             await asyncio.sleep(0.05)
     if not agent.client.busy:
-        await reply_text(update, "当前没有正在运行的任务")
+        if agent.prompt_pending:
+            await reply_text(
+                update,
+                f"已取消 {cancelled} 条待启动消息；当前任务仍在启动，请稍后再用 /stop 中止。",
+            )
+        elif cancelled:
+            await reply_text(update, f"已取消 {cancelled} 条待启动消息；没有正在运行的任务。")
+        else:
+            await reply_text(update, "当前没有正在运行或排队的任务")
         return
     try:
         await agent.client.abort()
     except Exception as e:
         logger.exception("中止任务失败", extra={"user_id": user.id})
-        await reply_text(update, f"中止任务失败：{_friendly_error(e)}")
+        await reply_text(
+            update,
+            f"已取消 {cancelled} 条待启动消息；中止运行中任务失败：{_friendly_error(e)}",
+        )
         return
-    await reply_text(update, "⏹ pi 已确认中止指令")
+    await reply_text(update, f"⏹ 已取消 {cancelled} 条待启动消息；pi 已确认中止运行中任务")
 
 
 async def cmd_steer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -124,6 +124,38 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
                 await bot.cmd_steer(update, context)
         client.steer.assert_awaited_once_with("调整方向", images=None)
 
+    async def test_stop_cancels_waiting_messages_without_running_task(self):
+        storage = Mock()
+        storage.cancel_user_queue.return_value = 2
+        client = SimpleNamespace(busy=False, abort=AsyncMock())
+        agent = SimpleNamespace(prompt_pending=False, client=client)
+        manager = Mock()
+        manager.get.return_value = agent
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        context = SimpleNamespace(bot_data={"manager": manager, "storage": storage})
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_stop(update, context)
+        storage.cancel_user_queue.assert_called_once_with(7)
+        client.abort.assert_not_awaited()
+        self.assertIn("已取消 2 条", reply.await_args.args[1])
+        self.assertIn("没有正在运行", reply.await_args.args[1])
+
+    async def test_stop_cancels_waiting_messages_and_aborts_running_task(self):
+        storage = Mock()
+        storage.cancel_user_queue.return_value = 1
+        client = SimpleNamespace(busy=True, abort=AsyncMock())
+        agent = SimpleNamespace(prompt_pending=False, client=client)
+        manager = Mock()
+        manager.get.return_value = agent
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        context = SimpleNamespace(bot_data={"manager": manager, "storage": storage})
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_stop(update, context)
+        storage.cancel_user_queue.assert_called_once_with(7)
+        client.abort.assert_awaited_once()
+        self.assertIn("已取消 1 条", reply.await_args.args[1])
+        self.assertIn("已确认中止", reply.await_args.args[1])
+
     async def test_queue_clear_only_requests_cancellation_of_unstarted_messages(self):
         storage = Mock()
         storage.cancel_user_queue.return_value = 2
