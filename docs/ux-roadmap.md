@@ -19,7 +19,7 @@
 | UX-04 | 普通文件与图片分流；支持受限文本、代码和日志附件 | 已部署验证 | e058064：UTF-8 附件在线下载并形成完整非图片回合；PDF 被拒绝且无回合；健康正常 |
 | UX-05 | 相册按组处理，明确数量与限制 | 已部署验证 | 05ef9a6：双图片同组 webhook 均 done，仅一个 complete 图片回合；5 张超限均 done、无回合；健康正常 |
 | UX-06 | 用户模型选择持久化，重启后保持 | 已部署验证 | b271f02、918379b：/model use 更新 done；重启后 SQLite 记录与新 AgentSession 模型一致；健康正常 |
-| UX-07 | /status 显示实际模型、任务耗时和队列 | 进行中 | 已实现实际模型读取、计时与队列，待部署与在线验证 |
+| UX-07 | /status 显示实际模型、任务耗时和队列 | 已部署验证 | 6edfe7e：/status 真实 webhook 更新 done；服务器 2 项格式测试通过；健康正常 |
 | UX-08 | 聊天工具进度不泄露命令和敏感参数 | 待做 | — |
 | UX-09 | 邮件发送前预览收件人、主题、正文并确认 | 待做 | — |
 | UX-10 | 失败更新与用户、会话关联，安全告知结果 | 待做 | — |
@@ -63,6 +63,7 @@
 | 2026-09-28 | UX-05 完成 | 126 项测试通过；uv lock、py_compile、diff --check 通过 | 05ef9a6；服务 active、/healthz 正常；服务器 27 项图片测试通过；两张真实图片文件同组 webhook 均 done，仅一个 complete 图片回合；5 张超限均 done、无回合 | 相册聚合与限制可用；下一项 UX-06 |
 | 2026-09-28 | UX-06 部署中 | 129 项测试通过；uv lock、py_compile、diff --check 通过 | b271f02；服务器 3 项针对性测试通过；真实 /model use webhook done，用户模型记录为 deepseek/deepseek-flash | 待部署重启后检查记录与启动模型 |
 | 2026-09-28 | UX-06 完成 | 无新代码 | 918379b 触发服务重启；/healthz 正常，数据库保存的模型与重建 AgentSession 的 provider/model 相同 | 选择持久化生效；下一项 UX-07 |
+| 2026-09-28 | UX-07 完成 | 131 项测试通过；uv lock、py_compile、diff --check 通过 | 6edfe7e；服务 active、/healthz 正常；服务器 2 项状态格式测试通过；真实 /status webhook 更新 done | 状态页增加实时模型、任务耗时、队列；下一项 UX-08 |
 
 ## 恢复工作时先做
 
