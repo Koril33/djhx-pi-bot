@@ -244,6 +244,7 @@ def _layout(title: str, active: str, body: str, csrf: str, user_id: int | None, 
 <div class="app-shell"><aside class="sidebar"><a class="brand" href="/admin/overview">
 <span class="brand-mark">P<span>·</span></span><span>PI<span class="brand-muted"> / ADMIN</span></span></a>
 <nav aria-label="主导航">{nav('overview', '概览', 'overview')}{nav('sessions', '会话管理', 'sessions')}{nav('usage', '用量费用', 'usage')}{nav('memories', '长期记忆', 'memories')}{nav('summaries', '会话摘要', 'summaries')}{nav('personas', '人格管理', 'personas')}{nav('settings', '记忆设置', 'settings')}{nav('mail', '邮件设置', 'mail')}</nav>
+<p class="nav-scroll-hint">← 左右滑动查看全部菜单 →</p>
 <div class="sidebar-bottom"><span class="admin-name">{_e(settings.admin_username)}</span>
 <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{_e(csrf)}">
 <button class="text-button" type="submit">退出</button></form></div></aside>
