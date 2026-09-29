@@ -376,6 +376,39 @@ def _overview_page(request: Request, csrf: str, user_id: int | None) -> HTMLResp
     return _html(_layout("概览", "overview", body, csrf, user_id, settings))
 
 
+
+_ADMIN_PAGE_SIZE = 10
+
+
+def _admin_list_page(request: Request, rows: list, section: str, user_id: int | None,
+                     matches) -> tuple[list, str, str, int]:
+    """搜索与分页共用同一组 GET 参数；越界页码自动回到最后一页。"""
+    query = request.query_params.get("q", "").strip()[:80]
+    filtered = [row for row in rows if not query or matches(row, query.casefold())]
+    raw = request.query_params.get("page", "1")
+    requested = int(raw) if raw.isdecimal() and 0 < len(raw) <= 6 else 1
+    pages = max(1, (len(filtered) + _ADMIN_PAGE_SIZE - 1) // _ADMIN_PAGE_SIZE)
+    page = min(max(1, requested), pages)
+    shown = filtered[(page - 1) * _ADMIN_PAGE_SIZE:page * _ADMIN_PAGE_SIZE]
+    base = {"user_id": user_id} if user_id is not None else {}
+    label = {"sessions": "会话", "memories": "记忆", "summaries": "摘要", "personas": "人格"}[section]
+    search = (f'<form method="get" action="/admin/{section}" class="search-form">'
+              + (f'<input type="hidden" name="user_id" value="{user_id}">' if user_id is not None else "")
+              + f'<input name="q" value="{_e(query)}" maxlength="80" placeholder="搜索{label}" '
+              f'aria-label="搜索{label}"><button class="button subtle">搜索</button></form>')
+    links = []
+    for target, title in ((page - 1, "上一页"), (page + 1, "下一页")):
+        if 1 <= target <= pages:
+            params = urlencode({**base, "q": query, "page": target})
+            links.append(f'<a class="button subtle" href="/admin/{section}?{_e(params)}">{title}</a>')
+        else:
+            links.append(f'<span class="button subtle" aria-disabled="true">{title}</span>')
+    pager = (f'<nav class="list-pagination" aria-label="分页">'
+             f'<span>第 {page}/{pages} 页 · 共 {len(filtered)} 条匹配</span>'
+             f'{links[0]}{links[1]}</nav>')
+    return shown, search, pager, len(filtered)
+
+
 def _session_page(request: Request, csrf: str, user_id: int | None, error: str = "") -> HTMLResponse:
     storage, settings = _storage(request), _settings(request)
     picker = _user_picker(storage, settings, user_id, "sessions")
@@ -388,8 +421,12 @@ def _session_page(request: Request, csrf: str, user_id: int | None, error: str =
                '<input id="session-name" name="name" maxlength="60" placeholder="新会话名称" required>'
                '<button class="button primary" type="submit">新建会话</button></form>')
         agent = request.app.state.manager.get(user_id)
+        shown, search, pager, _ = _admin_list_page(
+            request, storage.list_sessions(user_id), "sessions", user_id,
+            lambda row, q: q in row["name"].casefold() or q in row["id"].casefold(),
+        )
         cards = []
-        for row in storage.list_sessions(user_id):
+        for row in shown:
             sid = _e(row["id"])
             session_file = row["pi_session_file"]
             exists = bool(session_file and Path(session_file).is_file())
@@ -432,7 +469,8 @@ def _session_page(request: Request, csrf: str, user_id: int | None, error: str =
                          f'<span class="mono">{sid}</span></div><div class="session-foot">'
                          f'<span class="muted">{_e(_time_label(row["updated_at"]))}</span>'
                          f'<div class="card-actions">{switch}{rename}</div></div></article>')
-        content = add + ('<div class="card-list">' + "".join(cards) + '</div>' if cards else '<p class="empty">暂无会话</p>')
+        content = add + search + ('<div class="card-list">' + "".join(cards) + '</div>'
+                                  if cards else '<p class="empty">没有匹配的会话</p>') + pager
     alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
     body = f'<div class="page-heading"><div><p class="eyebrow">SESSIONS</p><h1>会话管理</h1></div>{picker}</div>{alert}{content}'
     return _html(_layout("会话管理", "sessions", body, csrf, user_id, settings), status_code=400 if error else 200)
@@ -530,16 +568,32 @@ def _usage_page(request: Request, csrf: str, user_id: int | None, period: str,
         "outside_effective_period": "超出价格生效期", "calendar_unknown": "无法判断计价时段",
         "invalid_usage": "用量数据无效", "invalid_config": "价格配置无效",
     }
+    raw_unpriced_page = request.query_params.get("unpriced_page", "1")
+    requested_page = (int(raw_unpriced_page)
+                      if raw_unpriced_page.isdecimal() and 0 < len(raw_unpriced_page) <= 6 else 1)
+    unpriced_pages = max(1, (len(unpriced) + 19) // 20)
+    unpriced_page = min(max(1, requested_page), unpriced_pages)
     unpriced_rows = "".join(
         f'<div class="list-row"><span>{_e(_time_label(row["started_at"]))}</span>'
         f'<span>{_e(row["provider"] + "/" + row["model"])} · '
         f'{_e(session_names.get(row["session_id"], "已删除会话" if row["session_id"] else "无关联会话"))} · '
         f'{_e(reasons.get(row["price_status"], row["price_status"]))}</span>'
         f'<strong>{row["total_tokens"]:,} tokens</strong></div>'
-        for row in unpriced[:20]
+        for row in unpriced[(unpriced_page - 1) * 20:unpriced_page * 20]
     ) or '<p class="empty small">当前筛选范围内没有未计价调用</p>'
-    if len(unpriced) > 20:
-        unpriced_rows += f'<p class="muted">仅显示最近 20 条，共 {len(unpriced)} 条</p>'
+    unpriced_nav = []
+    for target, title in ((unpriced_page - 1, "上一页"), (unpriced_page + 1, "下一页")):
+        if 1 <= target <= unpriced_pages:
+            params = dict(request.query_params)
+            params["unpriced_page"] = target
+            unpriced_nav.append(
+                f'<a class="button subtle" href="/admin/usage?{_e(urlencode(params))}">{title}</a>'
+            )
+        else:
+            unpriced_nav.append(f'<span class="button subtle" aria-disabled="true">{title}</span>')
+    unpriced_pager = (f'<nav class="list-pagination" aria-label="未计价调用分页">'
+                      f'<span>第 {unpriced_page}/{unpriced_pages} 页 · 共 {len(unpriced)} 次</span>'
+                      f'{unpriced_nav[0]}{unpriced_nav[1]}</nav>')
     recent = []
     for run in runs[:8]:
         run_events = by_run.get(run["id"], [])
@@ -559,7 +613,7 @@ def _usage_page(request: Request, csrf: str, user_id: int | None, period: str,
             f'<div class="simple-list">{model_rows}</div></section>'
             f'<section class="section-block"><div class="section-head"><h2>未计价调用</h2>'
             f'<span class="muted">不计入估算费用 · 共 {len(unpriced)} 次</span></div>'
-            f'<div class="simple-list">{unpriced_rows}</div></section>'
+            f'<div class="simple-list">{unpriced_rows}</div>{unpriced_pager}</section>'
             f'<section class="section-block"><div class="section-head"><h2>最近记录</h2></div>'
             f'<div class="simple-list">{"".join(recent) or "<p class=\"empty small\">暂无记录</p>"}</div></section>')
     return _html(_layout("用量费用", "usage", body, csrf, user_id, settings))
@@ -571,10 +625,11 @@ def _memory_page(request: Request, csrf: str, user_id: int | None, error: str = 
     if user_id is None:
         contents = '<p class="empty">暂无用户</p>'
     else:
-        query = request.query_params.get("q", "").strip()[:80]
         memories = storage.list_memories(user_id)
-        shown = [row for row in memories if query.casefold() in row["text"].casefold()]
-        search = f'<form method="get" action="/admin/memories" class="search-form"><input type="hidden" name="user_id" value="{user_id}"><input name="q" value="{_e(query)}" placeholder="搜索记忆" aria-label="搜索记忆"><button class="button subtle">搜索</button></form>'
+        shown, search, pager, matched = _admin_list_page(
+            request, memories, "memories", user_id,
+            lambda row, q: q in row["text"].casefold() or q in row["source"].casefold(),
+        )
         add = f'''<form method="post" action="/admin/memories/add" class="add-form"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><label class="sr-only" for="new-memory">新增记忆</label><textarea id="new-memory" name="text" maxlength="{settings.memory_item_max_chars}" rows="2" placeholder="写入一条长期记忆" required></textarea><button class="button primary" type="submit">添加记忆</button></form>'''
         cards = []
         for row in shown:
@@ -583,7 +638,9 @@ def _memory_page(request: Request, csrf: str, user_id: int | None, error: str = 
             source = "手动" if row["source"] == "manual" else "自动"
             cards.append(f'''<article class="memory-card"><div class="card-meta"><span>{source}</span>{badge}<span class="mono">{ident}</span></div><p class="memory-text">{_e(row["text"])}</p><div class="card-actions"><form method="post" action="/admin/memories/{ident}/pin"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><input type="hidden" name="pinned" value="{0 if row["pinned"] else 1}"><button class="text-button" type="submit">{'取消置顶' if row['pinned'] else '置顶'}</button></form><details><summary>编辑</summary><form method="post" action="/admin/memories/{ident}/edit" class="inline-edit"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><textarea name="text" maxlength="{settings.memory_item_max_chars}" rows="3" required>{_e(row["text"])}</textarea><button class="button primary" type="submit">保存</button></form></details><details class="danger-details"><summary>删除</summary><form method="post" action="/admin/memories/{ident}/delete"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><button class="button danger" type="submit">确认删除</button></form></details></div></article>''')
         cards_html = "".join(cards) if cards else '<p class="empty">暂无记忆</p>'
-        contents = f'<div class="toolbar"><span class="count">{len(memories)} / {settings.memory_active_limit}</span>{search}</div>{add}<div class="card-list">{cards_html}</div>'
+        contents = (f'<div class="toolbar"><span class="count">{matched} 条匹配 · '
+                    f'{len(memories)} / {settings.memory_active_limit}</span>{search}</div>'
+                    f'{add}<div class="card-list">{cards_html}</div>{pager}')
     alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
     body = f'<div class="page-heading"><div><p class="eyebrow">MEMORY</p><h1>长期记忆</h1></div>{picker}</div>{alert}{contents}'
     return _html(_layout("长期记忆", "memories", body, csrf, user_id, settings), status_code=400 if error else 200)
@@ -592,8 +649,14 @@ def _memory_page(request: Request, csrf: str, user_id: int | None, error: str = 
 def _summary_page(request: Request, csrf: str, user_id: int | None) -> HTMLResponse:
     storage, settings = _storage(request), _settings(request)
     picker = _user_picker(storage, settings, user_id, "summaries")
+    summaries = storage.list_admin_summaries(user_id) if user_id is not None else []
+    shown, search, pager, _ = _admin_list_page(
+        request, summaries, "summaries", user_id,
+        lambda row, q: q in row["name"].casefold() or q in row["id"].casefold()
+        or q in (row["summary_text"] or "").casefold(),
+    )
     cards = []
-    for row in storage.list_admin_summaries(user_id) if user_id is not None else []:
+    for row in shown:
         summary = row["summary_text"] or ""
         ident = _e(row["id"])
         if summary:
@@ -603,7 +666,8 @@ def _summary_page(request: Request, csrf: str, user_id: int | None) -> HTMLRespo
             clear, content = "", '<p class="empty small">暂无摘要</p>'
         cards.append(f'<article class="summary-card"><div class="summary-head"><div><span class="session-state">{_e(row["status"])}</span><h2>{_e(row["name"])}</h2></div><span class="mono">{ident}</span></div>{content}<div class="card-actions">{clear}</div></article>')
     content = "".join(cards) if cards else '<p class="empty">暂无会话</p>'
-    body = f'<div class="page-heading"><div><p class="eyebrow">SESSIONS</p><h1>会话摘要</h1></div>{picker}</div>{_notice(request)}<div class="card-list">{content}</div>'
+    body = (f'<div class="page-heading"><div><p class="eyebrow">SESSIONS</p><h1>会话摘要</h1></div>{picker}</div>'
+            f'{_notice(request)}{search}<div class="card-list">{content}</div>{pager}')
     return _html(_layout("会话摘要", "summaries", body, csrf, user_id, settings))
 
 
@@ -612,8 +676,14 @@ def _personas_page(request: Request, csrf: str, user_id: int | None, error: str 
     picker = _user_picker(storage, settings, user_id, "personas")
     active = storage.get_active_persona(user_id) if user_id is not None else None
     personas = storage.list_personas()
+    all_rows = ([{"id": "none", "name": "无人格 · Pi 默认", "identity": ""}]
+                if user_id is not None else []) + personas
+    shown, search, pager, matched = _admin_list_page(
+        request, all_rows, "personas", user_id,
+        lambda row, q: q in row["name"].casefold() or q in row["id"].casefold(),
+    )
     cards = []
-    if user_id is not None:
+    if any(row["id"] == "none" for row in shown):
         none_selected = active is None
         activate_none = (f'<form method="post" action="/admin/personas/none/use">'
                          f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
@@ -624,7 +694,9 @@ def _personas_page(request: Request, csrf: str, user_id: int | None, error: str 
                      f'<span class="badge">{"当前" if none_selected else "可用"}</span>'
                      f'<span class="mono">none</span></div><h2>无人格 · Pi 默认</h2>'
                      f'<div class="card-actions">{activate_none}</div></article>')
-    for row in personas:
+    for row in shown:
+        if row["id"] == "none":
+            continue
         persona_id = row["id"]
         selected = bool(active and active["id"] == persona_id)
         badge = ("当前" if selected else "默认" if persona_id == "default" else
@@ -654,10 +726,10 @@ def _personas_page(request: Request, csrf: str, user_id: int | None, error: str 
                      f'{activate}{toggle}{delete}</div></article>')
     alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
     body = (f'<div class="page-heading"><div><p class="eyebrow">PERSONAS</p><h1>人格管理</h1></div>{picker}</div>'
-            f'{alert}<div class="toolbar"><span class="count">{len(personas)} 个</span>'
-            f'<a class="button primary" href="/admin/personas/new'
+            f'{alert}<div class="toolbar"><span class="count">{matched} 条匹配 · {len(personas)} 个人格</span>'
+            f'{search}<a class="button primary" href="/admin/personas/new'
             f'{"?" + urlencode({"user_id": user_id}) if user_id is not None else ""}">创建人格</a></div>'
-            f'<div class="card-list">{"".join(cards)}</div>')
+            f'<div class="card-list">{"".join(cards) or "<p class=\"empty\">没有匹配的人格</p>"}</div>{pager}')
     return _html(_layout("人格管理", "personas", body, csrf, user_id, settings),
                  status_code=400 if error else 200)
 

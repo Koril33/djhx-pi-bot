@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from admin import _FIELDS, apply_runtime_settings, router
 from config import Settings
 from costs import PriceResult
+from persona import DEFAULT_PERSONA
 from storage import Storage
 
 
@@ -75,6 +76,57 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(result.status_code, 303)
         send.assert_called_once()
         self.assertEqual(send.call_args.args[1], "admin@example.com")
+
+    def test_long_admin_lists_support_search_and_pagination(self):
+        for index in range(13):
+            self.storage.create_session(7, f"项目{index:02}")
+            self.storage.add_memory(7, f"记忆{index:02}", limit=100)
+        for index in range(11):
+            values = dict(DEFAULT_PERSONA)
+            values["name"] = f"人格{index:02}"
+            self.storage.create_persona(values)
+        agent = SimpleNamespace(client=SimpleNamespace(has_live_session=Mock(return_value=False)),
+                                memory=None)
+        self.manager.get = lambda user_id: agent
+        self.login()
+        sessions = self.client.get("/admin/sessions?user_id=7")
+        self.assertEqual(sessions.text.count('<article class="summary-card">'), 10)
+        self.assertIn("第 1/2 页", sessions.text)
+        second = self.client.get("/admin/sessions?user_id=7&page=2")
+        self.assertEqual(second.text.count('<article class="summary-card">'), 3)
+        selected = self.client.get("/admin/sessions?user_id=7&q=项目12")
+        self.assertIn("项目12", selected.text)
+        self.assertNotIn("项目11", selected.text)
+        self.assertIn("第 1/1 页", selected.text)
+        memories = self.client.get("/admin/memories?user_id=7&page=2")
+        self.assertEqual(memories.text.count('<article class="memory-card">'), 3)
+        self.assertIn("第 2/2 页", memories.text)
+        matching = self.client.get("/admin/memories?user_id=7&q=记忆12")
+        self.assertIn("记忆12", matching.text)
+        self.assertNotIn("记忆11", matching.text)
+        summaries = self.client.get("/admin/summaries?user_id=7&page=2")
+        self.assertEqual(summaries.text.count('<article class="summary-card">'), 3)
+        personas = self.client.get("/admin/personas?user_id=7&page=2")
+        self.assertEqual(personas.text.count('<article class="memory-card">'), 3)
+        persona_match = self.client.get("/admin/personas?user_id=7&q=人格10")
+        self.assertIn("人格10", persona_match.text)
+        self.assertNotIn("人格09", persona_match.text)
+        escaped = self.client.get("/admin/sessions?user_id=7&q=%3Cscript%3E")
+        self.assertIn("&lt;script&gt;", escaped.text)
+        self.assertNotIn("<script>", escaped.text)
+        run = self.storage.start_usage_run(7, None, None, None)
+        for seq in range(1, 23):
+            self.storage.record_usage_event(run, seq, {
+                "kind": "assistant", "occurred_at": 1, "provider": "paging", "model": "unpriced",
+                "usage": {"input": 1, "output": 0},
+            }, PriceResult("missing_rule"))
+        self.storage.finish_usage_run(run, "complete", None)
+        usage_first = self.client.get("/admin/usage?user_id=7&range=today")
+        self.assertIn("第 1/2 页 · 共 22 次", usage_first.text)
+        self.assertEqual(usage_first.text.count("缺少价格规则"), 20)
+        usage_second = self.client.get("/admin/usage?user_id=7&range=today&unpriced_page=2")
+        self.assertIn("第 2/2 页 · 共 22 次", usage_second.text)
+        self.assertEqual(usage_second.text.count("缺少价格规则"), 2)
 
     def test_failed_updates_show_safe_metadata_and_side_effect_risk(self):
         sid = self.storage.create_session(7, "诊断")
