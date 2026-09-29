@@ -341,10 +341,50 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0]["model"], "deepseek-flash")
         self.assertNotIn("--append-system-prompt", calls[0]["extra_args"])
         self.assertEqual(self.storage.get_summary(self.sid)["summary_text"], "用户已打招呼")
+        status = self.storage.get_summary_job_status(7, self.sid)
+        self.assertIsNotNone(status["last_success_at"])
+        self.assertIsNone(status["last_failure_at"])
+        self.assertIsNone(self.storage.get_summary_job_status(8, self.sid))
         self.assertEqual(self.storage.list_memories(7)[0]["text"], "用户喜欢中文交流")
         run = self.storage.get_last_usage_run(7)
         self.assertEqual(run["origin"], "memory_maintenance")
         self.assertEqual(len(self.storage.get_usage_events(run["id"])), 1)
+
+    async def test_summary_failure_is_saved_without_internal_error_text(self):
+        class FailingPi:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def prompt(self, text, on_usage=None):
+                if False:
+                    yield ""
+                raise RuntimeError("private diagnostic")
+
+            async def stop(self):
+                pass
+
+        with patch("memory.PiRpcClient", FailingPi):
+            await self.memory._summarize(7, self.sid)
+        status = self.storage.get_summary_job_status(7, self.sid)
+        self.assertIsNotNone(status["last_failure_at"])
+        self.assertEqual(status["last_failure_kind"], "RuntimeError")
+        self.assertNotIn("private", status["last_failure_kind"])
+
+    async def test_summary_status_command_shows_pending_and_recent_results(self):
+        self.storage.record_summary_job_result(
+            7, self.sid, success=False, failure_kind="TimeoutError",
+        )
+        manager = SimpleNamespace(memory=self.memory)
+        context = SimpleNamespace(args=["status"], bot_data={
+            "settings": self.settings, "storage": self.storage, "manager": manager,
+        })
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_summary(update, context)
+        body = reply.await_args.args[1]
+        self.assertIn("待处理完整回合：2", body)
+        self.assertIn("最近一次失败", body)
+        self.assertIn("TimeoutError", body)
 
     async def test_interruption_notice_is_acknowledged_only_after_delivery(self):
         self.storage.start_turn(7, self.sid, 999, "上次未完成", False)

@@ -94,6 +94,14 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     updated_at      REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS summary_job_status (
+    session_id      TEXT PRIMARY KEY,
+    user_id         INTEGER NOT NULL,
+    last_success_at REAL,
+    last_failure_at REAL,
+    last_failure_kind TEXT
+);
+
 CREATE TABLE IF NOT EXISTS memory_items (
     id           TEXT PRIMARY KEY,
     user_id      INTEGER NOT NULL,
@@ -652,6 +660,44 @@ class Storage:
     def get_summary(self, session_id: str) -> sqlite3.Row | None:
         rows = self._query("SELECT * FROM session_summaries WHERE session_id = ?", (session_id,))
         return rows[0] if rows else None
+
+    def get_summary_job_status(self, user_id: int, session_id: str) -> sqlite3.Row | None:
+        rows = self._query(
+            "SELECT * FROM summary_job_status WHERE user_id = ? AND session_id = ?",
+            (user_id, session_id),
+        )
+        return rows[0] if rows else None
+
+    def record_summary_job_result(
+        self, user_id: int, session_id: str, *, success: bool, failure_kind: str = "",
+    ) -> None:
+        now = time.time()
+        if success:
+            self._exec(
+                "INSERT INTO summary_job_status (session_id, user_id, last_success_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
+                "last_success_at = excluded.last_success_at",
+                (session_id, user_id, now),
+            )
+        else:
+            self._exec(
+                "INSERT INTO summary_job_status "
+                "(session_id, user_id, last_failure_at, last_failure_kind) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "last_failure_at = excluded.last_failure_at, "
+                "last_failure_kind = excluded.last_failure_kind",
+                (session_id, user_id, now, failure_kind[:40] or "unknown"),
+            )
+
+    def count_pending_summary_turns(self, session_id: str) -> int:
+        rows = self._query(
+            "SELECT count(*) AS count FROM conversation_turns "
+            "WHERE session_id = ? AND status = 'complete' "
+            "AND id > COALESCE((SELECT covered_turn_id FROM session_summaries "
+            "WHERE session_id = ?), 0)",
+            (session_id, session_id),
+        )
+        return rows[0]["count"]
 
     def pending_summary_turns(self, session_id: str) -> list[sqlite3.Row]:
         return self._query(

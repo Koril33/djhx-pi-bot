@@ -940,7 +940,7 @@ HELP_SECTIONS = {
         "/memory used [list|回合ID] — 查询本轮注入的记忆\n"
         "/memory edit <id> <内容> — 编辑记忆\n"
         "/memory delete <id> — 删除记忆\n"
-        "/summary [show|clear] — 查看或清空当前会话摘要"
+        "/summary [show|status|clear] — 查看摘要进度或清空摘要"
     ),
     "other": (
         "📊 用量与帮助\n"
@@ -2031,6 +2031,31 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await reply_text(update, "当前没有会话")
         return
     sub = context.args[0] if context.args else "show"
+    if sub == "status":
+        pending = storage.count_pending_summary_turns(active["id"])
+        job = storage.get_summary_job_status(user_id, active["id"])
+        tz = timezone(timedelta(hours=8))
+        def stamp(value):
+            return datetime.fromtimestamp(value, tz).strftime("%Y-%m-%d %H:%M") if value else "暂无"
+        success_at = job["last_success_at"] if job else None
+        failure_at = job["last_failure_at"] if job else None
+        running = manager.memory.summary_running(active["id"])
+        last_state = (
+            "最近一次成功" if success_at and (not failure_at or success_at > failure_at)
+            else "最近一次失败" if failure_at else "尚未执行"
+        )
+        message = (
+            f"📝 会话「{active['name']}」摘要状态\n"
+            f"待处理完整回合：{pending}（达到 {manager.memory.settings.memory_batch_turns} 轮后自动处理）\n"
+            f"任务：{'运行中或已排队' if running else '空闲'}"
+            + ("；全局自动摘要已关闭" if not manager.memory.settings.memory_auto_extract else "")
+            + f"\n最近结果：{last_state}"
+            + f"\n最近成功：{stamp(success_at)}"
+            + f"\n最近失败：{stamp(failure_at)}"
+            + (f"（{job['last_failure_kind']}）" if failure_at and job else "")
+        )
+        await reply_text(update, message)
+        return
     if sub == "show":
         row = storage.get_summary(active["id"])
         await reply_text(update, "📝 当前会话摘要\n" + (row["summary_text"] if row and row["summary_text"] else "暂无摘要"))
@@ -2070,7 +2095,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     logger.exception("摘要清空后刷新上下文失败", extra={"user_id": user_id})
         await reply_text(update, "已清空 SQLite 会话摘要；旧 pi JSONL 不会自动删除")
     else:
-        await reply_text(update, "用法：/summary [show|clear]")
+        await reply_text(update, "用法：/summary [show|status|clear]")
 
 
 async def _read_usage_stats(client: PiRpcClient) -> dict | None:

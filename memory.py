@@ -173,6 +173,10 @@ class MemoryService:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def summary_running(self, session_id: str) -> bool:
+        name = f"memory-summary-{session_id}"
+        return any(task.get_name() == name and not task.done() for task in self._tasks)
+
     async def shutdown(self) -> None:
         for task in self._tasks:
             task.cancel()
@@ -215,6 +219,9 @@ class MemoryService:
             remaining = budget - len(prefix.encode("utf-8"))
             if remaining < 1:
                 self._last_failure[session_id] = time.monotonic()
+                self.storage.record_summary_job_result(
+                    user_id, session_id, success=False, failure_kind="input_budget",
+                )
                 logger.error("摘要输入预算太小", extra={"session_id": session_id, "budget": budget})
                 return
             # 最早的未覆盖回合优先；超长批次下一轮继续。
@@ -285,11 +292,18 @@ class MemoryService:
                     turn_retention=self.settings.memory_turn_retention,
                 )
                 complete = True
+                self.storage.record_summary_job_result(user_id, session_id, success=True)
                 self._last_failure.pop(session_id, None)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 self._last_failure[session_id] = time.monotonic()
+                try:
+                    self.storage.record_summary_job_result(
+                        user_id, session_id, success=False, failure_kind=type(exc).__name__,
+                    )
+                except Exception:
+                    logger.exception("记录摘要失败状态失败", extra={"user_id": user_id, "session_id": session_id})
                 logger.exception("记忆摘要更新失败", extra={"user_id": user_id, "session_id": session_id})
             finally:
                 try:
