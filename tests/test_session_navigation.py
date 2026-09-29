@@ -34,6 +34,20 @@ class SessionNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.storage._conn.close()
         self.temp.cleanup()
 
+    async def test_auto_name_hides_sensitive_message_content(self):
+        for text in (
+            "请保存 password: dummy-value",
+            "联系 admin@example.com 查询进度",
+            "打开 https://example.com/reset?token=dummy",
+            "我的手机是 13800138000",
+        ):
+            self.assertEqual(bot.automatic_session_name(text), "私密会话")
+        self.assertEqual(bot.automatic_session_name("讨论归并排序的复杂度"), "讨论归并排序的复杂度")
+        sid = self.storage.create_session(9, "默认会话")
+        self.storage.set_active(sid)
+        await bot._auto_name_session(self.storage, 9, "密码: dummy-value")
+        self.assertEqual(self.storage.get_session(sid)["name"], "私密会话")
+
     async def test_list_paginates_with_navigation_buttons(self):
         self.context.args = ["list", "2"]
         with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:

@@ -398,13 +398,27 @@ def _render(text: str, activity_holder: dict | None) -> str:
     return text
 
 
+_PRIVATE_SESSION_TEXT = re.compile(
+    r"(?i)(?:password|passwd|api[_ -]?key|access[_ -]?token|secret|密码|密钥|令牌|验证码"
+    r"|https?://\S+|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"
+    r"|(?<!\d)1[3-9]\d{9}(?!\d)|(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,})"
+)
+
+
+def automatic_session_name(text: str) -> str:
+    """只取安全的短标题；疑似包含凭据或联系信息时使用中性名称。"""
+    if looks_secret(text) or _PRIVATE_SESSION_TEXT.search(text):
+        return "私密会话"
+    return " ".join(text.split())[:20] or "默认会话"
+
+
 async def _auto_name_session(storage: Storage, user_id: int, text: str) -> None:
-    """用第一条消息给「默认会话」自动命名，便于 /session list 辨认。"""
+    """用第一条消息给「默认会话」自动命名，不展示原始敏感片段。"""
     active = storage.get_active_session(user_id)
     if active and active["name"] == "默认会话" and text.strip():
-        short = text.strip().replace("\n", " ")[:20]
-        if short:
-            storage.rename_session(active["id"], short)
+        name = automatic_session_name(text)
+        if name != "默认会话":
+            storage.rename_session(active["id"], name)
 
 
 async def _send(
