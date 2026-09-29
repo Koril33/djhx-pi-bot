@@ -291,6 +291,13 @@ class Storage:
                     (key, json.dumps(value, ensure_ascii=False), time.time()),
                 )
 
+    def delete_runtime_settings(self, keys: set[str]) -> None:
+        if not keys:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany("DELETE FROM runtime_settings WHERE key = ?",
+                                   ((key,) for key in keys))
+
     def get_smtp_settings(self) -> sqlite3.Row | None:
         rows = self._query("SELECT host, port, username, password, from_address, updated_at "
                            "FROM smtp_settings WHERE id = 1")

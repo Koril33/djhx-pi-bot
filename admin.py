@@ -290,7 +290,7 @@ def _user_picker(storage: Storage, settings: Settings, user_id: int | None, path
 def _notice(request: Request) -> str:
     labels = {"saved": "已保存", "deleted": "已删除", "pinned": "已更新", "cleared": "已清空",
               "created": "会话已创建", "switched": "会话已切换", "recovered": "会话已从 SQLite 恢复",
-              "sent": "测试邮件已提交给 SMTP 服务器"}
+              "sent": "测试邮件已提交给 SMTP 服务器", "restored": "已恢复 .env 默认值"}
     value = labels.get(request.query_params.get("status", ""))
     return f'<p class="notice" role="status">{value}</p>' if value else ""
 
@@ -780,6 +780,8 @@ def _persona_form_page(request: Request, csrf: str, user_id: int | None, row=Non
 def _settings_page(request: Request, csrf: str, error: str = "") -> HTMLResponse:
     settings = _settings(request)
     saved = _storage(request).get_runtime_settings()
+    defaults = Settings()
+    overridden = {key for key in saved if key in _FIELD_KEYS or key == "memory_auto_extract"}
     groups = (
         ("自动整理", _FIELDS[:7]),
         ("记忆边界", _FIELDS[7:]),
@@ -787,15 +789,22 @@ def _settings_page(request: Request, csrf: str, error: str = "") -> HTMLResponse
     sections = []
     for group_name, fields in groups:
         rows = "".join(
-            f'<label class="setting-field"><span>{_e(label)}</span><span class="input-with-unit"><input type="number" name="{key}" min="{low}" max="{high}" value="{getattr(settings, key)}" required><span>{_e(unit)}</span></span></label>'
+            f'<label class="setting-field"><span>{_e(label)}</span><span class="input-with-unit"><input type="number" name="{key}" min="{low}" max="{high}" value="{getattr(settings, key)}" required><span>{_e(unit)}</span></span>'
+            f'{"<small>环境默认：" + str(getattr(defaults, key)) + "</small>" if key in overridden else ""}</label>'
             for key, label, unit, low, high in fields
         )
         sections.append(f'<section class="settings-group"><h2>{group_name}</h2><div class="settings-grid">{rows}</div></section>')
     checked = " checked" if settings.memory_auto_extract else ""
-    source = "SQLite" if saved else ".env"
+    source = "SQLite 覆盖" if overridden else ".env"
     alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
     body = f'''<div class="page-heading"><div><p class="eyebrow">CONFIGURATION</p><h1>记忆设置</h1></div><span class="source-label">{source}</span></div>{alert}
 <form method="post" action="/admin/settings" class="settings-form"><input type="hidden" name="csrf" value="{_e(csrf)}"><label class="switch-row"><span>自动提取</span><input type="checkbox" name="memory_auto_extract"{checked}></label>{''.join(sections)}<div class="form-footer"><button class="button primary" type="submit">保存设置</button></div></form>'''
+    if overridden:
+        body += (f'<details class="settings-restore"><summary>恢复 .env 默认值</summary>'
+                 f'<p>将移除 {len(overridden)} 项 SQLite 覆盖，并立即采用 .env 中的记忆参数。</p>'
+                 f'<form method="post" action="/admin/settings/restore">'
+                 f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                 '<button class="button danger" type="submit">确认恢复默认值</button></form></details>')
     return _html(_layout("记忆设置", "settings", body, csrf, None, settings), status_code=400 if error else 200)
 
 
@@ -1155,6 +1164,23 @@ async def save_settings(request: Request):
         setattr(settings, key, value)
     logger.info("后台更新记忆参数", extra={"keys": sorted(values)})
     return _redirect("/admin/settings?status=saved")
+
+
+@router.post("/settings/restore")
+async def restore_settings(request: Request):
+    csrf, _ = await _authorized_form(request)
+    settings, storage = _settings(request), _storage(request)
+    defaults = Settings()
+    values = {key: getattr(defaults, key) for key in _FIELD_KEYS | {"memory_auto_extract"}}
+    try:
+        _validated_candidate(settings, values)
+    except ValueError as exc:
+        return _settings_page(request, csrf, str(exc))
+    storage.delete_runtime_settings(_FIELD_KEYS | {"memory_auto_extract"})
+    for key, value in values.items():
+        setattr(settings, key, value)
+    logger.info("后台恢复 .env 记忆参数")
+    return _redirect("/admin/settings?status=restored")
 
 
 @router.get("/mail")

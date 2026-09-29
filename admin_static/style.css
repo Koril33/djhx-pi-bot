@@ -225,6 +225,11 @@ justify-content:space-between;
 align-items:center;
 gap:16px;
 color:var(--muted)}
+.setting-field{flex-wrap:wrap}
+.setting-field small{width:100%;text-align:right;color:var(--muted)}
+.settings-restore{margin-top:20px;padding:18px 22px;border:1px solid var(--line);border-radius:9px;background:var(--panel)}
+.settings-restore summary{cursor:pointer}
+.settings-restore p{color:var(--muted);line-height:1.6}
 .input-with-unit{display:flex;
 align-items:center;
 gap:9px;

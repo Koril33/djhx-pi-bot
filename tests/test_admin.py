@@ -1,4 +1,5 @@
 import re
+import os
 import asyncio
 from datetime import datetime, timedelta, timezone
 import tempfile
@@ -76,6 +77,29 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(result.status_code, 303)
         send.assert_called_once()
         self.assertEqual(send.call_args.args[1], "admin@example.com")
+
+    def test_memory_settings_restore_env_defaults(self):
+        self.storage.save_runtime_settings({
+            "memory_batch_turns": 9, "memory_auto_extract": False, "future_feature": 123,
+        })
+        self.settings.memory_batch_turns = 9
+        self.settings.memory_auto_extract = False
+        self.login()
+        page = self.client.get("/admin/settings")
+        csrf = self.csrf(page)
+        self.assertIn("SQLite 覆盖", page.text)
+        self.assertIn("恢复 .env 默认值", page.text)
+        self.assertEqual(self.client.post("/admin/settings/restore", data={"csrf": "wrong"}).status_code, 403)
+        with patch.dict(os.environ, {"MEMORY_BATCH_TURNS": "7"}):
+            result = self.client.post("/admin/settings/restore", data={"csrf": csrf},
+                                      follow_redirects=False)
+        self.assertEqual(result.status_code, 303)
+        self.assertEqual(self.settings.memory_batch_turns, 7)
+        self.assertTrue(self.settings.memory_auto_extract)
+        self.assertEqual(self.storage.get_runtime_settings(), {"future_feature": 123})
+        restored = self.client.get("/admin/settings?status=restored")
+        self.assertIn("已恢复 .env 默认值", restored.text)
+        self.assertNotIn("确认恢复默认值", restored.text)
 
     def test_long_admin_lists_support_search_and_pagination(self):
         for index in range(13):
