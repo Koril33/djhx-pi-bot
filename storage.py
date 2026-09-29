@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     has_image          INTEGER NOT NULL DEFAULT 0,
     status             TEXT NOT NULL DEFAULT 'running',
     interruption_notice_pending INTEGER NOT NULL DEFAULT 0,
+    injected_memory_json TEXT NOT NULL DEFAULT '[]',
     created_at         REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turns_session ON conversation_turns(session_id, id);
@@ -222,6 +223,10 @@ class Storage:
             if "interruption_notice_pending" not in turn_columns:
                 self._conn.execute(
                     "ALTER TABLE conversation_turns ADD COLUMN interruption_notice_pending INTEGER NOT NULL DEFAULT 0"
+                )
+            if "injected_memory_json" not in turn_columns:
+                self._conn.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN injected_memory_json TEXT NOT NULL DEFAULT '[]'"
                 )
             update_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(telegram_updates)")}
             if "acknowledged_at" not in update_columns:
@@ -562,6 +567,33 @@ class Storage:
                 (update_id,) if update_id is not None else (),
             ).fetchone()
             return row["id"]
+
+    def set_turn_memories(self, turn_id: int, memories: list[dict]) -> None:
+        """保存本轮准备注入的记忆快照；旧记忆编辑/删除后仍可追溯。"""
+        self._exec(
+            "UPDATE conversation_turns SET injected_memory_json = ? WHERE id = ?",
+            (json.dumps(memories, ensure_ascii=False), turn_id),
+        )
+
+    def get_turn_for_user(self, user_id: int, session_id: str, turn_id: int | None = None) -> sqlite3.Row | None:
+        if turn_id is None:
+            rows = self._query(
+                "SELECT * FROM conversation_turns WHERE user_id = ? AND session_id = ? "
+                "ORDER BY id DESC LIMIT 1", (user_id, session_id),
+            )
+        else:
+            rows = self._query(
+                "SELECT * FROM conversation_turns WHERE user_id = ? AND session_id = ? AND id = ?",
+                (user_id, session_id, turn_id),
+            )
+        return rows[0] if rows else None
+
+    def recent_turns_for_user(self, user_id: int, session_id: str, limit: int = 10) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT id, user_text, status, created_at FROM conversation_turns "
+            "WHERE user_id = ? AND session_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, session_id, limit),
+        )
 
     def append_turn_steer(self, turn_id: int, text: str) -> None:
         self._exec("UPDATE conversation_turns SET steer_text = steer_text || ? WHERE id = ?",

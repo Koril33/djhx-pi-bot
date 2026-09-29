@@ -48,6 +48,32 @@ class MemoryStorageTests(unittest.TestCase):
         self.storage._conn.close()
         self.folder.cleanup()
 
+    def test_used_memory_snapshot_only_includes_complete_context_items(self):
+        self.settings.memory_items_max_bytes = 1000
+        self.settings.memory_inject_max_bytes = 300
+        for index in range(3):
+            self.storage.add_memory(
+                7, f"记忆内容 {index} " + "甲" * 30, limit=4,
+            )
+        used = []
+        body = self.memory.build_context(7, self.sid, None, "", used)
+        self.assertEqual(len(used), 1)
+        self.assertIn("- " + used[0]["text"], body)
+        self.assertNotIn("记忆内容 1 " + "甲" * 30, body)
+        self.assertTrue(all(set(item) == {"id", "text", "source"} for item in used))
+
+    def test_turn_memory_snapshot_is_scoped_and_survives_memory_edit(self):
+        memory_id = self.storage.add_memory(7, "原始记忆", limit=4)
+        turn_id = self.storage.start_turn(7, self.sid, 12345, "测试", False)
+        self.storage.set_turn_memories(turn_id, [
+            {"id": memory_id, "text": "原始记忆", "source": "manual"},
+        ])
+        self.storage.edit_memory(7, memory_id, "更新后的记忆")
+        row = self.storage.get_turn_for_user(7, self.sid, turn_id)
+        self.assertEqual(json.loads(row["injected_memory_json"])[0]["text"], "原始记忆")
+        self.assertIsNone(self.storage.get_turn_for_user(8, self.sid, turn_id))
+        self.assertEqual(self.storage.recent_turns_for_user(7, self.sid)[0]["id"], turn_id)
+
     def test_memory_is_bounded_and_delete_removes_next_context(self):
         item_id = self.storage.add_memory(7, "我喜欢用中文回答", limit=4)
         self.storage.add_memory(7, "长期偏好：代码保持简洁", limit=4)
@@ -169,6 +195,30 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
         await self.memory.shutdown()
         self.storage._conn.close()
         self.folder.cleanup()
+
+    async def test_memory_used_command_reads_current_session_snapshot_only(self):
+        memory_id = self.storage.add_memory(7, "回合当时的记忆", limit=4)
+        turn_id = self.storage.start_turn(7, self.sid, 555, "本轮问题", False)
+        self.storage.set_turn_memories(turn_id, [
+            {"id": memory_id, "text": "回合当时的记忆", "source": "manual"},
+        ])
+        self.storage.finish_turn(turn_id, "回答", complete=True)
+        manager = SimpleNamespace(memory=self.memory)
+        context = SimpleNamespace(args=["used"], bot_data={
+            "settings": self.settings, "storage": self.storage, "manager": manager,
+        })
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_memory(update, context)
+            self.assertIn("回合当时的记忆", reply.await_args.args[1])
+            self.assertIn(f"#{turn_id}", reply.await_args.args[1])
+            context.args = ["used", "list"]
+            await bot.cmd_memory(update, context)
+            self.assertIn(f"#{turn_id}", reply.await_args.args[1])
+            context.args = ["used", str(turn_id)]
+            update.effective_user.id = 8
+            await bot.cmd_memory(update, context)
+            self.assertIn("当前没有会话", reply.await_args.args[1])
 
     async def test_memory_list_buttons_show_source_and_update_time(self):
         self.settings.memory_active_limit = 20

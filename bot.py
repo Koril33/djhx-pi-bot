@@ -936,7 +936,8 @@ HELP_SECTIONS = {
         "/persona use <id|none> [new] — 切换人格，可同时新建会话\n"
         "/memory — 查看记忆管理用法\n"
         "/memory add <内容> — 保存记忆\n"
-        "/memory list — 列出记忆\n"
+        "/memory list — 分页列出记忆\n"
+        "/memory used [list|回合ID] — 查询本轮注入的记忆\n"
         "/memory edit <id> <内容> — 编辑记忆\n"
         "/memory delete <id> — 删除记忆\n"
         "/summary [show|clear] — 查看或清空当前会话摘要"
@@ -1854,8 +1855,55 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             reply_markup=InlineKeyboardMarkup([nav]) if nav else None,
         )
         return
+    if sub == "used":
+        active = storage.get_active_session(user_id)
+        if active is None:
+            await reply_text(update, "当前没有会话")
+            return
+        if len(args) > 2:
+            await reply_text(update, "用法：/memory used [list|回合ID]")
+            return
+        if len(args) == 2 and args[1] == "list":
+            turns = storage.recent_turns_for_user(user_id, active["id"])
+            if not turns:
+                await reply_text(update, "当前会话没有可查询的近期回合")
+                return
+            lines = ["🧠 近期回合（只保留尚未被摘要清理的记录）"]
+            for turn in turns:
+                when = datetime.fromtimestamp(
+                    turn["created_at"], timezone(timedelta(hours=8)),
+                ).strftime("%m-%d %H:%M")
+                preview = " ".join(turn["user_text"].split())[:30] or "图片/附件"
+                lines.append(f"#{turn['id']} · {when} · {turn['status']} · {preview}")
+            lines.append("使用 /memory used <回合ID> 查看注入明细")
+            await reply_text(update, "\n".join(lines))
+            return
+        try:
+            turn_id = int(args[1]) if len(args) == 2 else None
+            if turn_id is not None and turn_id < 1:
+                raise ValueError()
+        except ValueError:
+            await reply_text(update, "用法：/memory used [list|回合ID]")
+            return
+        turn = storage.get_turn_for_user(user_id, active["id"], turn_id)
+        if turn is None:
+            await reply_text(update, "当前会话找不到该回合；旧回合可能已被摘要清理")
+            return
+        items = json.loads(turn["injected_memory_json"] or "[]")
+        status = "已完成" if turn["status"] == "complete" else "未完成"
+        lines = [f"🧠 回合 #{turn['id']} · {status}"]
+        if turn["status"] != "complete":
+            lines.append("以下是本轮准备注入的记忆；任务未完成，无法确认模型已读取。")
+        elif not items:
+            lines.append("本轮没有完整注入的长期记忆。")
+        for item in items:
+            source = {"auto": "自动提取", "manual": "手动添加"}.get(item["source"], "其他")
+            lines.append(f"• {item['id']}（{source}）：{item['text']}")
+        lines.append("仅记录 SQLite 长期记忆；会话摘要和 pi 历史不在此列表。")
+        await reply_text(update, "\n".join(lines))
+        return
     if sub not in {"add", "edit", "delete", "pin", "unpin"}:
-        await reply_text(update, "用法：/memory list [页码] | add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
+        await reply_text(update, "用法：/memory list [页码] | used [list|回合ID] | add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
         return
     agent = manager.get(user_id)
     async with agent.control_lock:
@@ -2423,9 +2471,12 @@ async def _process_text(
                             safe_turn_text(text, settings.memory_turn_user_chars), has_image,
                         )
                         agent.active_turn_id = memory_turn_id
+                        injected_memories: list[dict] = []
                         injected_bytes = memory.refresh_context(
                             user.id, memory_session_id, active["pi_session_file"], text,
+                            selection_holder=injected_memories,
                         )
+                        storage.set_turn_memories(memory_turn_id, injected_memories)
                         logger.info("记忆上下文已准备", extra={"user_id": user.id,
                                    "injected_bytes": injected_bytes})
                 except Exception:
