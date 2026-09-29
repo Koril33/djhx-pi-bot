@@ -27,7 +27,7 @@
 | UX-12 | /help 首屏精简，分类查看命令 | 已部署验证 | 04bd425：服务器 2 项测试通过；真实 /help 与 /help memory 更新 done，健康正常 |
 | UX-13 | 单环境时避免 /env use 的误导性“已切换” | 已部署验证 | 4649ca7：服务器 3 项帮助/环境测试通过；真实 /env use server 更新 done，健康正常 |
 | UX-14 | 模型列表显示当前项、提供商、能力与估算价格；选择无歧义 | 已部署验证 | 79a115f：服务器 5 项测试通过；真实 /model list 与完整 ID 切换均 done，模型偏好与健康正常 |
-| UX-15 | 图片模型不兼容时便捷切换并提示重发 | 进行中 | 快捷选择按钮已实现；待本地及线上验证 |
+| UX-15 | 图片模型不兼容时便捷切换并提示重发 | 已部署验证 | a239310：服务器 28 项图片测试通过；真实非图片模型+图片更新 done、无会话回合；已恢复原模型，健康正常 |
 | UX-16 | Telegram 会话列表分页、搜索、重命名 | 待做 | — |
 | UX-17 | 默认会话自动命名过滤敏感内容 | 待做 | — |
 | UX-18 | Telegram 人格列表可点击切换 | 待做 | — |
@@ -76,6 +76,8 @@
 | 2026-09-29 | UX-13 完成 | 147 项测试通过（首次完整测试出现偶发失败，重跑通过）；uv lock、py_compile、diff --check 通过 | 4649ca7；服务器 3 项帮助/环境测试通过；真实 /env use server 更新 done，/healthz 正常 | 下一项 UX-14；UX-09 真实 SMTP 仍等待授权测试邮箱 |
 
 | 2026-09-29 | UX-14 完成 | 149 项测试通过；uv lock、py_compile、diff --check 通过 | 79a115f；服务器 5 项模型测试通过；RPC 元数据确有价格与能力；真实 /model list、/model use deepseek/deepseek-flash 更新 done，用户偏好保持，/healthz 正常 | 下一项 UX-15；UX-09 真实 SMTP 仍等待授权测试邮箱 |
+
+| 2026-09-29 | UX-15 完成 | 149 项测试通过；uv lock、py_compile、diff --check 通过 | a239310；服务器 28 项图片测试通过；先切到 deepseek-v4-pro，再投递真实 Telegram 图片，更新 done、无会话回合；切回 deepseek-flash，/healthz 正常 | 下一项 UX-16；UX-09 真实 SMTP 仍等待授权测试邮箱 |
 
 ## 恢复工作时先做
 
