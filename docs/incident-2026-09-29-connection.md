@@ -10,7 +10,7 @@
 - 18:22 后，服务器到模型接口与 Telegram API 的 IPv4 HTTPS 连接均成功；隔离的 pi RPC 请求正常返回。
 - 通过真实 webhook 投递一条中性文字测试消息，更新状态为 `done`，会话回合与用量记录均为 `complete`，助手回复已发送。
 - 两条 Telegram 连接失败的更新已有失败通知发送记录；核对后标记为已处理，不重放可能产生副作用的旧更新。`/healthz` 随后显示 `ok=true`、`degraded=false`、失败更新数为 0。
-- 记录提交后按项目部署流程重启服务，并再次检查健康状态与真实文字回复。
+- 提交 `d8c1db3` 经 Gitea webhook 自动部署，服务于 18:29:54（北京时间）重新启动。重启后再次投递真实文字 webhook：HTTP 200、更新 `done`、会话回合 `complete`，助手成功发送简短回复；健康检查保持 `ok=true`、`degraded=false`，失败更新数为 0。
 
 ## 再次发生时
 
