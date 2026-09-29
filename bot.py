@@ -674,6 +674,7 @@ async def stream_reply(
     activity_holder: dict | None = None,
     initial_delay: float = 0.25,
     initial_chars: int = 16,
+    idle_interval: float = 12.0,
 ) -> None:
     """流式回复：合并增量后定时编辑，按 HTML 长度分段，不切断代码块。
 
@@ -693,6 +694,8 @@ async def stream_reply(
     first_delta_at: float | None = None
     first_text_rendered = False
     last_edit = 0.0
+    started_at = last_event_at = last_idle_emit = time.monotonic()
+    idle_status: str | None = None
 
     events: asyncio.Queue[tuple[str, object | None]] = asyncio.Queue()
     if activity_holder is not None:
@@ -712,7 +715,10 @@ async def stream_reply(
     producer = asyncio.create_task(produce())
 
     def consume_event(kind: str, value: object | None) -> None:
-        nonlocal buf, dirty, done, producer_error, first_delta_at
+        nonlocal buf, dirty, done, producer_error, first_delta_at, idle_status, last_event_at
+        if kind in {"delta", "activity"}:
+            last_event_at = time.monotonic()
+            idle_status = None
         if kind == "delta":
             if first_delta_at is None:
                 first_delta_at = time.monotonic()
@@ -732,7 +738,7 @@ async def stream_reply(
         nonlocal msg, buf, dirty, first_delta_at, first_text_rendered, last_edit
         if not dirty and not force:
             return
-        if not buf and (not activity_holder or not activity_holder.get("current")) and not first_text_rendered:
+        if not buf and not idle_status and (not activity_holder or not activity_holder.get("current")) and not first_text_rendered:
             # 工具可能在首次刷新前已开始并结束。清除空刷新标记，
             # 否则截止时间一过会在 while 循环中无 await 地占满事件循环。
             dirty = False
@@ -755,7 +761,10 @@ async def stream_reply(
                 msg = await _send(target.reply_text, "…")
             buf = chunks[-1]
 
-        rendered = _render(buf, activity_holder) or "🤔 正在处理…"
+        rendered = _render(buf, activity_holder)
+        if idle_status:
+            rendered = f"{rendered}\n\n{idle_status}" if rendered else idle_status
+        rendered = rendered or "🤔 正在处理…"
         if msg is None:
             msg = await _send(target.reply_text, rendered)
         else:
@@ -789,13 +798,25 @@ async def stream_reply(
                     await flush()
                     continue
 
+            next_idle = max(last_event_at, last_idle_emit) + max(0.01, idle_interval)
+            idle_timeout = max(0.0, next_idle - time.monotonic())
+            timeout = min(timeout, idle_timeout) if timeout is not None else idle_timeout
             try:
-                if timeout is None:
-                    kind, value = await events.get()
-                else:
-                    kind, value = await asyncio.wait_for(events.get(), timeout=timeout)
+                kind, value = await asyncio.wait_for(events.get(), timeout=timeout)
             except asyncio.TimeoutError:
-                await flush()
+                now = time.monotonic()
+                if now >= next_idle and events.empty():
+                    elapsed = max(0, int(now - started_at))
+                    phase = (
+                        "等待工具完成" if activity_holder and activity_holder.get("current")
+                        else "等待模型响应" if not buf else "继续生成回复"
+                    )
+                    idle_status = f"⏳ {phase} · 已进行 {elapsed // 60}分{elapsed % 60}秒"
+                    last_idle_emit = now
+                    dirty = True
+                    await flush(force=True)
+                else:
+                    await flush()
                 continue
 
             consume_event(kind, value)
@@ -804,7 +825,10 @@ async def stream_reply(
                 queued_kind, queued_value = events.get_nowait()
                 consume_event(queued_kind, queued_value)
 
-        # 回合结束时立即刷新 dirty 内容，不等待下一个定时周期。
+        # 回合结束时移除等待状态，并立即刷新 dirty 内容。
+        if idle_status:
+            idle_status = None
+            dirty = True
         if activity_holder is not None and activity_holder.get("current"):
             activity_holder["current"] = None
             dirty = True

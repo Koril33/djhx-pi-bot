@@ -83,6 +83,49 @@ class StreamReplyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(split_calls, 1)
 
+    async def test_idle_period_shows_elapsed_phase_then_clears_on_text(self) -> None:
+        calls = []
+
+        async def fake_send(send_fn, text, *, edit=False, msg=None, reply_markup=None):
+            calls.append(text)
+            return True if edit else _SentMessage()
+
+        async def deltas():
+            await asyncio.sleep(0.08)
+            yield "最终回复"
+
+        with patch.object(bot, "_send", side_effect=fake_send):
+            await bot.stream_reply(
+                _FakeUpdate(), deltas(), interval=0,
+                initial_delay=0, idle_interval=0.02,
+            )
+        self.assertTrue(any("等待模型响应" in call and "已进行" in call for call in calls))
+        self.assertEqual(calls[-1], "最终回复")
+
+    async def test_idle_tool_phase_uses_generic_label(self) -> None:
+        calls = []
+        activity = {"current": None}
+
+        async def fake_send(send_fn, text, *, edit=False, msg=None, reply_markup=None):
+            calls.append(text)
+            return True if edit else _SentMessage()
+
+        async def deltas():
+            activity["current"] = "🔧 正在调用工具"
+            activity["notify"]()
+            await asyncio.sleep(0.07)
+            activity["current"] = None
+            activity["notify"]()
+            yield "完成"
+
+        with patch.object(bot, "_send", side_effect=fake_send):
+            await bot.stream_reply(
+                _FakeUpdate(), deltas(), interval=0,
+                initial_delay=0, idle_interval=0.02, activity_holder=activity,
+            )
+        self.assertTrue(any("等待工具完成" in call for call in calls))
+        self.assertEqual(calls[-1], "完成")
+
     async def test_empty_timeout_has_readable_error(self) -> None:
         calls: list[tuple[str, bool]] = []
 
