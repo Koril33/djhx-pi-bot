@@ -885,7 +885,7 @@ HELP_SECTIONS = {
     "memory": (
         "🧠 人格与记忆\n"
         "/persona list — 列出人格\n"
-        "/persona use <id|none> — 切换人格\n"
+        "/persona use <id|none> [new] — 切换人格，可同时新建会话\n"
         "/memory — 查看记忆管理用法\n"
         "/memory add <内容> — 保存记忆\n"
         "/memory list — 列出记忆\n"
@@ -1293,34 +1293,39 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         active = storage.get_active_persona(user.id)
         if sub == "current":
             current = f"{active['name']} ({active['id']})" if active is not None else "无人格（Pi 默认）"
-            await reply_text(update, f"当前人格：{current}\n用法：/persona list | /persona use <id|none>")
+            await reply_text(update, f"当前人格：{current}\n用法：/persona list | /persona use <id|none> [new]")
             return
         rows = [row for row in storage.list_personas() if row["enabled"]]
         lines = ["可用人格：", f"{'●' if active is None else '○'} 无人格（Pi 默认）(none)"] + [
             f"{'●' if active is not None and row['id'] == active['id'] else '○'} {row['name']} ({row['id']})"
             for row in rows
         ]
-        lines.append("点击下方按钮切换，或使用 /persona use <id|none>。")
-        buttons = [[InlineKeyboardButton(
-            f"{'●' if active is None else '○'} 无人格（Pi 默认）", callback_data="persona_use:none",
-        )]]
+        lines.append("切换当前会话会保留旧对话历史；新会话使用会隔离旧对话，但长期记忆仍可能作为背景。")
+        lines.append("命令：/persona use <id|none> [new]")
+        buttons = [[
+            InlineKeyboardButton("无人格·当前会话", callback_data="persona_use:none"),
+            InlineKeyboardButton("无人格·新会话", callback_data="persona_new:none"),
+        ]]
         buttons.extend([
-            [InlineKeyboardButton(
-                f"{'●' if active is not None and row['id'] == active['id'] else '○'} {row['name']}"[:50],
-                callback_data=f"persona_use:{row['id']}",
-            )]
+            [
+                InlineKeyboardButton(f"{row['name']}"[:25], callback_data=f"persona_use:{row['id']}"),
+                InlineKeyboardButton("新会话使用", callback_data=f"persona_new:{row['id']}"),
+            ]
             for row in rows
         ])
         await reply_text(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
         return
-    if sub != "use" or len(args) != 2:
-        await reply_text(update, "用法：/persona current | /persona list | /persona use <id|none>")
+    if sub != "use" or len(args) not in {2, 3} or (len(args) == 3 and args[2] != "new"):
+        await reply_text(update, "用法：/persona current | /persona list | /persona use <id|none> [new]")
         return
+    new_session = len(args) == 3
     agent = context.bot_data["manager"].get(user.id)
     async with agent.control_lock:
         if agent.client.busy or agent.prompt_pending or storage.count_user_queue(user.id):
             await reply_text(update, "⏳ 仍有运行或排队的消息；请等待完成，或用 /stop 和 /queue clear 后再切换人格")
             return
+        previous = storage.get_active_persona(user.id)
+        previous_id = previous["id"] if previous is not None else "none"
         try:
             storage.set_active_persona(user.id, args[1])
         except ValueError as exc:
@@ -1328,7 +1333,30 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         selected = storage.get_active_persona(user.id)
         name = selected["name"] if selected is not None else "无人格（Pi 默认）"
-        await reply_text(update, f"已切换人格：{name}。下一条消息起生效。")
+        if new_session:
+            try:
+                sid = await create_user_session(agent, storage, user.id, (name + " 会话")[:60])
+            except Exception as exc:
+                storage.set_active_persona(user.id, previous_id)
+                try:
+                    await agent.refresh_persona()
+                except Exception:
+                    logger.exception("新会话失败后恢复人格提示失败", extra={"user_id": user.id})
+                logger.exception("人格切换并新建会话失败", extra={"user_id": user.id})
+                await reply_text(update, f"新建会话失败，已恢复原人格：{_friendly_error(exc)}")
+                return
+            await reply_text(
+                update,
+                f"✅ 已切换人格：{name}，并新建会话 {sid}。旧对话历史不会带入新会话；"
+                "长期记忆仍可能作为背景。",
+            )
+            return
+        await reply_text(
+            update,
+            f"已切换人格：{name}。下一条消息起生效；当前会话的旧对话历史仍会保留，"
+            "可能影响新回复。需要隔离历史可用 /persona use <id|none> new。",
+        )
+
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1845,6 +1873,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if data.startswith("persona_use:"):
         context.args = ["use", data.split(":", 1)[1]]
+        await cmd_persona(update, context)
+        return
+    if data.startswith("persona_new:"):
+        context.args = ["use", data.split(":", 1)[1], "new"]
         await cmd_persona(update, context)
         return
     if data.startswith("mail_confirm:"):

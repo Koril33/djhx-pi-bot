@@ -161,6 +161,31 @@ class PersonaAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.storage.get_active_persona(7))
         self.assertIn("无人格", reply.call_args.args[1])
 
+    async def test_persona_new_session_is_created_and_rollback_on_failure(self):
+        new_id = self.storage.create_persona({"name": "工作伙伴", "identity": "你是工作伙伴。"})
+        agent = SimpleNamespace(
+            control_lock=asyncio.Lock(), client=SimpleNamespace(busy=False),
+            prompt_pending=False, refresh_persona=AsyncMock(),
+        )
+        context = SimpleNamespace(args=["use", new_id, "new"], bot_data={
+            "storage": self.storage, "manager": SimpleNamespace(get=lambda user_id: agent),
+        })
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        with patch("bot.create_user_session", new_callable=AsyncMock, return_value="new-sid") as create:
+            with patch("bot.reply_text", new_callable=AsyncMock) as reply:
+                await cmd_persona(update, context)
+        create.assert_awaited_once_with(agent, self.storage, 7, "工作伙伴 会话")
+        self.assertIn("旧对话历史不会带入", reply.await_args.args[1])
+        self.assertEqual(self.storage.get_active_persona(7)["id"], new_id)
+
+        self.storage.set_active_persona(7, "default")
+        with patch("bot.create_user_session", new_callable=AsyncMock, side_effect=RuntimeError("failed")):
+            with patch("bot.reply_text", new_callable=AsyncMock) as reply:
+                await cmd_persona(update, context)
+        self.assertEqual(self.storage.get_active_persona(7)["id"], "default")
+        agent.refresh_persona.assert_awaited_once()
+        self.assertIn("已恢复原人格", reply.await_args.args[1])
+
     async def test_admin_test_uses_isolated_tool_free_pi(self):
         async def answer(_question, *, on_usage):
             yield "你好，小丁。"
