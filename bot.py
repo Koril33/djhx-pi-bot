@@ -106,7 +106,7 @@ def md_to_html(text: str) -> str:
         body = m.group(2).rstrip("\n")
         lang = m.group(1).strip().lower()
         if lang in _PRE_LANGS:
-            return stash(f'<pre language="{lang}">{escape(body, quote=False)}</pre>')
+            return stash(f'<pre><code class="language-{lang}">{escape(body, quote=False)}</code></pre>')
         return stash(f"<pre>{escape(body, quote=False)}</pre>")
 
     text = re.sub(r"```(\w*)[ \t]*\n(.*?)```", _fence, text, flags=re.S)
@@ -181,7 +181,7 @@ def md_to_html(text: str) -> str:
     # 8) 链接 [text](url) → <a href="url">text</a>（仅 http/https/tg 协议）
     def _link(m: re.Match) -> str:
         url, label = m.group(2), m.group(1)
-        return stash(f'<a href="{escape(url, quote=False)}">{escape(label)}</a>')
+        return stash(f'<a href="{escape(url, quote=True)}">{escape(label)}</a>')
 
     text = re.sub(r"\[([^\[\]\n]+)\]\((https?://[^)\s]+|tg://[^)\s]+)\)", _link, text)
 
@@ -282,6 +282,12 @@ def split_markdown(text: str, max_html_len: int = MAX_HTML_LEN) -> list[str]:
                     high = mid - 1
             if not best:
                 raise ValueError("Telegram 消息长度上限不足以容纳一个字符")
+            if best < len(line):
+                # 将完整链接留在同一段；超长链接无法整体容纳时按普通文本拆开。
+                for match in re.finditer(r"\[[^\[\]\n]+\]\((?:https?://|tg://)[^)\s]+\)", line):
+                    if match.start() < best < match.end() and match.start() > 0:
+                        best = match.start()
+                        break
             parts.append(prefix + line[:best] + suffix)
             line = line[best:]
         return parts
@@ -342,8 +348,12 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r"~~([^~\n]+?)~~", r"\1", text)
     # 行内代码
     text = re.sub(r"`([^`\n]+)`", r"\1", text)
-    # 链接 [text](url) → text
-    text = re.sub(r"\[([^\[\]\n]+)\]\((?:https?://|tg://)[^)\s]+\)", r"\1", text)
+    # 降级纯文本仍保留目标地址，方便点击失败时复制。
+    text = re.sub(
+        r"\[([^\[\]\n]+)\]\(((?:https?://|tg://)[^)\s]+)\)",
+        lambda m: m.group(1) if m.group(1) == m.group(2) else f"{m.group(1)} ({m.group(2)})",
+        text,
+    )
     # 标题标记
     text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
     # 引用标记

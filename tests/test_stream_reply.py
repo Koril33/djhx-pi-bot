@@ -271,6 +271,28 @@ class MarkdownSplitTests(unittest.TestCase):
         self.assertIn("<pre", html)
         self.assertNotIn("第 1 项", html)
 
+    def test_code_language_uses_telegram_supported_html(self) -> None:
+        html = bot.md_to_html("```python\nprint(1)\n```")
+        self.assertEqual(html, '<pre><code class="language-python">print(1)</code></pre>')
+
+    def test_link_target_is_escaped_and_plain_fallback_keeps_url(self) -> None:
+        source = '[说明](https://example.com/path?q="a"&x=1)'
+        html = bot.md_to_html(source)
+        self.assertIn('href="https://example.com/path?q=&quot;a&quot;&amp;x=1"', html)
+        self.assertEqual(
+            bot.strip_markdown(source),
+            '说明 (https://example.com/path?q="a"&x=1)',
+        )
+
+    def test_long_line_does_not_split_valid_link(self) -> None:
+        link = "[参考资料](https://example.com/path?q=one&x=two)"
+        text = "A" * 3860 + " " + link + " " + "Z" * 100
+        chunks = bot.split_markdown(text)
+        self.assertEqual("".join(chunks), text)
+        self.assertEqual(sum(chunk.count(link) for chunk in chunks), 1)
+        self.assertTrue(any("<a href=" in bot.md_to_html(chunk) for chunk in chunks))
+        self.assertTrue(all(len(bot.md_to_html(chunk)) <= bot.MAX_HTML_LEN for chunk in chunks))
+
     def test_long_single_line_is_bounded(self) -> None:
         text = "<" * 5000
         chunks = bot.split_markdown(text)
