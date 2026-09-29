@@ -76,6 +76,18 @@ class AdminTests(unittest.TestCase):
         send.assert_called_once()
         self.assertEqual(send.call_args.args[1], "admin@example.com")
 
+    def test_overview_shows_refresh_time_and_refreshes_status(self):
+        self.login()
+        first = self.client.get("/admin/overview?user_id=7")
+        self.assertEqual(first.status_code, 200)
+        self.assertIn("数据读取于", first.text)
+        self.assertRegex(first.text, r'<time datetime="[^"]+">\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} 北京时间</time>')
+        self.assertIn('action="/admin/overview" class="overview-refresh"', first.text)
+        self.assertIn('name="user_id" value="7"', first.text)
+        self.storage.enqueue_update(991, '{"update_id":991}')
+        refreshed = self.client.get("/admin/overview?user_id=7")
+        self.assertIn("待处理更新</span><strong>1</strong>", refreshed.text)
+
     def test_failed_update_can_be_acknowledged_without_deleting_dedup_id(self):
         self.storage.enqueue_update(900, '{"update_id":900}')
         self.storage.fail_update(900, "network")

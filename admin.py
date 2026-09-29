@@ -345,7 +345,14 @@ def _overview_page(request: Request, csrf: str, user_id: int | None) -> HTMLResp
                       f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
                       f'<button class="text-button" type="submit">标记已处理</button></form></div>')
     failure_html = "".join(failed) or '<p class="empty small">没有失败更新</p>'
-    body = (f'<div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1>概览</h1></div>{picker}</div>'
+    refreshed_at = datetime.now(_CST)
+    refresh = (f'<form method="get" action="/admin/overview" class="overview-refresh">'
+               + (f'<input type="hidden" name="user_id" value="{user_id}">' if user_id is not None else "")
+               + '<button class="button subtle" type="submit">刷新</button></form>')
+    body = (f'<div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1>概览</h1></div>'
+            f'<div class="overview-actions">{picker}{refresh}</div></div>'
+            f'<p class="overview-timestamp">数据读取于 <time datetime="{refreshed_at.isoformat()}">'
+            f'{refreshed_at.strftime("%Y-%m-%d %H:%M:%S")} 北京时间</time></p>'
             f'<div class="metric-grid">{cards_html}</div>'
             f'<section class="section-block"><div class="section-head"><h2>最近失败更新</h2>'
             f'<span class="muted">仅展示故障类型，不自动重放</span></div><div class="simple-list">{failure_html}</div></section>')

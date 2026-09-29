@@ -342,6 +342,8 @@ width:0}
 .usage-filters select,.usage-filters input{width:100%;min-width:0;color:var(--text)}
 .usage-filters .button{min-height:42px}
 .usage-caption{color:var(--muted);font-size:12px;margin:16px 0 0;line-height:1.7}
+.overview-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.overview-timestamp{margin:-8px 0 20px;color:var(--muted);font-size:12px}
 .mail-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:19px 30px}
 .mail-field{display:grid;gap:8px;min-width:0;color:var(--muted);font-size:12px}
 .mail-field input,.mail-field select{width:100%;min-width:0;color:var(--text)}
