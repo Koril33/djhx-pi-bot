@@ -478,7 +478,7 @@ class Storage:
 
     def list_sessions(self, user_id: int) -> list[sqlite3.Row]:
         return self._query(
-            "SELECT * FROM sessions WHERE user_id = ? ORDER BY updated_at DESC",
+            "SELECT * FROM sessions WHERE user_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC",
             (user_id,),
         )
 

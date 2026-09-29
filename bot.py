@@ -860,7 +860,9 @@ HELP_SECTIONS = {
     "sessions": (
         "📁 会话、模型与环境\n"
         "/session new [名称] — 新建会话\n"
-        "/session list — 列出会话\n"
+        "/session list [页码] — 分页列出会话\n"
+        "/session search <关键词> — 搜索会话\n"
+        "/session rename <id> <名称> — 重命名\n"
         "/session use <id> — 切换会话\n"
         "/model list — 列出可用模型\n"
         "/model use <model_id> — 切换模型\n"
@@ -1038,6 +1040,46 @@ async def switch_user_session(agent: AgentSession, storage: Storage, user_id: in
     return notice
 
 
+SESSION_PAGE_SIZE = 8
+
+
+def session_list_view(
+    rows, page: int, query: str = "",
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    if query:
+        folded = query.casefold()
+        rows = [row for row in rows if folded in row["name"].casefold() or folded in row["id"].casefold()]
+    total = len(rows)
+    if not total:
+        return ("没有匹配的会话" if query else "还没有会话，用 /session new 创建"), None
+    pages = (total + SESSION_PAGE_SIZE - 1) // SESSION_PAGE_SIZE
+    page = min(max(1, page), pages)
+    current = rows[(page - 1) * SESSION_PAGE_SIZE:page * SESSION_PAGE_SIZE]
+    title = f"📁 {'搜索结果' if query else '会话列表'} · 第 {page}/{pages} 页（共 {total} 条）"
+    lines = [title]
+    buttons = []
+    for row in current:
+        marker = "▶ " if row["status"] == "active" else ""
+        lines.append(f"{marker}{row['name']} · {row['id']}")
+        buttons.append([InlineKeyboardButton(
+            f"{marker}{row['name']}"[:40], callback_data=f"session_use:{row['id']}",
+        )])
+    nav = []
+    for target, label in ((page - 1, "← 上一页"), (page + 1, "下一页 →")):
+        if not 1 <= target <= pages:
+            continue
+        data = f"session_find:{target}:{query}" if query else f"session_page:{target}"
+        if len(data.encode("utf-8")) <= 64:
+            nav.append(InlineKeyboardButton(label, callback_data=data))
+    if nav:
+        buttons.append(nav)
+    if query:
+        lines.append("继续搜索：/session search <关键词> [--page 页码]")
+    else:
+        lines.append("搜索：/session search <关键词>；重命名：/session rename <id> <名称>")
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
 async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     settings = context.bot_data["settings"]
@@ -1061,16 +1103,43 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await reply_text(update, f"✅ 已新建会话「{name}」\nID: {sid}")
 
-    elif sub == "list":
-        rows = storage.list_sessions(user.id)
-        if not rows:
-            await reply_text(update, "还没有会话，用 /session new 创建")
+    elif sub in {"list", "search"}:
+        if sub == "list":
+            if len(args) > 2 or (len(args) == 2 and (not args[1].isdigit() or int(args[1]) < 1)):
+                await reply_text(update, "用法：/session list [页码]")
+                return
+            page, query = (int(args[1]) if len(args) == 2 else 1), ""
+        else:
+            search_args = args[1:]
+            page = 1
+            if len(search_args) >= 3 and search_args[-2] == "--page":
+                if not search_args[-1].isdigit() or int(search_args[-1]) < 1:
+                    await reply_text(update, "页码须为正整数")
+                    return
+                page = int(search_args[-1])
+                search_args = search_args[:-2]
+            query = " ".join(search_args).strip()
+            if not query or len(query) > 80:
+                await reply_text(update, "用法：/session search <关键词> [--page 页码]（关键词最多 80 字）")
+                return
+        text, buttons = session_list_view(storage.list_sessions(user.id), page, query)
+        await reply_text(update, text, reply_markup=buttons)
+
+    elif sub == "rename":
+        if len(args) < 3:
+            await reply_text(update, "用法：/session rename <id> <新名称>")
             return
-        buttons = []
-        for r in rows:
-            marker = "▶ " if r["status"] == "active" else ""
-            buttons.append([InlineKeyboardButton(f"{marker}{r['name']}", callback_data=f"session_use:{r['id']}")])
-        await reply_text(update, "📁 会话列表（点击切换）：", reply_markup=InlineKeyboardMarkup(buttons))
+        sid = args[1]
+        row = storage.get_session(sid)
+        if row is None or row["user_id"] != user.id:
+            await reply_text(update, "找不到属于你的会话")
+            return
+        name = " ".join(args[2:]).strip()
+        if not 1 <= len(name) <= 60 or any(ord(char) < 32 for char in name):
+            await reply_text(update, "会话名称须为 1–60 个字符，且不能包含换行")
+            return
+        storage.rename_session(sid, name)
+        await reply_text(update, f"✅ 已将会话 {sid} 重命名为「{name}」")
 
     elif sub == "use":
         if len(args) < 2:
@@ -1091,7 +1160,7 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
                              + (f"\n{notice}" if notice else ""))
 
     else:
-        await reply_text(update, "用法：/session new [名称] | /session list | /session use <id>")
+        await reply_text(update, "用法：/session new [名称] | list [页码] | search <关键词> | rename <id> <名称> | use <id>")
 
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1730,6 +1799,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data.startswith("help:"):
         context.args = [data.split(":", 1)[1]]
         await cmd_help(update, context)
+        return
+    # 会话分页与搜索
+    if data.startswith("session_page:"):
+        context.args = ["list", data.split(":", 1)[1]]
+        await cmd_session(update, context)
+        return
+    if data.startswith("session_find:"):
+        _, page, query = data.split(":", 2)
+        context.args = ["search", query, "--page", page]
+        await cmd_session(update, context)
         return
     # 列表按钮直接触发切换操作
     if data.startswith("session_use:"):
