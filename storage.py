@@ -625,6 +625,21 @@ class Storage:
                 (session_id, covered_id, session_id, turn_retention),
             )
 
+    def clear_summary_if_unchanged(self, session_id: str, updated_at: float) -> bool:
+        """确认后仅清空预览时的版本，且同步清除对应恢复上下文。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE session_summaries SET summary_text = '', updated_at = ? "
+                "WHERE session_id = ? AND updated_at = ? AND summary_text <> ''",
+                (time.time(), session_id, updated_at),
+            )
+            if cur.rowcount:
+                self._conn.execute(
+                    "UPDATE session_recovery SET context_text = '' WHERE session_id = ?",
+                    (session_id,),
+                )
+            return cur.rowcount == 1
+
     def clear_summary(self, session_id: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("UPDATE session_summaries SET summary_text = '', updated_at = ? WHERE session_id = ?",
@@ -669,6 +684,15 @@ class Storage:
                 "WHERE user_id = ? AND id = ?", (item, digest, time.time(), user_id, memory_id),
             )
             return cur.rowcount > 0
+
+    def delete_memory_if_unchanged(self, user_id: int, memory_id: str, updated_at: float) -> bool:
+        """确认后仅删除预览时的版本，避免旧按钮删除后来编辑的内容。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM memory_items WHERE user_id = ? AND id = ? AND updated_at = ?",
+                (user_id, memory_id, updated_at),
+            )
+            return cur.rowcount == 1
 
     def delete_memory(self, user_id: int, memory_id: str) -> bool:
         with self._lock, self._conn:

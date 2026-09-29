@@ -1777,7 +1777,26 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 return
             memory_id = args[1]
             if sub == "delete":
-                changed = storage.delete_memory(user_id, memory_id)
+                row = storage.get_memory(user_id, memory_id)
+                if row is None:
+                    await reply_text(update, "找不到这条记忆")
+                    return
+                version = str(row["updated_at"])
+                if len(args) == 2:
+                    await reply_text(
+                        update,
+                        f"确认删除这条记忆？\n{row['text'][:500]}\n"
+                        "删除后不会再主动注入；旧会话历史中的相同内容不会自动消失。",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("确认删除", callback_data=f"memory_delete_confirm:{memory_id}:{version}"),
+                            InlineKeyboardButton("取消", callback_data="confirm_cancel"),
+                        ]]),
+                    )
+                    return
+                if len(args) != 4 or args[2] != "confirm" or args[3] != version:
+                    await reply_text(update, "预览已过期或记忆已变化；请重新用 /memory delete <id> 预览")
+                    return
+                changed = storage.delete_memory_if_unchanged(user_id, memory_id, row["updated_at"])
                 result = f"已删除记忆 {memory_id}；旧会话历史中相同信息仍可能存在"
             else:
                 changed = storage.pin_memory(user_id, memory_id, sub == "pin")
@@ -1812,16 +1831,40 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         row = storage.get_summary(active["id"])
         await reply_text(update, "📝 当前会话摘要\n" + (row["summary_text"] if row and row["summary_text"] else "暂无摘要"))
     elif sub == "clear":
+        args = context.args or []
+        row = storage.get_summary(active["id"])
+        if row is None or not row["summary_text"]:
+            await reply_text(update, "当前没有可清空的 SQLite 会话摘要")
+            return
+        version = str(row["updated_at"])
+        if len(args) == 1:
+            await reply_text(
+                update,
+                f"确认清空会话「{active['name']}」的 SQLite 摘要？\n"
+                f"当前摘要预览：{row['summary_text'][:500]}\n"
+                "旧 pi JSONL 和已经压缩的内容不会删除。",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("确认清空", callback_data=f"summary_clear_confirm:{active['id']}:{version}"),
+                    InlineKeyboardButton("取消", callback_data="confirm_cancel"),
+                ]]),
+            )
+            return
+        if len(args) != 4 or args[1] != "confirm" or args[2] != active["id"] or args[3] != version:
+            await reply_text(update, "预览已过期或会话已变化；请重新用 /summary clear 预览")
+            return
         agent = manager.get(user_id)
         async with agent.control_lock:
-            storage.clear_summary(active["id"])
+            current = storage.get_active_session(user_id)
+            if current is None or current["id"] != active["id"] or not storage.clear_summary_if_unchanged(active["id"], row["updated_at"]):
+                await reply_text(update, "摘要或当前会话已变化，未清空；请重新预览")
+                return
             if not agent.client.busy:
                 try:
                     manager.memory.refresh_context(user_id, active["id"], active["pi_session_file"])
                 except Exception:
                     manager.memory.clear_context(user_id)
                     logger.exception("摘要清空后刷新上下文失败", extra={"user_id": user_id})
-        await reply_text(update, "已清空 SQLite 会话摘要；已压缩的旧内容无法仅靠数据库重建，旧 pi JSONL 不会自动删除")
+        await reply_text(update, "已清空 SQLite 会话摘要；旧 pi JSONL 不会自动删除")
     else:
         await reply_text(update, "用法：/summary [show|clear]")
 
@@ -1878,6 +1921,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data.startswith("persona_new:"):
         context.args = ["use", data.split(":", 1)[1], "new"]
         await cmd_persona(update, context)
+        return
+    if data == "confirm_cancel":
+        await reply_text(update, "已取消，没有修改数据")
+        return
+    if data.startswith("memory_delete_confirm:"):
+        _, memory_id, version = data.split(":", 2)
+        context.args = ["delete", memory_id, "confirm", version]
+        await cmd_memory(update, context)
+        return
+    if data.startswith("summary_clear_confirm:"):
+        _, session_id, version = data.split(":", 2)
+        context.args = ["clear", "confirm", session_id, version]
+        await cmd_summary(update, context)
         return
     if data.startswith("mail_confirm:"):
         context.args = ["confirm", data.split(":", 1)[1]]

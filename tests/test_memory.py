@@ -250,8 +250,59 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
             await bot.cmd_memory(wrong_user, context)
             self.assertIsNotNone(self.storage.get_memory(7, memory_id))
             await bot.cmd_memory(right_user, context)
+            self.assertIsNotNone(self.storage.get_memory(7, memory_id))
+            self.assertIn("确认删除", reply.await_args.args[1])
+            callback = reply.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+            right_user.callback_query = SimpleNamespace(data=callback, answer=AsyncMock())
+            await bot.on_callback(right_user, context)
             self.assertIsNone(self.storage.get_memory(7, memory_id))
             self.assertIn("已删除", reply.await_args.args[1])
+
+    async def test_old_memory_confirmation_does_not_delete_edited_version(self):
+        memory_id = self.storage.add_memory(7, "旧内容", limit=4)
+        agent = SimpleNamespace(control_lock=asyncio.Lock(), client=SimpleNamespace(busy=False))
+        manager = SimpleNamespace(memory=self.memory, get=lambda _: agent)
+        context = SimpleNamespace(args=["delete", memory_id], bot_data={
+            "settings": self.settings, "storage": self.storage, "manager": manager,
+        })
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_memory(update, context)
+            callback = reply.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+            self.storage.edit_memory(7, memory_id, "更新后的内容")
+            update.callback_query = SimpleNamespace(data=callback, answer=AsyncMock())
+            await bot.on_callback(update, context)
+            self.assertIn("预览已过期", reply.await_args.args[1])
+        self.assertEqual(self.storage.get_memory(7, memory_id)["text"], "更新后的内容")
+
+    async def test_summary_clear_requires_current_version_confirmation(self):
+        covered = self.storage.pending_summary_turns(self.sid)[-1]["id"]
+        self.storage.apply_summary(7, self.sid, 0, covered, "旧摘要", [],
+                                   memory_limit=4, turn_retention=2)
+        agent = SimpleNamespace(control_lock=asyncio.Lock(), client=SimpleNamespace(busy=False))
+        manager = SimpleNamespace(memory=self.memory, get=lambda _: agent)
+        context = SimpleNamespace(args=["clear"], bot_data={
+            "settings": self.settings, "storage": self.storage, "manager": manager,
+        })
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_summary(update, context)
+            self.assertEqual(self.storage.get_summary(self.sid)["summary_text"], "旧摘要")
+            callback = reply.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+            self.storage._exec(
+                "UPDATE session_summaries SET summary_text = ?, updated_at = updated_at + 1 WHERE session_id = ?",
+                ("新摘要", self.sid),
+            )
+            update.callback_query = SimpleNamespace(data=callback, answer=AsyncMock())
+            await bot.on_callback(update, context)
+            self.assertIn("预览已过期", reply.await_args.args[1])
+            self.assertEqual(self.storage.get_summary(self.sid)["summary_text"], "新摘要")
+            context.args = ["clear"]
+            await bot.cmd_summary(update, context)
+            callback = reply.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+            update.callback_query = SimpleNamespace(data=callback, answer=AsyncMock())
+            await bot.on_callback(update, context)
+        self.assertEqual(self.storage.get_summary(self.sid)["summary_text"], "")
 
 
 if __name__ == "__main__":
