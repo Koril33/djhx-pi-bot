@@ -230,6 +230,8 @@ color:var(--muted)}
 .settings-restore{margin-top:20px;padding:18px 22px;border:1px solid var(--line);border-radius:9px;background:var(--panel)}
 .settings-restore summary{cursor:pointer}
 .settings-restore p{color:var(--muted);line-height:1.6}
+.submit-status{display:inline-block;margin:8px 0;color:var(--accent);font-size:12px}
+button:disabled{opacity:.65;cursor:wait}
 .input-with-unit{display:flex;
 align-items:center;
 gap:9px;

@@ -37,6 +37,9 @@ _STATIC_DIR = Path(__file__).resolve().parent / "admin_static"
 _STYLE = (_STATIC_DIR / "style.css").read_text(encoding="utf-8")
 _STYLE_TAG = f"<style>{_STYLE}</style>"
 _STYLE_HASH = base64.b64encode(hashlib.sha256(_STYLE.encode("utf-8")).digest()).decode("ascii")
+_SCRIPT = (_STATIC_DIR / "form_state.js").read_text(encoding="utf-8")
+_SCRIPT_TAG = f"<script>{_SCRIPT}</script>"
+_SCRIPT_HASH = base64.b64encode(hashlib.sha256(_SCRIPT.encode("utf-8")).digest()).decode("ascii")
 _SESSION_COOKIE = "dj_admin_session"
 _PRELOGIN_COOKIE = "dj_admin_prelogin"
 _SESSION_SECONDS = 12 * 3600
@@ -158,7 +161,7 @@ def _storage(request: Request) -> Storage:
 def _headers() -> dict[str, str]:
     return {
         "Cache-Control": "no-store",
-        "Content-Security-Policy": f"default-src 'none'; style-src 'sha256-{_STYLE_HASH}'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "Content-Security-Policy": f"default-src 'none'; style-src 'sha256-{_STYLE_HASH}'; script-src 'sha256-{_SCRIPT_HASH}'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
         "X-Frame-Options": "DENY",
@@ -216,7 +219,7 @@ def _redirect(path: str) -> RedirectResponse:
     return RedirectResponse(path, status_code=303, headers={"Cache-Control": "no-store"})
 
 
-def _login_page(csrf: str, error: str = "") -> str:
+def _login_page(csrf: str, error: str = "", username: str = "") -> str:
     message = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else ""
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · Pi 管理</title>
@@ -225,9 +228,9 @@ def _login_page(csrf: str, error: str = "") -> str:
 <p class="eyebrow">DJHX / PI</p><h1>管理后台</h1>{message}
 <form method="post" action="/admin/login" class="form-stack">
 <input type="hidden" name="csrf" value="{_e(csrf)}">
-<label>用户名<input name="username" autocomplete="username" required autofocus></label>
+<label>用户名<input name="username" value="{_e(username)}" autocomplete="username" required autofocus></label>
 <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
-<button class="button primary" type="submit">登录</button></form></main></body></html>"""
+<button class="button primary" type="submit">登录</button></form></main>{_SCRIPT_TAG}</body></html>"""
 
 
 def _layout(title: str, active: str, body: str, csrf: str, user_id: int | None, settings: Settings) -> str:
@@ -245,7 +248,7 @@ def _layout(title: str, active: str, body: str, csrf: str, user_id: int | None, 
 <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{_e(csrf)}">
 <button class="text-button" type="submit">退出</button></form></div></aside>
 <main class="main"><header class="topline"><span>DJHX PI BOT</span><span>ADMIN</span></header>
-<div class="page-content">{body}</div></main></div></body></html>"""
+<div class="page-content">{body}</div></main></div>{_SCRIPT_TAG}</body></html>"""
 
 
 def _users(storage: Storage, settings: Settings) -> list[tuple[int, str]]:
@@ -409,7 +412,8 @@ def _admin_list_page(request: Request, rows: list, section: str, user_id: int | 
     return shown, search, pager, len(filtered)
 
 
-def _session_page(request: Request, csrf: str, user_id: int | None, error: str = "") -> HTMLResponse:
+def _session_page(request: Request, csrf: str, user_id: int | None, error: str = "",
+                  draft_name: str = "", rename_values: dict[str, str] | None = None) -> HTMLResponse:
     storage, settings = _storage(request), _settings(request)
     picker = _user_picker(storage, settings, user_id, "sessions")
     if user_id is None:
@@ -418,7 +422,7 @@ def _session_page(request: Request, csrf: str, user_id: int | None, error: str =
         add = (f'<form method="post" action="/admin/sessions/new" class="compact-form">'
                f'<input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}">'
                '<label class="sr-only" for="session-name">会话名称</label>'
-               '<input id="session-name" name="name" maxlength="60" placeholder="新会话名称" required>'
+               f'<input id="session-name" name="name" value="{_e(draft_name)}" maxlength="60" placeholder="新会话名称" required>'
                '<button class="button primary" type="submit">新建会话</button></form>')
         agent = request.app.state.manager.get(user_id)
         shown, search, pager, _ = _admin_list_page(
@@ -462,7 +466,7 @@ def _session_page(request: Request, csrf: str, user_id: int | None, error: str =
                           '<button class="text-button" type="submit">切换</button></form>')
             rename = (f'<details><summary>重命名</summary><form method="post" action="/admin/sessions/{sid}/rename" class="inline-edit">'
                       f'<input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}">'
-                      f'<input name="name" value="{_e(row["name"])}" maxlength="60" required>'
+                      f'<input name="name" value="{_e((rename_values or {}).get(row["id"], row["name"]))}" maxlength="60" required>'
                       '<button class="button primary" type="submit">保存</button></form></details>')
             cards.append(f'<article class="summary-card"><div class="summary-head"><div>'
                          f'<span class="session-state">{_e(file_state)}</span><h2>{_e(row["name"])}</h2></div>'
@@ -619,7 +623,8 @@ def _usage_page(request: Request, csrf: str, user_id: int | None, period: str,
     return _html(_layout("用量费用", "usage", body, csrf, user_id, settings))
 
 
-def _memory_page(request: Request, csrf: str, user_id: int | None, error: str = "") -> HTMLResponse:
+def _memory_page(request: Request, csrf: str, user_id: int | None, error: str = "",
+                 draft_text: str = "", edit_values: dict[str, str] | None = None) -> HTMLResponse:
     storage, settings = _storage(request), _settings(request)
     picker = _user_picker(storage, settings, user_id, "memories")
     if user_id is None:
@@ -630,13 +635,13 @@ def _memory_page(request: Request, csrf: str, user_id: int | None, error: str = 
             request, memories, "memories", user_id,
             lambda row, q: q in row["text"].casefold() or q in row["source"].casefold(),
         )
-        add = f'''<form method="post" action="/admin/memories/add" class="add-form"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><label class="sr-only" for="new-memory">新增记忆</label><textarea id="new-memory" name="text" maxlength="{settings.memory_item_max_chars}" rows="2" placeholder="写入一条长期记忆" required></textarea><button class="button primary" type="submit">添加记忆</button></form>'''
+        add = f'''<form method="post" action="/admin/memories/add" class="add-form"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><label class="sr-only" for="new-memory">新增记忆</label><textarea id="new-memory" name="text" maxlength="{settings.memory_item_max_chars}" rows="2" placeholder="写入一条长期记忆" required>{_e(draft_text)}</textarea><button class="button primary" type="submit">添加记忆</button></form>'''
         cards = []
         for row in shown:
             ident = _e(row["id"])
             badge = '<span class="badge">置顶</span>' if row["pinned"] else ""
             source = "手动" if row["source"] == "manual" else "自动"
-            cards.append(f'''<article class="memory-card"><div class="card-meta"><span>{source}</span>{badge}<span class="mono">{ident}</span></div><p class="memory-text">{_e(row["text"])}</p><div class="card-actions"><form method="post" action="/admin/memories/{ident}/pin"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><input type="hidden" name="pinned" value="{0 if row["pinned"] else 1}"><button class="text-button" type="submit">{'取消置顶' if row['pinned'] else '置顶'}</button></form><details><summary>编辑</summary><form method="post" action="/admin/memories/{ident}/edit" class="inline-edit"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><textarea name="text" maxlength="{settings.memory_item_max_chars}" rows="3" required>{_e(row["text"])}</textarea><button class="button primary" type="submit">保存</button></form></details><details class="danger-details"><summary>删除</summary><form method="post" action="/admin/memories/{ident}/delete"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><button class="button danger" type="submit">确认删除</button></form></details></div></article>''')
+            cards.append(f'''<article class="memory-card"><div class="card-meta"><span>{source}</span>{badge}<span class="mono">{ident}</span></div><p class="memory-text">{_e(row["text"])}</p><div class="card-actions"><form method="post" action="/admin/memories/{ident}/pin"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><input type="hidden" name="pinned" value="{0 if row["pinned"] else 1}"><button class="text-button" type="submit">{'取消置顶' if row['pinned'] else '置顶'}</button></form><details><summary>编辑</summary><form method="post" action="/admin/memories/{ident}/edit" class="inline-edit"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><textarea name="text" maxlength="{settings.memory_item_max_chars}" rows="3" required>{_e((edit_values or {}).get(row["id"], row["text"]))}</textarea><button class="button primary" type="submit">保存</button></form></details><details class="danger-details"><summary>删除</summary><form method="post" action="/admin/memories/{ident}/delete"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><button class="button danger" type="submit">确认删除</button></form></details></div></article>''')
         cards_html = "".join(cards) if cards else '<p class="empty">暂无记忆</p>'
         contents = (f'<div class="toolbar"><span class="count">{matched} 条匹配 · '
                     f'{len(memories)} / {settings.memory_active_limit}</span>{search}</div>'
@@ -777,7 +782,8 @@ def _persona_form_page(request: Request, csrf: str, user_id: int | None, row=Non
                  status_code=400 if error else 200)
 
 
-def _settings_page(request: Request, csrf: str, error: str = "") -> HTMLResponse:
+def _settings_page(request: Request, csrf: str, error: str = "",
+                   values: dict[str, str] | None = None) -> HTMLResponse:
     settings = _settings(request)
     saved = _storage(request).get_runtime_settings()
     defaults = Settings()
@@ -789,12 +795,13 @@ def _settings_page(request: Request, csrf: str, error: str = "") -> HTMLResponse
     sections = []
     for group_name, fields in groups:
         rows = "".join(
-            f'<label class="setting-field"><span>{_e(label)}</span><span class="input-with-unit"><input type="number" name="{key}" min="{low}" max="{high}" value="{getattr(settings, key)}" required><span>{_e(unit)}</span></span>'
+            f'<label class="setting-field"><span>{_e(label)}</span><span class="input-with-unit"><input type="number" name="{key}" min="{low}" max="{high}" value="{_e(values.get(key, getattr(settings, key)) if values is not None else getattr(settings, key))}" required><span>{_e(unit)}</span></span>'
             f'{"<small>环境默认：" + str(getattr(defaults, key)) + "</small>" if key in overridden else ""}</label>'
             for key, label, unit, low, high in fields
         )
         sections.append(f'<section class="settings-group"><h2>{group_name}</h2><div class="settings-grid">{rows}</div></section>')
-    checked = " checked" if settings.memory_auto_extract else ""
+    checked = " checked" if ((values.get("memory_auto_extract") == "on") if values is not None
+                             else settings.memory_auto_extract) else ""
     source = "SQLite 覆盖" if overridden else ".env"
     alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
     body = f'''<div class="page-heading"><div><p class="eyebrow">CONFIGURATION</p><h1>记忆设置</h1></div><span class="source-label">{source}</span></div>{alert}
@@ -808,18 +815,20 @@ def _settings_page(request: Request, csrf: str, error: str = "") -> HTMLResponse
     return _html(_layout("记忆设置", "settings", body, csrf, None, settings), status_code=400 if error else 200)
 
 
-def _mail_page(request: Request, csrf: str, error: str = "") -> HTMLResponse:
+def _mail_page(request: Request, csrf: str, error: str = "",
+               values: dict[str, str] | None = None, test_to: str = "") -> HTMLResponse:
     current = _storage(request).get_smtp_settings()
-    host = _e(current["host"] if current else "")
-    port = current["port"] if current else 465
-    username = _e(current["username"] if current else "")
-    from_address = _e(current["from_address"] if current else "")
+    values = values or {}
+    host = _e(values.get("host", current["host"] if current else ""))
+    port = str(values.get("port", current["port"] if current else 465))
+    username = _e(values.get("username", current["username"] if current else ""))
+    from_address = _e(values.get("from_address", current["from_address"] if current else ""))
     secret_hint = "已保存，留空保持原值" if current else "SMTP 密码或授权码"
     alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
     test = (f'''<section class="settings-group"><h2>发送测试</h2>
 <form method="post" action="/admin/mail/test" class="mail-test-form">
 <input type="hidden" name="csrf" value="{_e(csrf)}">
-<label class="mail-field"><span>收件邮箱</span><input type="email" name="to" autocomplete="off" maxlength="254" required></label>
+<label class="mail-field"><span>收件邮箱</span><input type="email" name="to" value="{_e(test_to)}" autocomplete="off" maxlength="254" required></label>
 <button class="button subtle" type="submit">发送测试邮件</button></form></section>''' if current else "")
     body = f'''<div class="page-heading"><div><p class="eyebrow">CONFIGURATION</p><h1>邮件设置</h1></div>
 <span class="source-label">{'SQLite' if current else '未配置'}</span></div>{alert}
@@ -827,7 +836,7 @@ def _mail_page(request: Request, csrf: str, error: str = "") -> HTMLResponse:
 <form method="post" action="/admin/mail" class="mail-form">
 <input type="hidden" name="csrf" value="{_e(csrf)}">
 <label class="mail-field"><span>服务器</span><input name="host" value="{host}" maxlength="253" placeholder="mail.example.com" required></label>
-<label class="mail-field"><span>端口与加密</span><select name="port"><option value="465"{' selected' if port == 465 else ''}>465 · SSL/TLS</option><option value="587"{' selected' if port == 587 else ''}>587 · STARTTLS</option></select></label>
+<label class="mail-field"><span>端口与加密</span><select name="port"><option value="465"{' selected' if port == "465" else ''}>465 · SSL/TLS</option><option value="587"{' selected' if port == "587" else ''}>587 · STARTTLS</option></select></label>
 <label class="mail-field"><span>用户名</span><input name="username" value="{username}" autocomplete="off" maxlength="254" required></label>
 <label class="mail-field"><span>发件邮箱</span><input type="email" name="from_address" value="{from_address}" autocomplete="off" maxlength="254" required></label>
 <label class="mail-field"><span>密码 / 授权码</span><input type="password" name="password" autocomplete="new-password" maxlength="1024" placeholder="{secret_hint}"{' required' if not current else ''}></label>
@@ -895,7 +904,7 @@ async def login(request: Request):
     if not (valid_user and valid_password):
         _LOGIN_FAILURES[ip] = failures + [now]
         csrf = secrets.token_urlsafe(24)
-        response = _html(_login_page(csrf, "用户名或密码错误"), status_code=401)
+        response = _html(_login_page(csrf, "用户名或密码错误", form.get("username", "")), status_code=401)
         _cookie(response, _PRELOGIN_COOKIE, _seal(settings, "pre", csrf), _PRELOGIN_SECONDS)
         logger.warning("后台登录失败", extra={"client_ip": ip})
         await asyncio.sleep(0.2)
@@ -959,16 +968,16 @@ async def new_session(request: Request):
     try:
         name = _session_name(form.get("name"))
     except ValueError as exc:
-        return _session_page(request, csrf, user_id, str(exc))
+        return _session_page(request, csrf, user_id, str(exc), draft_name=form.get("name", ""))
     agent = request.app.state.manager.get(user_id)
     try:
         async with agent.control_lock:
             sid = await create_user_session(agent, storage, user_id, name)
     except (PiError, ValueError) as exc:
-        return _session_page(request, csrf, user_id, str(exc))
+        return _session_page(request, csrf, user_id, str(exc), draft_name=form.get("name", ""))
     except Exception:
         logger.exception("后台新建会话失败", extra={"user_id": user_id})
-        return _session_page(request, csrf, user_id, "新建失败，请查看服务日志")
+        return _session_page(request, csrf, user_id, "新建失败，请查看服务日志", draft_name=form.get("name", ""))
     logger.info("后台新建会话", extra={"user_id": user_id, "session_id": sid})
     return _redirect(f"/admin/sessions?{urlencode({'user_id': user_id, 'status': 'created'})}")
 
@@ -1007,7 +1016,7 @@ async def rename_session(session_id: str, request: Request):
     try:
         name = _session_name(form.get("name"))
     except ValueError as exc:
-        return _session_page(request, csrf, user_id, str(exc))
+        return _session_page(request, csrf, user_id, str(exc), rename_values={session_id: form.get("name", "")})
     storage.rename_session(session_id, name)
     logger.info("后台重命名会话", extra={"user_id": user_id, "session_id": session_id})
     return _redirect(f"/admin/sessions?{urlencode({'user_id': user_id, 'status': 'saved'})}")
@@ -1063,12 +1072,12 @@ async def add_memory(request: Request):
     user_id = _form_user(form, storage, settings)
     item = form.get("text", "").strip()
     if not item or len(item) > settings.memory_item_max_chars or looks_secret(item):
-        return _memory_page(request, csrf, user_id, "记忆内容为空、过长或包含敏感凭据")
+        return _memory_page(request, csrf, user_id, "记忆内容为空、过长或包含敏感凭据", draft_text="" if looks_secret(item) else form.get("text", ""))
     try:
         storage.ensure_user(user_id, None)
         memory_id = storage.add_memory(user_id, item, limit=settings.memory_active_limit)
     except ValueError as exc:
-        return _memory_page(request, csrf, user_id, str(exc))
+        return _memory_page(request, csrf, user_id, str(exc), draft_text="" if looks_secret(item) else form.get("text", ""))
     _refresh_memory(request, user_id)
     logger.info("后台添加记忆", extra={"user_id": user_id, "memory_id": memory_id})
     return _redirect(f"/admin/memories?{urlencode({'user_id': user_id, 'status': 'saved'})}")
@@ -1081,11 +1090,11 @@ async def edit_memory(memory_id: str, request: Request):
     user_id = _form_user(form, storage, settings)
     item = form.get("text", "").strip()
     if not item or len(item) > settings.memory_item_max_chars or looks_secret(item):
-        return _memory_page(request, csrf, user_id, "记忆内容为空、过长或包含敏感凭据")
+        return _memory_page(request, csrf, user_id, "记忆内容为空、过长或包含敏感凭据", edit_values={memory_id: "" if looks_secret(item) else form.get("text", "")})
     try:
         changed = storage.edit_memory(user_id, memory_id, item)
     except sqlite3.IntegrityError:
-        return _memory_page(request, csrf, user_id, "相同记忆已存在")
+        return _memory_page(request, csrf, user_id, "相同记忆已存在", edit_values={memory_id: "" if looks_secret(item) else form.get("text", "")})
     if not changed:
         raise HTTPException(status_code=404, detail="记忆不存在")
     _refresh_memory(request, user_id)
@@ -1158,7 +1167,7 @@ async def save_settings(request: Request):
         values = _memory_values(form, from_form=True)
         _validated_candidate(settings, values)
     except ValueError as exc:
-        return _settings_page(request, csrf, str(exc))
+        return _settings_page(request, csrf, str(exc), form)
     storage.save_runtime_settings(values)
     for key, value in values.items():
         setattr(settings, key, value)
@@ -1202,7 +1211,7 @@ async def save_mail(request: Request):
                                         form.get("username", ""), password,
                                         form.get("from_address", ""))
     except ValueError as exc:
-        return _mail_page(request, csrf, str(exc))
+        return _mail_page(request, csrf, str(exc), form)
     storage.save_smtp_settings(**values)
     logger.info("后台保存 SMTP 配置", extra={"host": values["host"], "port": values["port"]})
     return _redirect("/admin/mail?status=saved")
@@ -1380,7 +1389,7 @@ async def test_persona(persona_id: str, request: Request):
     user_id = _form_user(form, storage, settings)
     question = form.get("question", "").strip()
     if not 1 <= len(question) <= 1000:
-        return _persona_form_page(request, csrf, user_id, row, error="测试消息须为 1–1000 字符")
+        return _persona_form_page(request, csrf, user_id, row, error="测试消息须为 1–1000 字符", question=question)
     try:
         result = await _run_persona_test(request, row, user_id, question)
     except (PiError, ValueError, TimeoutError) as exc:
@@ -1399,11 +1408,11 @@ async def test_mail(request: Request):
     csrf, form = await _authorized_form(request)
     config = _storage(request).get_smtp_settings()
     if config is None:
-        return _mail_page(request, csrf, "请先保存 SMTP 配置")
+        return _mail_page(request, csrf, "请先保存 SMTP 配置", test_to=form.get("to", ""))
     try:
         recipient = email_address(form.get("to", ""))
         await asyncio.to_thread(send_email, config, recipient, "Pi 邮件功能测试", "这是一封来自 djhx-pi-bot 的 SMTP 测试邮件。")
     except (ValueError, MailSendError) as exc:
-        return _mail_page(request, csrf, str(exc))
+        return _mail_page(request, csrf, str(exc), test_to=form.get("to", ""))
     logger.info("后台发送 SMTP 测试邮件", extra={"recipient": recipient})
     return _redirect("/admin/mail?status=sent")

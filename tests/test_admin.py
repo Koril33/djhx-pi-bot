@@ -78,6 +78,38 @@ class AdminTests(unittest.TestCase):
         send.assert_called_once()
         self.assertEqual(send.call_args.args[1], "admin@example.com")
 
+    def test_forms_preserve_safe_inputs_after_error_and_enable_submit_feedback(self):
+        self.login()
+        settings_page = self.client.get("/admin/settings")
+        csrf = self.csrf(settings_page)
+        self.assertIn("script-src 'sha256-", settings_page.headers["content-security-policy"])
+        self.assertIn("提交中，请稍候", settings_page.text)
+        settings_data = {key: str(getattr(self.settings, key)) for key, *_ in _FIELDS}
+        settings_data.update(csrf=csrf, memory_batch_turns="12", memory_summary_max_bytes="8000")
+        rejected = self.client.post("/admin/settings", data=settings_data)
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn('name="memory_batch_turns" min="1" max="100" value="12"', rejected.text)
+        self.assertIn('name="memory_summary_max_bytes" min="128" max="16384" value="8000"', rejected.text)
+        mail = self.client.post("/admin/mail", data={
+            "csrf": csrf, "host": "bad host", "port": "465", "username": "bot@example.com",
+            "password": "dont-echo-this-123", "from_address": "bot@example.com",
+        })
+        self.assertEqual(mail.status_code, 400)
+        self.assertIn('name="host" value="bad host"', mail.text)
+        self.assertIn('name="username" value="bot@example.com"', mail.text)
+        self.assertNotIn("dont-echo-this-123", mail.text)
+        long_text = "可保留的输入" * 50
+        memory = self.client.post("/admin/memories/add", data={
+            "csrf": csrf, "user_id": "7", "text": long_text,
+        })
+        self.assertEqual(memory.status_code, 400)
+        self.assertIn(long_text, memory.text)
+        secret = self.client.post("/admin/memories/add", data={
+            "csrf": csrf, "user_id": "7", "text": "api_key=secret-value-123456789",
+        })
+        self.assertEqual(secret.status_code, 400)
+        self.assertNotIn("secret-value-123456789", secret.text)
+
     def test_memory_settings_restore_env_defaults(self):
         self.storage.save_runtime_settings({
             "memory_batch_turns": 9, "memory_auto_extract": False, "future_feature": 123,
@@ -137,7 +169,7 @@ class AdminTests(unittest.TestCase):
         self.assertNotIn("人格09", persona_match.text)
         escaped = self.client.get("/admin/sessions?user_id=7&q=%3Cscript%3E")
         self.assertIn("&lt;script&gt;", escaped.text)
-        self.assertNotIn("<script>", escaped.text)
+        self.assertNotIn('name="q" value="<script>"', escaped.text)
         run = self.storage.start_usage_run(7, None, None, None)
         for seq in range(1, 23):
             self.storage.record_usage_event(run, seq, {
