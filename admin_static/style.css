@@ -337,6 +337,10 @@ width:0}
 .range-link{padding:10px 13px;color:var(--muted);border-bottom:2px solid transparent}
 .range-link:hover{color:var(--text)}
 .range-link.active{color:var(--accent);border-color:var(--accent)}
+.usage-filters{display:flex;flex-wrap:wrap;align-items:end;gap:12px;margin:-8px 0 24px}
+.usage-filters label{display:grid;gap:6px;min-width:140px;flex:1;color:var(--muted);font-size:12px}
+.usage-filters select,.usage-filters input{width:100%;min-width:0;color:var(--text)}
+.usage-filters .button{min-height:42px}
 .usage-caption{color:var(--muted);font-size:12px;margin:16px 0 0;line-height:1.7}
 .mail-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:19px 30px}
 .mail-field{display:grid;gap:8px;min-width:0;color:var(--muted);font-size:12px}

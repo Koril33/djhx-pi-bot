@@ -1,5 +1,6 @@
 import re
 import asyncio
+from datetime import datetime, timedelta, timezone
 import tempfile
 import unittest
 from pathlib import Path
@@ -244,6 +245,46 @@ class AdminTests(unittest.TestCase):
         self.assertIn("80%", usage.text)
         self.assertIn("$0.0002", usage.text)
         self.assertEqual(self.client.get("/admin/usage?user_id=8").text.count("$0.0002"), 0)
+
+    def test_usage_filters_session_date_model_and_lists_unpriced_calls(self):
+        cst = timezone(timedelta(hours=8))
+        today = datetime.now(cst).date().isoformat()
+        one = self.storage.create_session(7, "项目甲")
+        two = self.storage.create_session(7, "项目乙")
+        other_user = self.storage.create_session(8, "其他用户")
+        def record(sid, model, status, price, days_ago=0):
+            run = self.storage.start_usage_run(7, sid, None, None)
+            self.storage.record_usage_event(run, 1, {
+                "kind": "assistant", "occurred_at": 1, "provider": "deepseek", "model": model,
+                "usage": {"input": 10, "output": 5},
+            }, PriceResult(status, usd=price))
+            self.storage.finish_usage_run(run, "complete", None)
+            if days_ago:
+                stamp = (datetime.now(cst) - timedelta(days=days_ago)).timestamp()
+                with self.storage._lock, self.storage._conn:
+                    self.storage._conn.execute("UPDATE usage_runs SET started_at = ? WHERE id = ?", (stamp, run))
+        record(one, "flash", "priced", "0.001")
+        record(one, "unpriced", "missing_rule", None)
+        record(two, "flash", "priced", "0.002")
+        record(one, "flash", "priced", "0.004", days_ago=3)
+        self.login()
+        url = f"/admin/usage?user_id=7&range=30d&session_id={one}&date_from={today}&date_to={today}"
+        page = self.client.get(url)
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("未计价调用", page.text)
+        self.assertIn("缺少价格规则", page.text)
+        self.assertIn("项目甲", page.text)
+        self.assertIn("$0.001", page.text)
+        self.assertNotIn("$0.002", page.text)
+        self.assertNotIn("$0.004", page.text)
+        filtered = self.client.get(url + "&model=deepseek%2Fflash")
+        self.assertEqual(filtered.status_code, 200)
+        self.assertIn("$0.001", filtered.text)
+        self.assertNotIn("缺少价格规则", filtered.text)
+        self.assertIn("当前筛选范围内没有未计价调用", filtered.text)
+        self.assertEqual(self.client.get(f"/admin/usage?user_id=7&session_id={other_user}").status_code, 400)
+        self.assertEqual(self.client.get("/admin/usage?user_id=7&model=unknown%2Fmodel").status_code, 400)
+        self.assertEqual(self.client.get("/admin/usage?user_id=7&date_from=bad").status_code, 400)
 
     def test_missing_session_requires_preview_confirmation(self):
         from bot import session_recovery_preview

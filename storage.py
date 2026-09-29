@@ -892,22 +892,39 @@ class Storage:
         )
         return rows[0] if rows else None
 
-    def get_usage_runs_since(self, user_id: int, since: float) -> list[sqlite3.Row]:
+    def get_usage_runs_since(self, user_id: int, since: float, until: float | None = None,
+                             session_id: str | None = None, model: str | None = None) -> list[sqlite3.Row]:
         return self._query(
-            "SELECT * FROM usage_runs WHERE user_id = ? AND started_at >= ? ORDER BY started_at DESC",
-            (user_id, since),
+            "SELECT * FROM usage_runs AS r WHERE r.user_id = ? AND r.started_at >= ? "
+            "AND (? IS NULL OR r.started_at < ?) "
+            "AND (? IS NULL OR r.session_id = ?) "
+            "AND (? IS NULL OR EXISTS (SELECT 1 FROM usage_events AS e WHERE e.run_id = r.id "
+            "AND e.provider || '/' || e.model = ?)) ORDER BY r.started_at DESC",
+            (user_id, since, until, until, session_id, session_id, model, model),
         )
 
     def get_usage_events(self, run_id: str) -> list[sqlite3.Row]:
         return self._query("SELECT * FROM usage_events WHERE run_id = ? ORDER BY seq", (run_id,))
 
-    def get_usage_events_since(self, user_id: int, since: float) -> list[sqlite3.Row]:
+    def get_usage_events_since(self, user_id: int, since: float, until: float | None = None,
+                               session_id: str | None = None, model: str | None = None) -> list[sqlite3.Row]:
         return self._query(
-            "SELECT e.*, r.origin, r.started_at, r.status AS run_status "
+            "SELECT e.*, r.origin, r.started_at, r.status AS run_status, r.session_id "
             "FROM usage_events AS e JOIN usage_runs AS r ON r.id = e.run_id "
-            "WHERE r.user_id = ? AND r.started_at >= ? ORDER BY r.started_at DESC, e.seq",
-            (user_id, since),
+            "WHERE r.user_id = ? AND r.started_at >= ? AND (? IS NULL OR r.started_at < ?) "
+            "AND (? IS NULL OR r.session_id = ?) "
+            "AND (? IS NULL OR e.provider || '/' || e.model = ?) "
+            "ORDER BY r.started_at DESC, e.seq",
+            (user_id, since, until, until, session_id, session_id, model, model),
         )
+
+    def get_usage_models(self, user_id: int) -> list[str]:
+        rows = self._query(
+            "SELECT DISTINCT e.provider || '/' || e.model AS name FROM usage_events AS e "
+            "JOIN usage_runs AS r ON r.id = e.run_id WHERE r.user_id = ? ORDER BY name",
+            (user_id,),
+        )
+        return [row["name"] for row in rows]
 
     def get_recent_usage_runs(self, user_id: int, limit: int = 8) -> list[sqlite3.Row]:
         return self._query(

@@ -11,7 +11,7 @@ import secrets
 import sqlite3
 import time
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from html import escape
 from pathlib import Path
@@ -414,15 +414,52 @@ def _session_page(request: Request, csrf: str, user_id: int | None, error: str =
     return _html(_layout("会话管理", "sessions", body, csrf, user_id, settings), status_code=400 if error else 200)
 
 
-def _usage_page(request: Request, csrf: str, user_id: int | None, period: str) -> HTMLResponse:
+def _usage_page(request: Request, csrf: str, user_id: int | None, period: str,
+                start_date: date | None = None, end_date: date | None = None,
+                session_id: str | None = None, model: str | None = None) -> HTMLResponse:
     storage, settings = _storage(request), _settings(request)
     picker = _user_picker(storage, settings, user_id, "usage")
     periods = {"today": ("今天", 0), "7d": ("近 7 天", 6), "30d": ("近 30 天", 29)}
-    label, days_back = periods[period]
-    midnight = datetime.now(_CST).replace(hour=0, minute=0, second=0, microsecond=0)
-    since = (midnight - timedelta(days=days_back)).timestamp()
-    runs = storage.get_usage_runs_since(user_id, since) if user_id is not None else []
-    events = storage.get_usage_events_since(user_id, since) if user_id is not None else []
+    if start_date is not None and end_date is not None:
+        label = f"{start_date.isoformat()} 至 {end_date.isoformat()}"
+        since = datetime(start_date.year, start_date.month, start_date.day, tzinfo=_CST).timestamp()
+        until = (datetime(end_date.year, end_date.month, end_date.day, tzinfo=_CST)
+                 + timedelta(days=1)).timestamp()
+    else:
+        label, days_back = periods[period]
+        since = (datetime.now(_CST).replace(hour=0, minute=0, second=0, microsecond=0)
+                 - timedelta(days=days_back)).timestamp()
+        until = (datetime.now(_CST).replace(hour=0, minute=0, second=0, microsecond=0)
+                 + timedelta(days=1)).timestamp()
+    runs = storage.get_usage_runs_since(user_id, since, until, session_id, model) if user_id is not None else []
+    events = storage.get_usage_events_since(user_id, since, until, session_id, model) if user_id is not None else []
+    sessions = storage.list_sessions(user_id) if user_id is not None else []
+    session_names = {row["id"]: row["name"] for row in sessions}
+    models = storage.get_usage_models(user_id) if user_id is not None else []
+    filters = {"user_id": user_id, "session_id": session_id, "model": model}
+    range_links = "".join(
+        f'<a class="range-link{" active" if key == period and start_date is None else ""}" '
+        f'href="/admin/usage?{urlencode({"range": key, **{k: v for k, v in filters.items() if v is not None}})}">{title}</a>'
+        for key, (title, _) in periods.items()
+    )
+    session_options = '<option value="">全部会话</option>' + "".join(
+        f'<option value="{_e(row["id"])}"{" selected" if session_id == row["id"] else ""}>'
+        f'{_e(row["name"])} · {_e(row["id"])}</option>' for row in sessions
+    )
+    model_options = '<option value="">全部模型</option>' + "".join(
+        f'<option value="{_e(name)}"{" selected" if model == name else ""}>{_e(name)}</option>'
+        for name in models
+    )
+    filter_form = (
+        '<form class="usage-filters" method="get" action="/admin/usage">'
+        + (f'<input type="hidden" name="user_id" value="{user_id}">' if user_id is not None else "")
+        + f'<input type="hidden" name="range" value="{_e(period)}">'
+        + f'<label>会话<select name="session_id">{session_options}</select></label>'
+        + f'<label>模型<select name="model">{model_options}</select></label>'
+        + f'<label>开始日期<input type="date" name="date_from" value="{start_date.isoformat() if start_date else ""}"></label>'
+        + f'<label>结束日期<input type="date" name="date_to" value="{end_date.isoformat() if end_date else ""}"></label>'
+        + '<button class="button primary" type="submit">应用筛选</button></form>'
+    )
     counts = {key: sum(row[key] for row in events) for key in
               ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")}
     total = sum((Decimal(row["estimated_usd"]) for row in events if row["estimated_usd"] is not None), Decimal(0))
@@ -430,34 +467,33 @@ def _usage_page(request: Request, csrf: str, user_id: int | None, period: str) -
                        if row["origin"] == "memory_maintenance" and row["estimated_usd"] is not None), Decimal(0))
     persona_testing = sum((Decimal(row["estimated_usd"]) for row in events
                            if row["origin"] == "persona_test" and row["estimated_usd"] is not None), Decimal(0))
+    unpriced = [row for row in events if row["estimated_usd"] is None]
     cache_base = counts["input_tokens"] + counts["cache_read_tokens"]
     cache_rate = f'{counts["cache_read_tokens"] / cache_base:.0%}' if cache_base else "—"
-    range_links = "".join(
-        f'<a class="range-link{" active" if key == period else ""}" href="/admin/usage?{urlencode({"range": key, **({"user_id": user_id} if user_id is not None else {})})}">{title}</a>'
-        for key, (title, _) in periods.items()
-    )
     metrics = (("估算费用", format_usd(total)), ("聊天轮次", str(sum(r["origin"] == "chat" for r in runs))),
                ("缓存命中", cache_rate), ("记忆维护", format_usd(maintenance)),
-               ("人格测试", format_usd(persona_testing)))
+               ("人格测试", format_usd(persona_testing)), ("未计价调用", str(len(unpriced))))
     metric_html = "".join(f'<div class="metric-card"><span>{_e(name)}</span><strong>{_e(value)}</strong></div>'
                           for name, value in metrics)
     by_model: dict[str, dict[str, object]] = {}
+    by_run: dict[str, list] = {}
     for row in events:
         key = f'{row["provider"]}/{row["model"]}'
-        item = by_model.setdefault(key, {"calls": 0, "tokens": 0, "cost": Decimal(0)})
+        item = by_model.setdefault(key, {"calls": 0, "tokens": 0, "cost": Decimal(0), "unpriced": 0})
         item["calls"] += 1
         item["tokens"] += row["total_tokens"]
+        by_run.setdefault(row["run_id"], []).append(row)
         if row["estimated_usd"] is not None:
             item["cost"] += Decimal(row["estimated_usd"])
+        else:
+            item["unpriced"] += 1
     model_rows = "".join(
-        f'<div class="list-row"><span>{_e(model)}</span><span>{entry["calls"]} 次 · {entry["tokens"]:,} tokens</span>'
+        f'<div class="list-row"><span>{_e(name)}</span><span>{entry["calls"]} 次 · {entry["tokens"]:,} tokens'
+        f'{" · " + str(entry["unpriced"]) + " 次未计价" if entry["unpriced"] else ""}</span>'
         f'<strong>{_e(format_usd(entry["cost"]))}</strong></div>'
-        for model, entry in sorted(by_model.items())
+        for name, entry in sorted(by_model.items())
     ) or '<p class="empty small">暂无用量事件</p>'
     issues = []
-    unpriced = sum(row["estimated_usd"] is None for row in events)
-    if unpriced:
-        issues.append(f'{unpriced} 次调用未计价')
     if any(row["price_status"] == "stale_price" for row in events):
         issues.append("价格待复核")
     if any(row["status"] != "complete" for row in runs):
@@ -465,18 +501,41 @@ def _usage_page(request: Request, csrf: str, user_id: int | None, period: str) -
     issue_html = f'<p class="form-error">{_e("；".join(issues))}</p>' if issues else ""
     token_line = (f'未命中 {counts["input_tokens"]:,} · 缓存读取 {counts["cache_read_tokens"]:,} · '
                   f'缓存写入 {counts["cache_write_tokens"]:,} · 输出 {counts["output_tokens"]:,}')
+    reasons = {
+        "missing_rule": "缺少价格规则", "missing_config": "无价格配置",
+        "outside_effective_period": "超出价格生效期", "calendar_unknown": "无法判断计价时段",
+        "invalid_usage": "用量数据无效", "invalid_config": "价格配置无效",
+    }
+    unpriced_rows = "".join(
+        f'<div class="list-row"><span>{_e(_time_label(row["started_at"]))}</span>'
+        f'<span>{_e(row["provider"] + "/" + row["model"])} · '
+        f'{_e(session_names.get(row["session_id"], "已删除会话" if row["session_id"] else "无关联会话"))} · '
+        f'{_e(reasons.get(row["price_status"], row["price_status"]))}</span>'
+        f'<strong>{row["total_tokens"]:,} tokens</strong></div>'
+        for row in unpriced[:20]
+    ) or '<p class="empty small">当前筛选范围内没有未计价调用</p>'
+    if len(unpriced) > 20:
+        unpriced_rows += f'<p class="muted">仅显示最近 20 条，共 {len(unpriced)} 条</p>'
     recent = []
-    for run in storage.get_recent_usage_runs(user_id) if user_id is not None else []:
-        amount = sum((Decimal(event["estimated_usd"]) for event in storage.get_usage_events(run["id"])
+    for run in runs[:8]:
+        run_events = by_run.get(run["id"], [])
+        amount = sum((Decimal(event["estimated_usd"]) for event in run_events
                       if event["estimated_usd"] is not None), Decimal(0))
+        missing_count = sum(event["estimated_usd"] is None for event in run_events)
         origin = {"memory_maintenance": "记忆维护", "persona_test": "人格测试"}.get(run["origin"], "聊天")
         recent.append(f'<div class="list-row"><span>{_e(_time_label(run["started_at"]))}</span>'
-                      f'<span>{origin} · {_e(run["status"])}</span><strong>{_e(format_usd(amount))}</strong></div>')
+                      f'<span>{origin} · {_e(session_names.get(run["session_id"], "已删除会话" if run["session_id"] else "无关联会话"))} · {_e(run["status"])}'
+                      f'{" · " + str(missing_count) + " 次未计价" if missing_count else ""}</span>'
+                      f'<strong>{_e(format_usd(amount))}</strong></div>')
+    caption = label + (f' · {session_names[session_id]}' if session_id else "") + (f' · {model}' if model else "")
     body = (f'<div class="page-heading"><div><p class="eyebrow">USAGE</p><h1>用量费用</h1></div>{picker}</div>'
-            f'<div class="range-links">{range_links}</div>{issue_html}<div class="metric-grid">{metric_html}</div>'
-            f'<p class="usage-caption">{_e(label)} · {token_line}</p>'
+            f'<div class="range-links">{range_links}</div>{filter_form}{issue_html}<div class="metric-grid">{metric_html}</div>'
+            f'<p class="usage-caption">{_e(caption)} · {token_line}</p>'
             f'<section class="section-block"><div class="section-head"><h2>模型</h2><span class="muted">按公开费率估算</span></div>'
             f'<div class="simple-list">{model_rows}</div></section>'
+            f'<section class="section-block"><div class="section-head"><h2>未计价调用</h2>'
+            f'<span class="muted">不计入估算费用 · 共 {len(unpriced)} 次</span></div>'
+            f'<div class="simple-list">{unpriced_rows}</div></section>'
             f'<section class="section-block"><div class="section-head"><h2>最近记录</h2></div>'
             f'<div class="simple-list">{"".join(recent) or "<p class=\"empty small\">暂无记录</p>"}</div></section>')
     return _html(_layout("用量费用", "usage", body, csrf, user_id, settings))
@@ -858,7 +917,29 @@ async def usage(request: Request):
     period = request.query_params.get("range", "today")
     if period not in {"today", "7d", "30d"}:
         raise HTTPException(status_code=400, detail="时间范围无效")
-    return _usage_page(request, csrf, user_id, period)
+    storage = _storage(request)
+    session_id = request.query_params.get("session_id") or None
+    if session_id:
+        row = storage.get_session(session_id)
+        if row is None or row["user_id"] != user_id:
+            raise HTTPException(status_code=400, detail="会话筛选无效")
+    model = request.query_params.get("model") or None
+    if model and (user_id is None or model not in storage.get_usage_models(user_id)):
+        raise HTTPException(status_code=400, detail="模型筛选无效")
+    raw_start = request.query_params.get("date_from") or None
+    raw_end = request.query_params.get("date_to") or None
+    try:
+        start_date = date.fromisoformat(raw_start) if raw_start else None
+        end_date = date.fromisoformat(raw_end) if raw_end else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="日期格式无效") from exc
+    if start_date and not end_date:
+        end_date = datetime.now(_CST).date()
+    elif end_date and not start_date:
+        start_date = end_date
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+    return _usage_page(request, csrf, user_id, period, start_date, end_date, session_id, model)
 
 
 @router.get("/memories")
