@@ -1830,13 +1830,29 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         rows = storage.list_memories(user_id)
         page_size = 8
+        pages = max(1, (len(rows) + page_size - 1) // page_size)
+        page = min(page, pages)
         shown = rows[(page - 1) * page_size:page * page_size]
-        lines = [f"🧠 长期记忆（{len(rows)}/{settings.memory_active_limit}，第 {page} 页）"]
-        lines += [f"{'📌 ' if row['pinned'] else ''}{row['id']}：{row['text']}" for row in shown]
+        lines = [f"🧠 长期记忆（{len(rows)}/{settings.memory_active_limit}，第 {page}/{pages} 页）"]
+        for row in shown:
+            source = {"auto": "自动提取", "manual": "手动添加"}.get(row["source"], "其他")
+            updated = datetime.fromtimestamp(
+                row["updated_at"], timezone(timedelta(hours=8)),
+            ).strftime("%Y-%m-%d %H:%M")
+            lines.append(f"{'📌 ' if row['pinned'] else ''}{row['id']}：{row['text']}")
+            lines.append(f"  来源：{source} · 更新：{updated}")
         if not shown:
-            lines.append("暂无此页记忆")
+            lines.append("暂无记忆；可用 /memory add <内容> 添加")
         lines.append("/memory add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
-        await reply_text(update, "\n".join(lines))
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("← 上一页", callback_data=f"memory_page:{page - 1}"))
+        if page < pages:
+            nav.append(InlineKeyboardButton("下一页 →", callback_data=f"memory_page:{page + 1}"))
+        await reply_text(
+            update, "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([nav]) if nav else None,
+        )
         return
     if sub not in {"add", "edit", "delete", "pin", "unpin"}:
         await reply_text(update, "用法：/memory list [页码] | add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
@@ -2019,6 +2035,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if data == "confirm_cancel":
         await reply_text(update, "已取消，没有修改数据")
+        return
+    if data.startswith("memory_page:"):
+        context.args = ["list", data.split(":", 1)[1]]
+        await cmd_memory(update, context)
         return
     if data.startswith("memory_delete_confirm:"):
         _, memory_id, version = data.split(":", 2)

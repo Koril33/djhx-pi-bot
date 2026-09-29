@@ -170,6 +170,39 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.storage._conn.close()
         self.folder.cleanup()
 
+    async def test_memory_list_buttons_show_source_and_update_time(self):
+        self.settings.memory_active_limit = 20
+        for index in range(9):
+            self.storage.add_memory(
+                7, f"记忆 {index}", limit=20,
+                source="auto" if index == 8 else "manual",
+            )
+        self.storage.add_memory(8, "其他用户记忆", limit=20)
+        manager = SimpleNamespace(memory=self.memory)
+        context = SimpleNamespace(args=["list"], bot_data={
+            "settings": self.settings, "storage": self.storage, "manager": manager,
+        })
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_memory(update, context)
+            first = reply.await_args
+            self.assertIn("第 1/2 页", first.args[1])
+            self.assertIn("来源：自动提取", first.args[1])
+            self.assertIn("来源：手动添加", first.args[1])
+            self.assertIn("更新：20", first.args[1])
+            self.assertNotIn("其他用户记忆", first.args[1])
+            button = first.kwargs["reply_markup"].inline_keyboard[0][0]
+            self.assertEqual(button.callback_data, "memory_page:2")
+            update.callback_query = SimpleNamespace(data=button.callback_data, answer=AsyncMock())
+            await bot.on_callback(update, context)
+            second = reply.await_args
+            self.assertIn("第 2/2 页", second.args[1])
+            self.assertEqual(
+                second.kwargs["reply_markup"].inline_keyboard[0][0].callback_data,
+                "memory_page:1",
+            )
+            update.callback_query.answer.assert_awaited_once()
+
     async def test_auto_summary_uses_flash_and_separate_cost_run(self):
         calls = []
 
