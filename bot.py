@@ -68,6 +68,14 @@ class _ImageTooLarge(ValueError):
     """仅用于区分本地校验错误与下载库抛出的异常。"""
 
 
+class SessionRecoveryRequired(PiError):
+    """当前会话文件缺失，等待用户预览并确认恢复。"""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        super().__init__("会话文件缺失，请先预览并确认恢复")
+
+
 # ================= Markdown → Telegram HTML =================
 
 
@@ -542,18 +550,9 @@ class AgentSession:
         await self.ensure_default_session()
         active = self.storage.get_active_session(self.user_id)
         session_file = active["pi_session_file"] if active else None
-        if (self.memory is not None and active and session_file
-                and not Path(session_file).is_file()
+        if (active and session_file and not Path(session_file).is_file()
                 and not self.client.has_live_session(session_file)):
-            recovery = self.memory.build_recovery(active["id"])
-            state = await self.client.reset_session()
-            new_file = state.get("sessionFile")
-            if not new_file:
-                raise PiError("pi 未返回新会话文件，无法恢复缺失的历史")
-            self.storage.set_session_recovery(active["id"], new_file, recovery)
-            self.recovery_notice = ("旧会话文件不存在，已从 SQLite 摘要恢复主要内容；原始对话无法逐字恢复"
-                                    if recovery else "旧会话文件不存在，已创建空白 pi 会话；SQLite 没有可用摘要")
-            return
+            raise SessionRecoveryRequired(active["id"])
         # 进程仍存活但 stdout reader 已失效时，也必须按当前会话文件重启。
         await self.client.ensure_running(session_file)
         # 首次同步 pi 侧会话文件路径
@@ -1049,43 +1048,84 @@ async def create_user_session(agent: AgentSession, storage: Storage, user_id: in
         raise
 
 
-async def switch_user_session(agent: AgentSession, storage: Storage, user_id: int, sid: str) -> str | None:
-    """供 Telegram 和后台共用的切换流程，含 JSONL 缺失恢复和失败回滚。"""
+def session_recovery_preview(agent: AgentSession, storage: Storage, user_id: int, sid: str) -> dict | None:
+    """描述缺失 JSONL 可恢复的内容；版本用于确认时防止使用过期预览。"""
+    row = storage.get_session(sid)
+    if row is None or row["user_id"] != user_id:
+        raise ValueError("会话不存在")
+    session_file = row["pi_session_file"]
+    if session_file and (Path(session_file).is_file() or agent.client.has_live_session(session_file)):
+        return None
+    memory = getattr(agent, "memory", None)
+    if memory is None:
+        raise PiError("会话文件缺失且未启用 SQLite 记忆，无法恢复")
+    summary = storage.get_summary(sid)
+    has_summary = bool(summary and summary["summary_text"])
+    covered = summary["covered_turn_id"] if summary else 0
+    turns = storage.latest_turns(sid, covered)
+    retained = turns[-memory.settings.memory_turn_retention:]
+    recovery = memory.build_recovery(sid)
+    version_data = json.dumps(
+        [sid, session_file, recovery, len(turns), [turn["id"] for turn in retained]],
+        ensure_ascii=False,
+    )
+    version = hashlib.sha256(version_data.encode("utf-8")).hexdigest()[:16]
+    summary_label = "有" if has_summary else "无"
+    mode = "部分恢复" if recovery else "空白恢复"
+    text = (f"⚠️ 会话「{row['name']}」的原始 JSONL 文件缺失。\n"
+            f"恢复方式：{mode}\nSQLite 摘要：{summary_label}\n"
+            f"可用完整回合：{len(retained)} 条"
+            + (f"（另有 {len(turns) - len(retained)} 条超出保留范围）" if len(turns) > len(retained) else "")
+            + f"\n实际恢复上下文：{len(recovery.encode('utf-8'))} 字节。\n"
+            + ("将创建新 pi 会话并注入上述 SQLite 上下文。" if recovery else "将创建不含历史上下文的新 pi 会话。")
+            + "原始对话无法逐字恢复；确认后旧文件关联会替换为新文件。")
+    return {"version": version, "recovery": recovery, "text": text, "mode": mode}
+
+
+async def switch_user_session(agent: AgentSession, storage: Storage, user_id: int, sid: str,
+                              recovery_version: str | None = None) -> str | None:
+    """供 Telegram 和后台共用的切换流程；文件缺失时须确认最新预览。"""
     if agent.client.busy or agent.prompt_pending:
         raise PiBusyError("当前任务仍在运行")
     row = storage.get_session(sid)
     if row is None or row["user_id"] != user_id:
         raise ValueError("会话不存在")
-    await agent.ensure_client()
-    # ensure_client 已处理当前会话的 JSONL 缺失；再次 reset 会把刚恢复的文件覆盖掉。
     previous = storage.get_active_session(user_id)
-    if previous is not None and "id" in previous and previous["id"] == sid:
+    preview = session_recovery_preview(agent, storage, user_id, sid)
+    if preview and recovery_version != preview["version"]:
+        raise SessionRecoveryRequired(sid)
+    if previous is not None and "id" in previous and previous["id"] == sid and preview is None:
+        await agent.ensure_client()
         notice = getattr(agent, "recovery_notice", None)
         agent.recovery_notice = None
         return notice
-    row = storage.get_session(sid)
-    memory_service = getattr(agent, "memory", None)
-    missing_file = memory_service is not None and (
-        not row["pi_session_file"] or (
-            not Path(row["pi_session_file"]).is_file()
-            and not agent.client.has_live_session(row["pi_session_file"])
-        )
-    )
-    if not row["pi_session_file"] and memory_service is None:
-        raise PiError("该会话没有可用的 pi 会话文件")
     previous_file = previous["pi_session_file"] if previous else None
+    previous_available = bool(previous_file and
+                              (Path(previous_file).is_file() or agent.client.has_live_session(previous_file)))
+    if previous_available:
+        await agent.ensure_client()
+    else:
+        await agent.refresh_persona()
+    # 异步初始化期间摘要可能更新，确认必须仍对应最新可恢复范围。
+    latest_preview = session_recovery_preview(agent, storage, user_id, sid)
+    if latest_preview and recovery_version != latest_preview["version"]:
+        raise PiError("恢复范围已变化，请重新预览并确认")
+    preview = latest_preview
     switch_attempted = False
     try:
         switch_attempted = True
-        if missing_file:
-            recovery = memory_service.build_recovery(sid)
+        if preview:
+            recovery = preview["recovery"]
             state = await agent.client.reset_session()
             new_file = state.get("sessionFile")
             if not new_file:
                 raise PiError("pi 未返回新会话文件")
             storage.set_session_recovery(sid, new_file, recovery)
-            notice = ("已从 SQLite 摘要恢复主要内容；旧 JSONL 未迁移"
-                      if recovery else "旧 JSONL 不存在，SQLite 也没有可用摘要；已创建空白会话")
+            notice = ("已按预览创建新会话并注入 SQLite 上下文；原始对话无法逐字恢复"
+                      if recovery else "已按预览创建空白会话；没有可恢复的 SQLite 上下文")
+        elif not previous_available:
+            await agent.client.ensure_running(row["pi_session_file"])
+            notice = None
         else:
             await agent.client.switch_session(row["pi_session_file"])
             notice = None
@@ -1093,7 +1133,7 @@ async def switch_user_session(agent: AgentSession, storage: Storage, user_id: in
     except Exception:
         if switch_attempted:
             try:
-                if not previous_file:
+                if not previous_available:
                     raise PiError("无法确认旧会话文件")
                 await agent.client.switch_session(previous_file)
             except Exception:
@@ -1153,7 +1193,7 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
     args = context.args
     sub = args[0] if args else ""
 
-    if sub in {"new", "use"} and (agent.client.busy or agent.prompt_pending or storage.count_user_queue(user.id)):
+    if sub in {"new", "use", "recover"} and (agent.client.busy or agent.prompt_pending or storage.count_user_queue(user.id)):
         await reply_text(update, "⏳ 仍有运行或排队的消息；请等待完成，或用 /stop 和 /queue clear 后再切换会话")
         return
 
@@ -1215,11 +1255,33 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
             await reply_text(update, f"找不到会话 {sid}")
             return
         try:
+            preview = session_recovery_preview(agent, storage, user.id, sid)
+            if preview:
+                buttons = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("确认恢复并切换", callback_data=f"session_recover:{sid}:{preview['version']}"),
+                    InlineKeyboardButton("取消", callback_data="confirm_cancel"),
+                ]])
+                await reply_text(update, preview["text"] + "\n确认后再发送原消息。", reply_markup=buttons)
+                return
             notice = await switch_user_session(agent, storage, user.id, sid)
         except Exception as e:
             logger.exception("切换会话失败", extra={"user_id": user.id, "err": str(e)[:300]})
             await reply_text(update, f"切换会话失败: {_friendly_error(e)}")
         else:
+            await reply_text(update, f"✅ 已切换到会话「{row['name']}」({sid})"
+                             + (f"\n{notice}" if notice else ""))
+
+    elif sub == "recover":
+        if len(args) != 3:
+            await reply_text(update, "请先用 /session use <id> 预览恢复范围，再点击确认。")
+            return
+        sid, version = args[1], args[2]
+        try:
+            notice = await switch_user_session(agent, storage, user.id, sid, version)
+        except (PiError, ValueError) as exc:
+            await reply_text(update, f"恢复失败：{_friendly_error(exc)}。请重新用 /session use <id> 预览。")
+        else:
+            row = storage.get_session(sid)
             await reply_text(update, f"✅ 已切换到会话「{row['name']}」({sid})"
                              + (f"\n{notice}" if notice else ""))
 
@@ -1229,7 +1291,7 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sub = context.args[0] if context.args else ""
-    if sub not in {"new", "use"}:
+    if sub not in {"new", "use", "recover"}:
         await _cmd_session_unlocked(update, context)
         return
     agent = context.bot_data["manager"].get(update.effective_user.id)
@@ -2139,6 +2201,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.args = ["use", data.split(":", 1)[1]]
         await cmd_session(update, context)
         return
+    if data.startswith("session_recover:"):
+        _, sid, version = data.split(":", 2)
+        context.args = ["recover", sid, version]
+        await cmd_session(update, context)
+        return
     if data.startswith("model_use:"):
         context.args = ["use", data.split(":", 1)[1]]
         await cmd_model(update, context)
@@ -2474,6 +2541,19 @@ async def _process_text(
                 return  # /queue clear 已取消这条尚未开始的更新
             try:
                 await agent.ensure_client()
+            except SessionRecoveryRequired as exc:
+                try:
+                    preview = session_recovery_preview(agent, storage, user.id, exc.session_id)
+                except PiError as recovery_error:
+                    await reply_text(update, f"⚠️ {_friendly_error(recovery_error)}")
+                    return
+                if preview:
+                    buttons = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("确认恢复", callback_data=f"session_recover:{exc.session_id}:{preview['version']}"),
+                        InlineKeyboardButton("取消", callback_data="confirm_cancel"),
+                    ]])
+                    await reply_text(update, preview["text"] + "\n确认后请重发这条消息。", reply_markup=buttons)
+                return
             except Exception as e:
                 logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
                 await reply_text(update, f"⚠️ pi 进程启动失败: {_friendly_error(e)}")

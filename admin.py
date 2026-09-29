@@ -21,7 +21,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from config import Settings
-from bot import create_user_session, switch_user_session
+from bot import create_user_session, session_recovery_preview, switch_user_session
 from costs import PricingCatalog, format_usd
 from logging_conf import get_logger
 from mail_service import MailSendError, email_address, send_email, smtp_settings as validate_smtp_settings
@@ -363,7 +363,7 @@ def _session_page(request: Request, csrf: str, user_id: int | None, error: str =
                '<label class="sr-only" for="session-name">会话名称</label>'
                '<input id="session-name" name="name" maxlength="60" placeholder="新会话名称" required>'
                '<button class="button primary" type="submit">新建会话</button></form>')
-        agent = request.app.state.manager._agents.get(user_id)
+        agent = request.app.state.manager.get(user_id)
         cards = []
         for row in storage.list_sessions(user_id):
             sid = _e(row["id"])
@@ -377,11 +377,28 @@ def _session_page(request: Request, csrf: str, user_id: int | None, error: str =
             if not exists and not live and has_summary:
                 file_state += " · SQLite 有摘要"
             active = row["status"] == "active"
-            switch = ('<span class="badge">当前</span>' if active else
-                      f'<form method="post" action="/admin/sessions/{sid}/use">'
-                      f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
-                      f'<input type="hidden" name="user_id" value="{user_id}">'
-                      '<button class="text-button" type="submit">切换</button></form>')
+            try:
+                preview = session_recovery_preview(agent, storage, user_id, row["id"])
+                preview_error = ""
+            except PiError as exc:
+                preview, preview_error = None, str(exc)
+            if preview:
+                description = _e(preview["text"]).replace("\n", "<br>")
+                switch = (f'<details><summary>预览恢复{("（当前）" if active else "")}</summary>'
+                          f'<p class="small">{description}</p>'
+                          f'<form method="post" action="/admin/sessions/{sid}/use">'
+                          f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                          f'<input type="hidden" name="user_id" value="{user_id}">'
+                          f'<input type="hidden" name="recovery_version" value="{preview["version"]}">'
+                          '<button class="button primary" type="submit">确认恢复并切换</button></form></details>')
+            elif preview_error:
+                switch = f'<span class="muted">{_e(preview_error)}</span>'
+            else:
+                switch = ('<span class="badge">当前</span>' if active else
+                          f'<form method="post" action="/admin/sessions/{sid}/use">'
+                          f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                          f'<input type="hidden" name="user_id" value="{user_id}">'
+                          '<button class="text-button" type="submit">切换</button></form>')
             rename = (f'<details><summary>重命名</summary><form method="post" action="/admin/sessions/{sid}/rename" class="inline-edit">'
                       f'<input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}">'
                       f'<input name="name" value="{_e(row["name"])}" maxlength="60" required>'
@@ -803,7 +820,8 @@ async def use_session(session_id: str, request: Request):
     agent = request.app.state.manager.get(user_id)
     try:
         async with agent.control_lock:
-            notice = await switch_user_session(agent, storage, user_id, session_id)
+            notice = await switch_user_session(agent, storage, user_id, session_id,
+                                               str(form.get("recovery_version") or ""))
     except (PiError, ValueError) as exc:
         return _session_page(request, csrf, user_id, str(exc))
     except Exception:

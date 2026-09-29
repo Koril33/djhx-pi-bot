@@ -245,6 +245,47 @@ class AdminTests(unittest.TestCase):
         self.assertIn("$0.0002", usage.text)
         self.assertEqual(self.client.get("/admin/usage?user_id=8").text.count("$0.0002"), 0)
 
+    def test_missing_session_requires_preview_confirmation(self):
+        from bot import session_recovery_preview
+        from memory import MemoryService
+
+        active = self.storage.create_session(7, "当前")
+        active_file = Path(self.folder.name) / "active.jsonl"
+        active_file.write_text("{}", encoding="utf-8")
+        self.storage.set_pi_session_file(active, str(active_file))
+        self.storage.set_active(active)
+        missing = self.storage.create_session(7, "需恢复")
+        self.storage.set_pi_session_file(missing, str(Path(self.folder.name) / "missing.jsonl"))
+        memory = MemoryService(self.settings, self.storage)
+        client = SimpleNamespace(
+            busy=False, has_live_session=Mock(return_value=False),
+            reset_session=AsyncMock(return_value={"sessionFile": str(Path(self.folder.name) / "new.jsonl")}),
+            switch_session=AsyncMock(), stop=AsyncMock(),
+        )
+        agent = SimpleNamespace(client=client, prompt_pending=False, memory=memory,
+                                ensure_client=AsyncMock(), refresh_persona=AsyncMock(),
+                                control_lock=asyncio.Lock(), recovery_notice=None)
+        self.manager._agents[7] = agent
+        self.manager.get = lambda user_id: agent
+        self.login()
+        page = self.client.get("/admin/sessions?user_id=7")
+        self.assertIn("预览恢复", page.text)
+        self.assertIn("空白恢复", page.text)
+        csrf = self.csrf(page)
+        no_confirmation = self.client.post(f"/admin/sessions/{missing}/use", data={
+            "csrf": csrf, "user_id": "7",
+        })
+        self.assertEqual(no_confirmation.status_code, 400)
+        client.reset_session.assert_not_awaited()
+        self.assertEqual(self.storage.get_active_session(7)["id"], active)
+        version = session_recovery_preview(agent, self.storage, 7, missing)["version"]
+        confirmed = self.client.post(f"/admin/sessions/{missing}/use", data={
+            "csrf": csrf, "user_id": "7", "recovery_version": version,
+        }, follow_redirects=False)
+        self.assertEqual(confirmed.status_code, 303)
+        client.reset_session.assert_awaited_once()
+        self.assertEqual(self.storage.get_active_session(7)["id"], missing)
+
     def test_session_manage_uses_shared_flow_and_checks_ownership(self):
         old = self.storage.create_session(7, "旧会话")
         self.storage.set_pi_session_file(old, "/old.jsonl")
@@ -281,6 +322,7 @@ class AdminTests(unittest.TestCase):
             "csrf": csrf, "user_id": "7", "name": "改名",
         }, follow_redirects=False).status_code, 303)
         self.assertEqual(self.storage.get_session(old)["name"], "改名")
+        client.has_live_session.return_value = True
         switched = self.client.post(f"/admin/sessions/{old}/use", data={
             "csrf": csrf, "user_id": "7",
         }, follow_redirects=False)

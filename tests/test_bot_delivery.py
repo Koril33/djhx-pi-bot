@@ -66,11 +66,12 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
         storage = Mock()
         storage.count_user_queue.return_value = 0
         storage.get_session.return_value = {
-            "id": "current", "user_id": 1, "pi_session_file": "/missing.jsonl",
+            "id": "current", "user_id": 1, "pi_session_file": "/restored.jsonl",
         }
         storage.get_active_session.return_value = {"id": "current", "pi_session_file": "/restored.jsonl"}
         client = SimpleNamespace(
             busy=False, reset_session=AsyncMock(), switch_session=AsyncMock(),
+            has_live_session=Mock(return_value=True),
         )
         agent = SimpleNamespace(
             client=client, prompt_pending=False, memory=Mock(),
@@ -128,7 +129,8 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
             pi_cmd="pi", pi_session_dir="/sessions", pi_provider=None, pi_model=None,
         )
         agent = bot.AgentSession(1, settings, storage)
-        agent.client = SimpleNamespace(ensure_running=AsyncMock(), get_state=AsyncMock())
+        agent.client = SimpleNamespace(ensure_running=AsyncMock(), get_state=AsyncMock(),
+                                       has_live_session=Mock(return_value=True))
         await agent.ensure_client()
         agent.client.ensure_running.assert_awaited_once_with("/current.jsonl")
         agent.client.get_state.assert_not_awaited()
@@ -235,7 +237,8 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
             bot_data={"settings": Mock(), "storage": storage, "manager": manager},
         )
         update = SimpleNamespace(effective_user=SimpleNamespace(id=1))
-        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply, \
+             patch("bot.Path.is_file", return_value=True):
             await bot.cmd_session(update, context)
         self.assertEqual(client.switch_session.await_args_list, [call("/new.jsonl"), call("/old.jsonl")])
         client.stop.assert_not_awaited()
@@ -264,7 +267,8 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
             bot_data={"settings": Mock(), "storage": storage, "manager": manager},
         )
         update = SimpleNamespace(effective_user=SimpleNamespace(id=1))
-        with patch.object(bot, "reply_text", new_callable=AsyncMock):
+        with patch.object(bot, "reply_text", new_callable=AsyncMock), \
+             patch("bot.Path.is_file", return_value=True):
             await bot.cmd_session(update, context)
         self.assertEqual(client.switch_session.await_args_list, [call("/new.jsonl"), call("/old.jsonl")])
         storage.set_active.assert_not_called()

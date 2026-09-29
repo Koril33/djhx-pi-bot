@@ -410,12 +410,47 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
             client = client_type.return_value
             client.reset_session = AsyncMock(return_value={"sessionFile": "/new/history.jsonl"})
             client.has_live_session.return_value = False
+            client.busy = False
             agent = AgentSession(7, self.settings, self.storage, self.memory)
-            await agent.ensure_client()
+            with self.assertRaises(bot.SessionRecoveryRequired):
+                await agent.ensure_client()
+            client.reset_session.assert_not_awaited()
+            preview = bot.session_recovery_preview(agent, self.storage, 7, self.sid)
+            self.assertIn("部分恢复", preview["text"])
+            self.assertIn("旧会话已讨论问候", preview["recovery"])
+            with self.assertRaises(bot.SessionRecoveryRequired):
+                await bot.switch_user_session(agent, self.storage, 7, self.sid)
+            client.reset_session.assert_not_awaited()
+            await bot.switch_user_session(agent, self.storage, 7, self.sid, preview["version"])
         self.assertEqual(self.storage.get_active_session(7)["id"], self.sid)
         self.assertEqual(self.storage.get_active_session(7)["pi_session_file"], "/new/history.jsonl")
         self.assertIn("旧会话已讨论问候", self.storage.get_session_recovery(self.sid,
                                                         "/new/history.jsonl"))
+
+    async def test_recovery_preview_distinguishes_blank_and_rejects_stale_confirmation(self):
+        blank = self.storage.create_session(7, "空白测试")
+        self.storage.set_pi_session_file(blank, "/missing/blank.jsonl")
+        with patch("bot.PiRpcClient") as client_type:
+            client = client_type.return_value
+            client.busy = False
+            client.has_live_session.return_value = False
+            client.reset_session = AsyncMock(return_value={"sessionFile": "/new/blank.jsonl"})
+            agent = AgentSession(7, self.settings, self.storage, self.memory)
+            preview = bot.session_recovery_preview(agent, self.storage, 7, blank)
+            self.assertEqual(preview["mode"], "空白恢复")
+            self.assertIn("可用完整回合：0 条", preview["text"])
+            self.assertEqual(preview["recovery"], "")
+            with self.assertRaises(ValueError):
+                bot.session_recovery_preview(agent, self.storage, 8, blank)
+            turn = self.storage.start_turn(7, blank, None, "后来补录", False)
+            self.storage.finish_turn(turn, "可恢复内容", complete=True)
+            with self.assertRaises(bot.SessionRecoveryRequired):
+                await bot.switch_user_session(agent, self.storage, 7, blank, preview["version"])
+            client.reset_session.assert_not_awaited()
+            fresh = bot.session_recovery_preview(agent, self.storage, 7, blank)
+            self.assertEqual(fresh["mode"], "部分恢复")
+            self.assertNotEqual(fresh["version"], preview["version"])
+            self.assertEqual(self.storage.get_active_session(7)["id"], self.sid)
 
     async def test_chat_persona_is_versioned_and_loaded_only_for_chat(self):
         with patch("bot.PiRpcClient") as client_type:
