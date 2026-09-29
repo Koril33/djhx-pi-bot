@@ -34,6 +34,14 @@ class ToolActivityTests(unittest.IsolatedAsyncioTestCase):
             })
             event = client._event_queue.get_nowait()
             self.assertEqual(event, {"type": "tool_execution_start", "toolName": "bash"})
+            await client._route_event(proc, {
+                "type": "tool_execution_end", "toolName": "bash",
+                "isError": False, "result": "SECRET_TOKEN_123",
+            })
+            ended = client._event_queue.get_nowait()
+            self.assertEqual(ended, {
+                "type": "tool_execution_end", "toolName": "bash", "isError": False,
+            })
 
 
 if __name__ == "__main__":

@@ -802,7 +802,12 @@ async def stream_reply(
             idle_timeout = max(0.0, next_idle - time.monotonic())
             timeout = min(timeout, idle_timeout) if timeout is not None else idle_timeout
             try:
-                kind, value = await asyncio.wait_for(events.get(), timeout=timeout)
+                # wait_for(timeout=0) 即使队列已有事件也会直接取消 get；
+                # 优先消费积压事件，且给极短定时器留出一次事件循环调度。
+                if events.empty():
+                    kind, value = await asyncio.wait_for(events.get(), timeout=max(0.001, timeout))
+                else:
+                    kind, value = events.get_nowait()
             except asyncio.TimeoutError:
                 now = time.monotonic()
                 if now >= next_idle and events.empty():
@@ -832,7 +837,8 @@ async def stream_reply(
         if activity_holder is not None and activity_holder.get("current"):
             activity_holder["current"] = None
             dirty = True
-        await flush()
+        if buf:
+            await flush()
 
         if producer_error is not None:
             logger.error(
@@ -849,13 +855,21 @@ async def stream_reply(
             else:
                 await _send(target.reply_text, interrupted)
         elif not buf:
-            # 工具型回合可能没有文本；若已发思考占位，不要将它永久留在聊天中。
+            # 空文本回合也要给明确结果，避免思考/工具状态一直留在聊天中。
+            completed_tools = int(activity_holder.get("completed", 0)) if activity_holder else 0
+            failed_tools = int(activity_holder.get("failed", 0)) if activity_holder else 0
+            if failed_tools:
+                result = "⚠️ 工具执行出现失败，本轮没有文字回复；请查看任务结果后重试。"
+            elif completed_tools:
+                result = "✅ 工具操作已完成；本轮没有文字回复。"
+            else:
+                result = "⚠️ 本轮没有文字回复，请重试或换个说法。"
             if msg is None and placeholder is not None:
                 msg = placeholder.get("msg")
             if msg is not None:
-                await _send(None, "(无输出)", edit=True, msg=msg)
+                await _send(None, result, edit=True, msg=msg)
             else:
-                await _send(target.reply_text, "(无输出)")
+                await _send(target.reply_text, result)
     except Exception as e:
         logger.exception("流式回复发送异常", extra={"err_type": type(e).__name__, "err": str(e)[:200]})
         if isinstance(e, (*_TG_NET_EXC, RetryAfter)):
@@ -2415,13 +2429,16 @@ async def _process_text(
 
         # 思考占位 + 工具活动状态
         placeholder = {"msg": None}
-        activity = {"current": None}
+        activity = {"current": None, "completed": 0, "failed": 0}
 
         async def on_thinking() -> None:
             if placeholder["msg"] is None:
                 placeholder["msg"] = await _send(update.message.reply_text, "🤔 深度思考中…")
 
         def on_tool(tool_name: str, phase: str, args: dict | None) -> None:
+            if phase == "end":
+                key = "failed" if (args or {}).get("is_error") else "completed"
+                activity[key] += 1
             activity["current"] = _tool_activity(tool_name, phase, args)
             notify = activity.get("notify")
             if notify is not None:

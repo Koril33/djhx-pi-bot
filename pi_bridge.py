@@ -208,7 +208,8 @@ class PiRpcClient:
             # 工具参数可能包含命令、文件路径和凭据；界面只需要工具类别。
             routed = {"type": etype, "toolName": str(event.get("toolName") or "")[:80]}
         elif etype == "tool_execution_end":
-            routed = {"type": etype, "toolName": str(event.get("toolName") or "")[:80]}
+            routed = {"type": etype, "toolName": str(event.get("toolName") or "")[:80],
+                      "isError": event.get("isError") is True}
         elif etype == "message_end":
             message = event.get("message") or {}
             if isinstance(message, dict) and message.get("role") == "assistant":
@@ -362,7 +363,7 @@ class PiRpcClient:
         on_thinking：首次出现思考（thinking_delta）时回调一次（无参数），
                      用于 bot 层发「思考中」占位；不展示思考内容本身。
         on_tool(tool_name, phase, args)：工具执行开始/结束时回调，
-                     phase 为 "start"/"end"，end 时 args 为 None。
+                     phase 为 "start"/"end"，end 时 args 仅含 is_error 布尔值。
                      回调须轻量（仅更新状态），避免阻塞流式循环。
         """
         await self.ensure_running()
@@ -426,7 +427,8 @@ class PiRpcClient:
                 elif etype == "tool_execution_start":
                     await _invoke(on_tool, event.get("toolName", ""), "start", event.get("args") or {})
                 elif etype == "tool_execution_end":
-                    await _invoke(on_tool, event.get("toolName", ""), "end", None)
+                    await _invoke(on_tool, event.get("toolName", ""), "end",
+                                  {"is_error": event.get("isError") is True})
                 elif etype == "message_end":
                     message = event.get("message") or {}
                     if message.get("role") == "assistant":

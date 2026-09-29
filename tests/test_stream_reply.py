@@ -95,10 +95,10 @@ class StreamReplyTests(unittest.IsolatedAsyncioTestCase):
             yield "最终回复"
 
         with patch.object(bot, "_send", side_effect=fake_send):
-            await bot.stream_reply(
+            await asyncio.wait_for(bot.stream_reply(
                 _FakeUpdate(), deltas(), interval=0,
                 initial_delay=0, idle_interval=0.02,
-            )
+            ), timeout=1)
         self.assertTrue(any("等待模型响应" in call and "已进行" in call for call in calls))
         self.assertEqual(calls[-1], "最终回复")
 
@@ -125,6 +125,59 @@ class StreamReplyTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(any("等待工具完成" in call for call in calls))
         self.assertEqual(calls[-1], "完成")
+
+    async def test_tool_only_turn_has_clear_completion(self) -> None:
+        calls = []
+
+        async def fake_send(send_fn, text, *, edit=False, msg=None, reply_markup=None):
+            calls.append(text)
+            return True if edit else _SentMessage()
+
+        async def deltas():
+            if False:
+                yield ""
+
+        with patch.object(bot, "_send", side_effect=fake_send):
+            await bot.stream_reply(
+                _FakeUpdate(), deltas(), interval=0,
+                activity_holder={"current": None, "completed": 1},
+                placeholder={"msg": _SentMessage()},
+            )
+        self.assertEqual(calls, ["✅ 工具操作已完成；本轮没有文字回复。"])
+
+    async def test_failed_tool_is_not_reported_as_success(self) -> None:
+        calls = []
+
+        async def fake_send(send_fn, text, *, edit=False, msg=None, reply_markup=None):
+            calls.append(text)
+            return True if edit else _SentMessage()
+
+        async def deltas():
+            if False:
+                yield ""
+
+        with patch.object(bot, "_send", side_effect=fake_send):
+            await bot.stream_reply(
+                _FakeUpdate(), deltas(), interval=0,
+                activity_holder={"current": None, "completed": 1, "failed": 1},
+            )
+        self.assertIn("出现失败", calls[-1])
+        self.assertNotIn("✅", calls[-1])
+
+    async def test_empty_turn_without_tool_has_retry_guidance(self) -> None:
+        calls = []
+
+        async def fake_send(send_fn, text, *, edit=False, msg=None, reply_markup=None):
+            calls.append(text)
+            return True if edit else _SentMessage()
+
+        async def deltas():
+            if False:
+                yield ""
+
+        with patch.object(bot, "_send", side_effect=fake_send):
+            await bot.stream_reply(_FakeUpdate(), deltas(), interval=0)
+        self.assertEqual(calls, ["⚠️ 本轮没有文字回复，请重试或换个说法。"])
 
     async def test_empty_timeout_has_readable_error(self) -> None:
         calls: list[tuple[str, bool]] = []

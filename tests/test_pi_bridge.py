@@ -80,6 +80,22 @@ class PiRpcClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received[0]["occurred_at"], 1790215200)
         self.assertEqual(received[0]["usage"]["cacheRead"], 3)
 
+    async def test_tool_end_exposes_only_error_flag_to_callback(self) -> None:
+        def on_command(command):
+            proc.emit({"id": command["id"], "type": "response", "command": "prompt", "success": True})
+            proc.emit({"type": "tool_execution_end", "toolName": "bash",
+                       "isError": False, "result": "private output"})
+            proc.emit({"type": "agent_settled"})
+
+        proc = FakeProc(on_command)
+        seen = []
+        with patch("pi_bridge.asyncio.create_subprocess_exec", return_value=proc):
+            result = "".join([part async for part in self.client.prompt(
+                "hello", on_tool=lambda *args: seen.append(args),
+            )])
+        self.assertEqual(result, "")
+        self.assertEqual(seen, [("bash", "end", {"is_error": False})])
+
     async def test_reads_120kb_record_and_waits_for_agent_settled(self) -> None:
         def on_command(command):
             proc.emit({"id": command["id"], "type": "response", "command": "prompt", "success": True})
