@@ -1922,18 +1922,45 @@ async def _download_image(message, *, user_id: int | None = None) -> dict[str, s
     return {"type": "image", "data": base64.b64encode(data).decode("ascii"), "mimeType": mime_type}
 
 
+class ImageModelUnavailable(ValueError):
+    """当前模型无法确认支持图片；原消息须在切换模型后由用户重发。"""
+
+
+async def image_model_switch_markup(client: PiRpcClient) -> InlineKeyboardMarkup | None:
+    try:
+        models = await client.get_available_models()
+    except Exception:
+        logger.warning("获取图片模型快捷选择失败")
+        return None
+    buttons = []
+    for item in models:
+        if "image" not in (item.get("input") or []):
+            continue
+        provider, model_id = item.get("provider"), item.get("id")
+        if not provider or not model_id:
+            continue
+        callback = f"model_use:{provider}/{model_id}"
+        if len(callback.encode("utf-8")) <= 64:
+            buttons.append([InlineKeyboardButton(
+                f"🖼 切换到 {provider}/{model_id}"[:60], callback_data=callback,
+            )])
+        if len(buttons) >= 8:
+            break
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
 async def _model_accepts_images(client: PiRpcClient) -> bool:
     """从 pi 当前模型的能力元数据确认图片支持，避免图片被静默丢弃。"""
     state = await client.get_state()
     model = state.get("model")
     if isinstance(model, dict) and isinstance(model.get("input"), list):
         return "image" in model["input"]
-    raise ValueError("无法确认当前模型的图片能力，请用 /model list 选择带 🖼 标记的模型后重发")
+    raise ImageModelUnavailable("无法确认当前模型的图片能力。")
 
 
 async def _prepare_images(client: PiRpcClient, message, *, user_id: int | None = None) -> list[dict[str, str]]:
     if not await _model_accepts_images(client):
-        raise ValueError("当前模型不支持图片输入，请用 /model list 选择带 🖼 标记的模型后重发")
+        raise ImageModelUnavailable("当前模型不支持图片输入。")
     return [await _download_image(message, user_id=user_id)]
 
 async def _process_text(
@@ -2044,7 +2071,7 @@ async def _process_text(
             try:
                 if album_messages:
                     if not await _model_accepts_images(agent.client):
-                        raise ValueError("当前模型不支持图片输入，请用 /model list 选择带 🖼 标记的模型后重发")
+                        raise ImageModelUnavailable("当前模型不支持图片输入。")
                     images = [await _download_image(item, user_id=user.id) for item in album_messages]
                     actual_bytes = sum((len(image["data"]) // 4) * 3 - image["data"].count("=") for image in images)
                     if actual_bytes > MAX_ALBUM_BYTES:
@@ -2054,6 +2081,15 @@ async def _process_text(
                 elif has_text_document:
                     content = await _download_text_document(message.document, user_id=user.id)
                     text = _with_text_document(text, message.document, content)
+            except ImageModelUnavailable as exc:
+                buttons = await image_model_switch_markup(agent.client)
+                await reply_text(
+                    update,
+                    f"⚠️ {exc}请选择支持图片的模型；切换成功后请重新发送刚才的图片"
+                    "（或相册）。可用 /model list 查看全部模型。",
+                    reply_markup=buttons,
+                )
+                return
             except ValueError as exc:
                 await reply_text(update, f"⚠️ {exc}")
                 return

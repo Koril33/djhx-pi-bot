@@ -178,6 +178,7 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         self.client = SimpleNamespace(
             busy=False,
             get_state=AsyncMock(return_value={"model": {"input": ["text", "image"]}}),
+            get_available_models=AsyncMock(return_value=[]),
             prompt=prompt,
             steer=AsyncMock(),
         )
@@ -285,11 +286,18 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
             await bot.on_text(self.update, self.context)
         self.assertEqual(self.calls[0][0], "请分析这张图片。")
 
-    async def test_unsupported_model_is_explained_without_download(self):
+    async def test_unsupported_model_offers_image_model_without_download(self):
         self.client.get_state.return_value = {"model": {"input": ["text"]}}
+        self.client.get_available_models = AsyncMock(return_value=[
+            {"provider": "deepseek", "id": "flash", "input": ["text", "image"]},
+            {"provider": "deepseek", "id": "pro", "input": ["text"]},
+        ])
         with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
             await bot.on_text(self.update, self.context)
         self.assertIn("不支持图片", reply.await_args.args[1])
+        self.assertIn("重新发送", reply.await_args.args[1])
+        buttons = reply.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual(buttons[0][0].callback_data, "model_use:deepseek/flash")
         self.media.get_file.assert_not_awaited()
         self.assertFalse(self.agent.prompt_pending)
 
