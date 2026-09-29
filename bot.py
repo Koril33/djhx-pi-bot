@@ -38,7 +38,7 @@ from telegram.ext import (
 
 from config import Settings
 from costs import PricingCatalog, format_usd
-from memory import MemoryService, looks_secret, safe_turn_text
+from memory import MemoryService, looks_secret, memory_match, safe_turn_text
 from persona import persona_prompt_path, render_persona, write_prompt
 from logging_conf import get_logger
 from mail_service import send_email
@@ -1855,6 +1855,28 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             reply_markup=InlineKeyboardMarkup([nav]) if nav else None,
         )
         return
+    if sub == "search":
+        query = " ".join(args[1:]).strip()
+        if not query:
+            await reply_text(update, "用法：/memory search <关键词>")
+            return
+        matches = []
+        for row in storage.list_memories(user_id):
+            score, reason = memory_match(row["text"], query)
+            if score:
+                matches.append((score, row, reason))
+        matches.sort(key=lambda item: (item[0], item[1]["pinned"], item[1]["updated_at"]), reverse=True)
+        if not matches:
+            await reply_text(update, "没有找到相关长期记忆；可尝试更短的中文短语或关键词")
+            return
+        lines = [f"🔎 记忆匹配（共 {len(matches)} 条，显示前 8 条）"]
+        for _, row, reason in matches[:8]:
+            marker = "📌 " if row["pinned"] else ""
+            lines.append(f"{marker}{row['id']}：{row['text']}")
+            lines.append(f"  {reason}" + ("；置顶" if row["pinned"] else ""))
+        lines.append("实际注入受条数、字节上限及会话恢复内容影响；用 /memory used 查询本轮结果。")
+        await reply_text(update, "\n".join(lines))
+        return
     if sub == "used":
         active = storage.get_active_session(user_id)
         if active is None:
@@ -1899,11 +1921,12 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         for item in items:
             source = {"auto": "自动提取", "manual": "手动添加"}.get(item["source"], "其他")
             lines.append(f"• {item['id']}（{source}）：{item['text']}")
+            lines.append(f"  依据：{item.get('reason') or '旧回合未记录'}")
         lines.append("仅记录 SQLite 长期记忆；会话摘要和 pi 历史不在此列表。")
         await reply_text(update, "\n".join(lines))
         return
     if sub not in {"add", "edit", "delete", "pin", "unpin"}:
-        await reply_text(update, "用法：/memory list [页码] | used [list|回合ID] | add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
+        await reply_text(update, "用法：/memory list [页码] | search <关键词> | used [list|回合ID] | add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
         return
     agent = manager.get(user_id)
     async with agent.control_lock:

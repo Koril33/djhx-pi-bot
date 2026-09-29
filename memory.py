@@ -1,6 +1,7 @@
 """SQLite 长期记忆、会话摘要与 pi 请求临时上下文。"""
 
 import asyncio
+from difflib import SequenceMatcher
 import json
 import os
 import re
@@ -33,14 +34,34 @@ def looks_secret(text: str) -> bool:
     return _SECRET.search(text) is not None
 
 
+_QUERY_NOISE = {"请问", "帮我", "一下", "这个", "那个", "什么", "怎么", "可以", "是否", "关于"}
+
+
+def memory_match(item: str, query: str) -> tuple[int, str]:
+    """返回中文连续短语与英文关键词的匹配分数和可解释依据。"""
+    query_text = query.casefold().strip()[:200]
+    item_text = item.casefold().strip()
+    if not query_text or not item_text:
+        return 0, ""
+    matches = []
+    for block in SequenceMatcher(None, query_text, item_text, autojunk=False).get_matching_blocks():
+        phrase = query_text[block.a:block.a + block.size].strip()
+        if len(phrase) < 2 or phrase in _QUERY_NOISE:
+            continue
+        if not any("\u4e00" <= char <= "\u9fff" for char in phrase) and len(phrase) < 3:
+            continue
+        matches.append(phrase)
+    if not matches:
+        return 0, ""
+    score = sum(len(phrase) ** 2 for phrase in matches)
+    if query_text in item_text or item_text in query_text:
+        score += 12
+    phrases = sorted(set(matches), key=lambda phrase: (-len(phrase), phrase))[:3]
+    return score, "命中：" + "、".join(phrases)
+
+
 def _score(item: str, query: str) -> int:
-    query = query.casefold()
-    item = item.casefold()
-    if not query or not item:
-        return 0
-    score = 5 if item in query or query in item else 0
-    pairs = {query[i:i + 2] for i in range(max(0, len(query) - 1))}
-    return score + sum(pair in item for pair in pairs)
+    return memory_match(item, query)[0]
 
 
 class MemoryService:
@@ -107,8 +128,13 @@ class MemoryService:
             padded_section = "\n" + memory_section + "\n"
             for row in selected_rows:
                 if "\n- " + row["text"] + "\n" in padded_section:
+                    _, match_reason = memory_match(row["text"], query)
+                    reason = "置顶" if row["pinned"] else ""
+                    if match_reason:
+                        reason = (reason + "；" if reason else "") + match_reason
                     selection_holder.append({
                         "id": row["id"], "text": row["text"], "source": row["source"],
+                        "reason": reason or "背景补充",
                     })
         return body
 

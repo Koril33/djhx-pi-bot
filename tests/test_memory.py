@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 from bot import AgentSession
-from memory import MemoryService, safe_turn_text
+from memory import MemoryService, memory_match, safe_turn_text
 from storage import Storage
 from scripts.backup_db import main as backup_main
 
@@ -60,7 +60,14 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertEqual(len(used), 1)
         self.assertIn("- " + used[0]["text"], body)
         self.assertNotIn("记忆内容 1 " + "甲" * 30, body)
-        self.assertTrue(all(set(item) == {"id", "text", "source"} for item in used))
+        self.assertTrue(all(set(item) == {"id", "text", "source", "reason"} for item in used))
+
+    def test_chinese_phrase_match_has_explainable_priority(self):
+        specific = memory_match("偏好：请使用简体中文", "能不能用简体中文给我回答")
+        generic = memory_match("我今天想喝茶", "能不能用简体中文给我回答")
+        self.assertGreater(specific[0], generic[0])
+        self.assertIn("简体中文", specific[1])
+        self.assertEqual(memory_match("无关内容", "异步取消")[0], 0)
 
     def test_turn_memory_snapshot_is_scoped_and_survives_memory_edit(self):
         memory_id = self.storage.add_memory(7, "原始记忆", limit=4)
@@ -196,11 +203,27 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.storage._conn.close()
         self.folder.cleanup()
 
+    async def test_memory_search_shows_phrase_basis_and_user_scope(self):
+        specific_id = self.storage.add_memory(7, "偏好：请使用简体中文", limit=4)
+        self.storage.add_memory(7, "我今天想喝茶", limit=4)
+        self.storage.add_memory(8, "他人的简体中文记忆", limit=4)
+        manager = SimpleNamespace(memory=self.memory)
+        context = SimpleNamespace(args=["search", "能不能用简体中文给我回答"], bot_data={
+            "settings": self.settings, "storage": self.storage, "manager": manager,
+        })
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_memory(update, context)
+        result = reply.await_args.args[1]
+        self.assertIn(specific_id, result)
+        self.assertIn("命中：用简体中文", result)
+        self.assertNotIn("他人的简体中文记忆", result)
+
     async def test_memory_used_command_reads_current_session_snapshot_only(self):
         memory_id = self.storage.add_memory(7, "回合当时的记忆", limit=4)
         turn_id = self.storage.start_turn(7, self.sid, 555, "本轮问题", False)
         self.storage.set_turn_memories(turn_id, [
-            {"id": memory_id, "text": "回合当时的记忆", "source": "manual"},
+            {"id": memory_id, "text": "回合当时的记忆", "source": "manual", "reason": "命中：记忆"},
         ])
         self.storage.finish_turn(turn_id, "回答", complete=True)
         manager = SimpleNamespace(memory=self.memory)
@@ -211,6 +234,7 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
             await bot.cmd_memory(update, context)
             self.assertIn("回合当时的记忆", reply.await_args.args[1])
+            self.assertIn("依据：命中：记忆", reply.await_args.args[1])
             self.assertIn(f"#{turn_id}", reply.await_args.args[1])
             context.args = ["used", "list"]
             await bot.cmd_memory(update, context)
