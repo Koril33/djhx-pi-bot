@@ -76,6 +76,32 @@ class AdminTests(unittest.TestCase):
         send.assert_called_once()
         self.assertEqual(send.call_args.args[1], "admin@example.com")
 
+    def test_failed_updates_show_safe_metadata_and_side_effect_risk(self):
+        sid = self.storage.create_session(7, "诊断")
+        self.storage.enqueue_update(701, '{"secret":"must-not-render"}',
+                                    user_id=7, session_id=sid, queueable=True)
+        self.storage.claim_updates(1)
+        self.storage.fail_update(701, "RuntimeError: private diagnostic")
+        self.storage.enqueue_update(702, '{"secret":"must-not-render"}',
+                                    user_id=7, session_id=sid, queueable=True)
+        self.storage.claim_updates(1)
+        self.storage.begin_update(702)
+        self.storage.fail_update(702, "RuntimeError: private diagnostic")
+        self.login()
+        page = self.client.get("/admin/overview?user_id=7")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("#701", page.text)
+        self.assertIn("#702", page.text)
+        self.assertIn(f"会话 {sid}", page.text)
+        self.assertIn("用户 7", page.text)
+        self.assertIn("尝试 1 次", page.text)
+        self.assertIn("未开始处理", page.text)
+        self.assertIn("有副作用风险", page.text)
+        self.assertIn("先核对工具、消息和外部结果", page.text)
+        self.assertNotIn("must-not-render", page.text)
+        self.assertNotIn("private diagnostic", page.text)
+        self.assertNotIn("payload", self.storage.get_recent_failed_updates()[0].keys())
+
     def test_overview_shows_refresh_time_and_refreshes_status(self):
         self.login()
         first = self.client.get("/admin/overview?user_id=7")

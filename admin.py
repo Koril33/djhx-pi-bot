@@ -339,11 +339,28 @@ def _overview_page(request: Request, csrf: str, user_id: int | None) -> HTMLResp
             reason = error.split(":", 1)[0].strip()[:64]
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", reason):
                 reason = "处理失败"
-        failed.append(f'<div class="list-row"><span class="mono">#{_e(row["update_id"])}</span>'
-                      f'<span>{_e(reason)}</span><span class="muted">{_e(_time_label(row["processed_at"]))}</span>'
-                      f'<form method="post" action="/admin/updates/{row["update_id"]}/acknowledge">'
-                      f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
-                      f'<button class="text-button" type="submit">标记已处理</button></form></div>')
+        low_risk = bool(row["safe_to_retry"])
+        risk = ("处理器尚未开始；原消息已清除，可请用户重新发送"
+                if low_risk else
+                "处理可能已产生副作用；请先核对工具、消息和外部结果，再决定是否重发")
+        notice = ("通知待发送" if row["failure_notice_pending"] else
+                  "已通知用户" if row["failure_notice_sent_at"] else "无通知记录")
+        details = (f'用户 {_e(row["user_id"] if row["user_id"] is not None else "未知")} · '
+                   f'会话 {_e(row["session_id"] or "未关联")} · 尝试 {row["attempts"]} 次 · '
+                   f'{"普通消息" if row["queueable"] else "优先更新"} · {notice}')
+        failed.append(
+            f'<article class="failure-card"><div class="failure-head">'
+            f'<strong class="mono">#{_e(row["update_id"])}</strong><span>{_e(reason)}</span>'
+            f'<span class="badge {"risk-low" if low_risk else "risk-high"}">'
+            f'{"未开始处理" if low_risk else "有副作用风险"}</span></div>'
+            f'<p class="failure-meta">{details}</p>'
+            f'<p class="failure-meta">接收 {_e(_time_label(row["received_at"]))} · '
+            f'失败 {_e(_time_label(row["processed_at"]))}</p>'
+            f'<p class="failure-risk">{_e(risk)}</p>'
+            f'<form method="post" action="/admin/updates/{row["update_id"]}/acknowledge">'
+            f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+            f'<button class="text-button" type="submit">标记已处理</button></form></article>'
+        )
     failure_html = "".join(failed) or '<p class="empty small">没有失败更新</p>'
     refreshed_at = datetime.now(_CST)
     refresh = (f'<form method="get" action="/admin/overview" class="overview-refresh">'

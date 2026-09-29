@@ -1142,7 +1142,9 @@ class Storage:
     def get_recent_failed_updates(self, limit: int = 5) -> list[sqlite3.Row]:
         """后台只取故障元数据；不读取 Telegram 原始消息载荷。"""
         return self._query(
-            "SELECT update_id, processed_at, attempts, last_error FROM telegram_updates "
+            "SELECT update_id, user_id, session_id, queueable, safe_to_retry, attempts, "
+            "received_at, processed_at, failure_notice_pending, failure_notice_sent_at, last_error "
+            "FROM telegram_updates "
             "WHERE state = 'failed' ORDER BY processed_at DESC LIMIT ?", (limit,),
         )
 

@@ -344,6 +344,13 @@ width:0}
 .usage-caption{color:var(--muted);font-size:12px;margin:16px 0 0;line-height:1.7}
 .overview-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .overview-timestamp{margin:-8px 0 20px;color:var(--muted);font-size:12px}
+.failure-card{padding:16px;border-bottom:1px solid var(--line)}
+.failure-card:last-child{border-bottom:0}
+.failure-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.failure-meta{margin:8px 0 0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.failure-risk{margin:10px 0;color:var(--text);line-height:1.5}
+.badge.risk-high{color:#f2ae9d;border-color:#70433c}
+.badge.risk-low{color:#9bd5b7;border-color:#315b45}
 .mail-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:19px 30px}
 .mail-field{display:grid;gap:8px;min-width:0;color:var(--muted);font-size:12px}
 .mail-field input,.mail-field select{width:100%;min-width:0;color:var(--text)}
