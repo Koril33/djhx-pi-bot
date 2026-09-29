@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bot import AgentSession, cmd_persona
+from bot import AgentSession, cmd_persona, on_callback
 from config import Settings
 from admin import _run_persona_test
 from persona import render_persona, validate_persona
@@ -121,6 +121,27 @@ class PersonaAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.ensure_running.call_args.args[0], "/existing/history.jsonl")
         self.assertEqual(self.storage.get_active_session(7)["id"], session_id)
         self.assertFalse(agent.persona_file.exists())
+
+    async def test_persona_list_buttons_switch_through_callback(self):
+        new_id = self.storage.create_persona({"name": "工作伙伴", "identity": "你是工作伙伴。"})
+        agent = SimpleNamespace(control_lock=asyncio.Lock(), client=SimpleNamespace(busy=False),
+                                prompt_pending=False)
+        context = SimpleNamespace(args=["list"], bot_data={
+            "storage": self.storage, "manager": SimpleNamespace(get=lambda user_id: agent),
+        })
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        with patch("bot.reply_text", new_callable=AsyncMock) as reply:
+            await cmd_persona(update, context)
+        buttons = reply.await_args.kwargs["reply_markup"].inline_keyboard
+        callbacks = [row[0].callback_data for row in buttons]
+        self.assertIn("persona_use:none", callbacks)
+        self.assertIn(f"persona_use:{new_id}", callbacks)
+        query = SimpleNamespace(data=f"persona_use:{new_id}", answer=AsyncMock())
+        update.callback_query = query
+        with patch("bot.reply_text", new_callable=AsyncMock):
+            await on_callback(update, context)
+        query.answer.assert_awaited_once()
+        self.assertEqual(self.storage.get_active_persona(7)["id"], new_id)
 
     async def test_telegram_command_selects_persona(self):
         new_id = self.storage.create_persona({"name": "工作伙伴", "identity": "你是工作伙伴。"})

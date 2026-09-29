@@ -1300,8 +1300,18 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"{'●' if active is not None and row['id'] == active['id'] else '○'} {row['name']} ({row['id']})"
             for row in rows
         ]
-        lines.append("切换：/persona use <id|none>")
-        await reply_text(update, "\n".join(lines))
+        lines.append("点击下方按钮切换，或使用 /persona use <id|none>。")
+        buttons = [[InlineKeyboardButton(
+            f"{'●' if active is None else '○'} 无人格（Pi 默认）", callback_data="persona_use:none",
+        )]]
+        buttons.extend([
+            [InlineKeyboardButton(
+                f"{'●' if active is not None and row['id'] == active['id'] else '○'} {row['name']}"[:50],
+                callback_data=f"persona_use:{row['id']}",
+            )]
+            for row in rows
+        ])
+        await reply_text(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
         return
     if sub != "use" or len(args) != 2:
         await reply_text(update, "用法：/persona current | /persona list | /persona use <id|none>")
@@ -1832,6 +1842,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data.startswith("model_use:"):
         context.args = ["use", data.split(":", 1)[1]]
         await cmd_model(update, context)
+        return
+    if data.startswith("persona_use:"):
+        context.args = ["use", data.split(":", 1)[1]]
+        await cmd_persona(update, context)
         return
     if data.startswith("mail_confirm:"):
         context.args = ["confirm", data.split(":", 1)[1]]
