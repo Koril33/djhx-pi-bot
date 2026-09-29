@@ -191,12 +191,17 @@ class MemoryService:
             if len(turns) < self.settings.memory_batch_turns:
                 return
             # 旧摘要、说明和新回合共同受同一个输入字节预算约束。
+            extract_enabled = self.storage.get_user_auto_memory(user_id) is not False
+            memory_instruction = (
+                "memories 是用户跨会话仍有用的稳定偏好或事实字符串数组，"
+                "不要加入项目细节、猜测、密码、密钥、token 或一次性信息；没有则用空数组。"
+                if extract_enabled else "自动记忆已暂停，memories 固定返回空数组。"
+            )
             instruction_head = (
                 "请把旧摘要和新回合整理为 JSON 对象，只包含 summary 和 memories 两个键。"
                 "summary 是本会话目标、进度、决定和待办，简洁、忠实；"
                 "摘要也不要包含密码、密钥、token 或验证码；"
-                "memories 是用户跨会话仍有用的稳定偏好或事实字符串数组，"
-                "不要加入项目细节、猜测、密码、密钥、token 或一次性信息；没有则用空数组。"
+                f"{memory_instruction}"
                 "不要输出 Markdown 或解释。\n"
                 f"摘要上限约 {self.settings.memory_summary_max_bytes} UTF-8 字节，"
                 f"每条记忆最多 {self.settings.memory_item_max_chars} 字符。\n旧摘要："

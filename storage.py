@@ -170,6 +170,12 @@ CREATE TABLE IF NOT EXISTS user_model_selection (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS user_memory_preferences (
+    user_id              INTEGER PRIMARY KEY,
+    auto_extract_enabled INTEGER NOT NULL CHECK (auto_extract_enabled IN (0, 1)),
+    updated_at            REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_cost_preferences (
     user_id     INTEGER PRIMARY KEY,
     report_mode TEXT NOT NULL CHECK (report_mode IN ('off', 'compact', 'full')),
@@ -474,6 +480,24 @@ class Storage:
             (user_id, mode, time.time()),
         )
 
+    def get_user_auto_memory(self, user_id: int) -> bool | None:
+        rows = self._query(
+            "SELECT auto_extract_enabled FROM user_memory_preferences WHERE user_id = ?",
+            (user_id,),
+        )
+        return bool(rows[0]["auto_extract_enabled"]) if rows else None
+
+    def set_user_auto_memory(self, user_id: int, enabled: bool | None) -> None:
+        if enabled is None:
+            self._exec("DELETE FROM user_memory_preferences WHERE user_id = ?", (user_id,))
+            return
+        self._exec(
+            "INSERT INTO user_memory_preferences (user_id, auto_extract_enabled, updated_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+            "auto_extract_enabled = excluded.auto_extract_enabled, updated_at = excluded.updated_at",
+            (user_id, int(enabled), time.time()),
+        )
+
     # ---------- sessions ----------
     def create_session(self, user_id: int, name: str) -> str:
         sid = uuid.uuid4().hex[:12]
@@ -659,6 +683,13 @@ class Storage:
                 "updated_at=excluded.updated_at",
                 (session_id, user_id, summary, covered_id, now),
             )
+            preference = self._conn.execute(
+                "SELECT auto_extract_enabled FROM user_memory_preferences WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if preference is not None and not preference["auto_extract_enabled"]:
+                # 与暂停设置在同一事务中判定，避免摘要运行期间切换产生新记忆。
+                candidates = []
             count = self._conn.execute(
                 "SELECT count(*) FROM memory_items WHERE user_id = ?", (user_id,)
             ).fetchone()[0]

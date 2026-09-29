@@ -62,6 +62,27 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertNotIn("记忆内容 1 " + "甲" * 30, body)
         self.assertTrue(all(set(item) == {"id", "text", "source", "reason"} for item in used))
 
+    def test_auto_memory_pause_keeps_summary_but_blocks_new_items(self):
+        first = self.storage.start_turn(7, self.sid, 101, "问题一", False)
+        self.storage.finish_turn(first, "回答一", complete=True)
+        self.storage.set_user_auto_memory(7, False)
+        self.storage.apply_summary(
+            7, self.sid, 0, first, "摘要一", ["应被拦截的记忆"],
+            memory_limit=4, turn_retention=2,
+        )
+        self.assertEqual(self.storage.get_summary(self.sid)["summary_text"], "摘要一")
+        self.assertEqual(self.storage.list_memories(7), [])
+        self.storage.set_user_auto_memory(7, True)
+        second = self.storage.start_turn(7, self.sid, 102, "问题二", False)
+        self.storage.finish_turn(second, "回答二", complete=True)
+        self.storage.apply_summary(
+            7, self.sid, first, second, "摘要二", ["恢复后的记忆"],
+            memory_limit=4, turn_retention=2,
+        )
+        self.assertEqual(self.storage.list_memories(7)[0]["text"], "恢复后的记忆")
+        self.storage.set_user_auto_memory(7, None)
+        self.assertIsNone(self.storage.get_user_auto_memory(7))
+
     def test_chinese_phrase_match_has_explainable_priority(self):
         specific = memory_match("偏好：请使用简体中文", "能不能用简体中文给我回答")
         generic = memory_match("我今天想喝茶", "能不能用简体中文给我回答")
@@ -202,6 +223,28 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
         await self.memory.shutdown()
         self.storage._conn.close()
         self.folder.cleanup()
+
+    async def test_memory_auto_command_pauses_resumes_and_restores_default(self):
+        manager = SimpleNamespace(memory=self.memory)
+        context = SimpleNamespace(args=["auto", "off"], bot_data={
+            "settings": self.settings, "storage": self.storage, "manager": manager,
+        })
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            await bot.cmd_memory(update, context)
+            self.assertFalse(self.storage.get_user_auto_memory(7))
+            self.assertIn("摘要仍会更新", reply.await_args.args[1])
+            context.args = ["auto", "on"]
+            await bot.cmd_memory(update, context)
+            self.assertTrue(self.storage.get_user_auto_memory(7))
+            context.args = ["auto", "default"]
+            await bot.cmd_memory(update, context)
+            self.assertIsNone(self.storage.get_user_auto_memory(7))
+            self.settings.memory_auto_extract = False
+            context.args = ["auto", "on"]
+            await bot.cmd_memory(update, context)
+            self.assertIn("全局自动提取已关闭", reply.await_args.args[1])
+            self.assertIsNone(self.storage.get_user_auto_memory(7))
 
     async def test_memory_search_shows_phrase_basis_and_user_scope(self):
         specific_id = self.storage.add_memory(7, "偏好：请使用简体中文", limit=4)

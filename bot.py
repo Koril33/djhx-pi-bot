@@ -1855,6 +1855,28 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             reply_markup=InlineKeyboardMarkup([nav]) if nav else None,
         )
         return
+    if sub == "auto":
+        mode = args[1] if len(args) > 1 else "status"
+        if len(args) > 2 or mode not in {"status", "on", "off", "default"}:
+            await reply_text(update, "用法：/memory auto [status|on|off|default]")
+            return
+        if mode == "on" and not settings.memory_auto_extract:
+            await reply_text(update, "全局自动提取已关闭，个人设置无法开启；请先在后台开启全局设置")
+            return
+        if mode != "status":
+            storage.set_user_auto_memory(
+                user_id, None if mode == "default" else mode == "on",
+            )
+        selected = storage.get_user_auto_memory(user_id)
+        effective = settings.memory_auto_extract and selected is not False
+        source = "个人设置" if selected is not None else "全局默认"
+        await reply_text(
+            update,
+            f"自动提取长期记忆：{'开启' if effective else '暂停'}（{source}）。"
+            "暂停后不会新增自动记忆；已有记忆仍可注入，当前会话摘要仍会更新。"
+            "使用 /memory auto on|off|default 调整。",
+        )
+        return
     if sub == "search":
         query = " ".join(args[1:]).strip()
         if not query:
@@ -1926,7 +1948,7 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await reply_text(update, "\n".join(lines))
         return
     if sub not in {"add", "edit", "delete", "pin", "unpin"}:
-        await reply_text(update, "用法：/memory list [页码] | search <关键词> | used [list|回合ID] | add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
+        await reply_text(update, "用法：/memory list [页码] | search <关键词> | used [list|回合ID] | auto [on|off|default] | add <内容> | edit <id> <内容> | delete <id> | pin <id> | unpin <id>")
         return
     agent = manager.get(user_id)
     async with agent.control_lock:
