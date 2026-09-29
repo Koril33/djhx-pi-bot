@@ -60,6 +60,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 - pi 扩展在模型请求前临时注入受预算限制的 SQLite 背景资料，不把同一份记忆逐轮写入 JSONL。删除后不再主动注入，但已存在于旧 JSONL、旧回复或摘要的内容不会自动消失。
 - 自动摘要固定使用 DeepSeek Flash，不受 `/model use` 影响。若服务意外中断，未完成回合会在启动时标为不完整；下一条普通消息会提醒用户，不会自动重放可能已经执行工具的请求。
 - Webhook 更新在入队时记录用户与当前会话；处理失败时向已授权用户发送不含内部错误的结果不确定提示。通知失败会保留待提醒状态，下次普通消息补发；可能有外部副作用的更新不会自动重放。
+- 每位用户可用 `/cost auto off|compact|full` 控制每轮费用报告；`/cost last compact` 与 `/cost today compact` 提供简洁查询。未设置时沿用全局 COST_AUTO_REPORT。
 - `/stop` 会取消本用户尚未开始的排队消息，并中止当前运行任务；回复分别报告取消数量和中止状态。
 - 会话 JSONL 没有迁移时，bot 会为原会话 ID 新建 pi 会话，并从 SQLite 摘要和近期文字回合恢复主要背景。无法恢复旧图片、工具输出或逐字历史；没有摘要时会明确提示为空白历史。
 - `MEMORY_*` 环境变量控制自动提取周期、原始回合保留数量、单条记忆长度和注入字节预算；维护模型不提供可覆盖项，见 [.env.example](.env.example)。完整设计及限制见 [产品设计文档](docs/memory-product.md)。

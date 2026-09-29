@@ -895,7 +895,8 @@ HELP_SECTIONS = {
     ),
     "other": (
         "📊 用量与帮助\n"
-        "/cost [last|today] — 查看模型用量与估算费用\n"
+        "/cost [last|today] [compact] — 查看费用\n"
+        "/cost auto off|compact|full — 调整每轮报告\n"
         "/help [chat|sessions|memory|other] — 查看分类帮助"
     ),
 }
@@ -1691,6 +1692,27 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
     return "\n".join(lines)
 
 
+def _compact_cost_report(storage: Storage, runs: list, *, title: str) -> str:
+    if not runs:
+        return f"{title}：暂无用量记录"
+    input_tokens = output_tokens = unpriced = events = 0
+    total_usd = Decimal(0)
+    for run in runs:
+        for event in storage.get_usage_events(run["id"]):
+            events += 1
+            input_tokens += event["input_tokens"] + event["cache_read_tokens"] + event["cache_write_tokens"]
+            output_tokens += event["output_tokens"]
+            if event["estimated_usd"] is None:
+                unpriced += 1
+            else:
+                total_usd += Decimal(event["estimated_usd"])
+    amount = "费用待确认" if not events else (
+        f"已计价 {format_usd(total_usd)}；{unpriced} 次未计价" if unpriced else f"约 {format_usd(total_usd)}"
+    )
+    note = "；存在未完成回合" if any(run["status"] != "complete" for run in runs) else ""
+    return f"{title}：输入 {input_tokens:,} · 输出 {output_tokens:,} tokens · {amount}{note}"
+
+
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.bot_data["settings"]
     if not getattr(settings, "cost_tracking_enabled", False):
@@ -1698,7 +1720,28 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     storage = context.bot_data["storage"]
     user_id = update.effective_user.id
-    mode = context.args[0] if context.args else "last"
+    args = context.args or []
+    mode = args[0] if args else "last"
+    if mode == "auto":
+        if len(args) == 1:
+            selected = storage.get_user_cost_report_mode(user_id)
+            current = selected or ("full" if settings.cost_auto_report else "off")
+            source = "个人设置" if selected else "全局默认"
+            await reply_text(
+                update,
+                f"每轮自动费用报告：{current}（{source}）。使用 /cost auto off|compact|full 调整。",
+            )
+            return
+        if len(args) != 2 or args[1] not in {"off", "compact", "full"}:
+            await reply_text(update, "用法：/cost auto off|compact|full")
+            return
+        storage.set_user_cost_report_mode(user_id, args[1])
+        await reply_text(update, f"已将每轮自动费用报告设为 {args[1]}（重启后保持）")
+        return
+    compact = len(args) == 2 and args[1] == "compact"
+    if len(args) > (2 if compact else 1):
+        await reply_text(update, "用法：/cost [last|today] [compact] | /cost auto off|compact|full")
+        return
     if mode == "last":
         last = storage.get_last_usage_run(user_id, origin="chat")
         runs = [last] if last else []
@@ -1711,9 +1754,13 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         maintenance_count = sum(run["origin"] == "memory_maintenance" for run in runs)
         title = f"📊 今日用量（北京时间，聊天 {chat_count} 轮，记忆维护 {maintenance_count} 次）"
     else:
-        await reply_text(update, "用法：/cost [last|today]")
+        await reply_text(update, "用法：/cost [last|today] [compact] | /cost auto off|compact|full")
         return
-    await reply_text(update, _cost_report(storage, runs, title=title))
+    await reply_text(
+        update,
+        _compact_cost_report(storage, runs, title=title) if compact
+        else _cost_report(storage, runs, title=title),
+    )
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2402,11 +2449,19 @@ async def _process_text(
                 stats_after = await _read_usage_stats(agent.client)
                 try:
                     storage.finish_usage_run(usage_run_id, "complete" if turn_settled else "incomplete", stats_after)
-                    if getattr(settings, "cost_auto_report", False):
+                    report_mode = storage.get_user_cost_report_mode(user.id) or (
+                        "full" if getattr(settings, "cost_auto_report", False) else "off"
+                    )
+                    if report_mode != "off":
                         run = storage.get_last_usage_run(user.id, origin="chat")
                         if run is not None and run["id"] == usage_run_id:
                             try:
-                                await reply_text(update, _cost_report(storage, [run], title="📊 本轮用量"))
+                                report = (
+                                    _compact_cost_report(storage, [run], title="📊 本轮用量")
+                                    if report_mode == "compact"
+                                    else _cost_report(storage, [run], title="📊 本轮用量")
+                                )
+                                await reply_text(update, report)
                             except Exception:
                                 logger.exception("发送用量摘要失败", extra={"user_id": user.id})
                 except Exception:

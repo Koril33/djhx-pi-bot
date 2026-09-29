@@ -169,6 +169,12 @@ CREATE TABLE IF NOT EXISTS user_model_selection (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS user_cost_preferences (
+    user_id     INTEGER PRIMARY KEY,
+    report_mode TEXT NOT NULL CHECK (report_mode IN ('off', 'compact', 'full')),
+    updated_at  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS telegram_updates (
     update_id      INTEGER PRIMARY KEY,
     payload        TEXT,
@@ -444,6 +450,23 @@ class Storage:
             "VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
             "provider = excluded.provider, model_id = excluded.model_id, updated_at = excluded.updated_at",
             (user_id, provider, model_id, time.time()),
+        )
+
+    def get_user_cost_report_mode(self, user_id: int) -> str | None:
+        rows = self._query(
+            "SELECT report_mode FROM user_cost_preferences WHERE user_id = ?",
+            (user_id,),
+        )
+        return rows[0]["report_mode"] if rows else None
+
+    def set_user_cost_report_mode(self, user_id: int, mode: str) -> None:
+        if mode not in {"off", "compact", "full"}:
+            raise ValueError("费用报告模式须为 off、compact 或 full")
+        self._exec(
+            "INSERT INTO user_cost_preferences (user_id, report_mode, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET report_mode = excluded.report_mode, "
+            "updated_at = excluded.updated_at",
+            (user_id, mode, time.time()),
         )
 
     # ---------- sessions ----------

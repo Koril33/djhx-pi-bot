@@ -1,12 +1,15 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 from contextlib import closing
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from bot import _cost_report
+import bot
+from bot import _compact_cost_report, _cost_report
 from costs import PricingCatalog, PriceResult, normalize_usage
 from storage import Storage
 
@@ -87,6 +90,31 @@ class UsageLedgerTests(unittest.TestCase):
         self.assertIn("pi 会话统计高于已记录事件", report)
         self.assertIn("缓存命中 3", report)
 
+    def test_user_report_mode_persists_and_compact_report_is_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "bot.db")
+            storage = Storage(path)
+            storage.set_user_cost_report_mode(42, "compact")
+            run_id = storage.start_usage_run(42, None, 123, None)
+            storage.record_usage_event(
+                run_id, 1,
+                {"kind": "assistant", "occurred_at": 1, "provider": "deepseek",
+                 "model": "deepseek-flash", "usage": {"input": 2, "cacheRead": 3, "output": 4}},
+                PriceResult("priced", "0.0005", "peak"),
+            )
+            storage.finish_usage_run(run_id, "complete", None)
+            report = _compact_cost_report(storage, [storage.get_last_usage_run(42)], title="test")
+            self.assertIn("输入 5", report)
+            self.assertIn("输出 4", report)
+            self.assertIn("$0.0005", report)
+            self.assertLess(len(report), 100)
+            storage._conn.close()
+            reopened = Storage(path)
+            self.assertEqual(reopened.get_user_cost_report_mode(42), "compact")
+            with self.assertRaises(ValueError):
+                reopened.set_user_cost_report_mode(42, "invalid")
+            reopened._conn.close()
+
     def test_unknown_price_is_visible_in_report(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             storage = Storage(str(Path(folder) / "bot.db"))
@@ -98,6 +126,30 @@ class UsageLedgerTests(unittest.TestCase):
                 storage.finish_usage_run(run_id, "complete", None)
                 report = _cost_report(storage, [storage.get_last_usage_run(42)], title="test")
                 self.assertIn("1 次模型调用未计价", report)
+
+
+
+
+class CostCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_mode_is_per_user_and_can_be_changed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(str(Path(folder) / "bot.db"))
+            update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
+            context = SimpleNamespace(
+                args=["auto"],
+                bot_data={"settings": SimpleNamespace(cost_tracking_enabled=True, cost_auto_report=True),
+                          "storage": storage},
+            )
+            with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+                await bot.cmd_cost(update, context)
+                self.assertIn("full（全局默认）", reply.await_args.args[1])
+                context.args = ["auto", "compact"]
+                await bot.cmd_cost(update, context)
+                self.assertEqual(storage.get_user_cost_report_mode(7), "compact")
+                context.args = ["auto"]
+                await bot.cmd_cost(update, context)
+                self.assertIn("compact（个人设置）", reply.await_args.args[1])
+            storage._conn.close()
 
 
 if __name__ == "__main__":
