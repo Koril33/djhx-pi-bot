@@ -96,6 +96,23 @@ class PiRpcClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "")
         self.assertEqual(seen, [("bash", "end", {"is_error": False})])
 
+    async def test_extension_dialog_is_auto_cancelled_but_widget_is_ignored(self) -> None:
+        def on_command(command):
+            if command.get("type") != "prompt":
+                return
+            proc.emit({"id": command["id"], "type": "response", "command": "prompt", "success": True})
+            proc.emit({"type": "extension_ui_request", "id": "ui-1", "method": "confirm", "title": "Authorize?"})
+            proc.emit({"type": "extension_ui_request", "id": "ui-2", "method": "setWidget", "widgetKey": "subagent-async"})
+            proc.emit({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "ok"}})
+            proc.emit({"type": "agent_settled"})
+
+        proc = FakeProc(on_command)
+        with patch("pi_bridge.asyncio.create_subprocess_exec", return_value=proc):
+            result = "".join([part async for part in self.client.prompt("hello")])
+        self.assertEqual(result, "ok")
+        responses = [cmd for cmd in proc.commands if cmd.get("type") == "extension_ui_response"]
+        self.assertEqual(responses, [{"type": "extension_ui_response", "id": "ui-1", "cancelled": True}])
+
     async def test_reads_120kb_record_and_waits_for_agent_settled(self) -> None:
         def on_command(command):
             proc.emit({"id": command["id"], "type": "response", "command": "prompt", "success": True})

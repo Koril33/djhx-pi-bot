@@ -46,6 +46,19 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(self.catalog.price("deepseek", "deepseek-flash", self.usage,
                                              utc("2027-01-01T02:00:00")).status, "outside_effective_period")
 
+    def test_flat_provider_prices_any_time_and_free_cache_write(self) -> None:
+        usage = {"input": 236, "cacheRead": 2304, "cacheWrite": 5,
+                 "output": 124, "reasoning": 10}
+        # mimo-v2.6-flash 无峰谷，缓存写入限时免费：任意时刻、含 cacheWrite 都能计价。
+        for date in ("2026-10-07T02:00:00", "2026-10-10T22:00:00"):
+            result = self.catalog.price("xiaomi", "mimo-v2.6-flash", usage, utc(date))
+            self.assertEqual(result.status, "priced")
+            self.assertIsNone(result.tier)
+            self.assertEqual(Decimal(result.usd), Decimal("0.0000742112"))
+        snapshot = json.loads(result.snapshot)
+        self.assertEqual(snapshot["model"], "mimo-v2.6-flash")
+        self.assertIsNone(snapshot["tier"])
+
     def test_updated_price_file_is_read_without_code_change(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             config = json.loads(Path(self.catalog.path).read_text(encoding="utf-8"))
@@ -53,8 +66,8 @@ class PricingTests(unittest.TestCase):
             path.write_text(json.dumps(config), encoding="utf-8")
             catalog = PricingCatalog(str(path))
             first = catalog.price("deepseek", "deepseek-flash", self.usage, utc("2026-09-24T02:00:00"))
-            config["revision"] = "new-revision"
-            config["models"]["deepseek-flash"]["peak"]["output"] = "2.40"
+            config["providers"]["deepseek"]["revision"] = "new-revision"
+            config["providers"]["deepseek"]["models"]["deepseek-flash"]["peak"]["output"] = "2.40"
             path.write_text(json.dumps(config), encoding="utf-8")
             second = catalog.price("deepseek", "deepseek-flash", self.usage, utc("2026-09-24T02:00:00"))
             self.assertGreater(Decimal(second.usd), Decimal(first.usd))

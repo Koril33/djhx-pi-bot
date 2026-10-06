@@ -73,27 +73,36 @@ class PricingCatalog:
         except (OSError, ValueError):
             return PriceResult("missing_config")
         try:
-            if config["currency"] != "USD" or config["provider"] != provider:
+            if config["currency"] != "USD":
                 return PriceResult("missing_rule")
-            model_id = config.get("aliases", {}).get(model, model)
-            rule = config["models"].get(model_id)
+            provider_cfg = config["providers"].get(provider)
+            if provider_cfg is None:
+                return PriceResult("missing_rule")
+            model_id = provider_cfg.get("aliases", {}).get(model, model)
+            rule = provider_cfg["models"].get(model_id)
             if rule is None:
                 return PriceResult("missing_rule")
             moment = _utc_time(at)
-            if not (_parse_time(config["effective_from"]) <= moment < _parse_time(config["effective_until"])):
+            if not (_parse_time(provider_cfg["effective_from"]) <= moment
+                    < _parse_time(provider_cfg["effective_until"])):
                 return PriceResult("outside_effective_period")
-            schedule = config["peak_schedule"]
-            china_day = (moment + timedelta(minutes=int(schedule["china_offset_minutes"]))).date()
-            if china_day.isoformat() > schedule["holiday_calendar_through"]:
-                return PriceResult("calendar_unknown")
-            now_minute = moment.hour * 60 + moment.minute
-            peak = (
-                moment.weekday() in schedule["weekdays_utc"]
-                and china_day.isoformat() not in schedule["china_holidays"]
-                and any(_minutes(start) <= now_minute < _minutes(end) for start, end in schedule["windows_utc"])
-            )
-            tier = "peak" if peak else "off_peak"
-            rates = rule[tier]
+            schedule = provider_cfg.get("peak_schedule")
+            if schedule is None:
+                # 无峰谷时段的提供商：全天单一费率，不展示时段标签。
+                tier = None
+                rates = rule
+            else:
+                china_day = (moment + timedelta(minutes=int(schedule["china_offset_minutes"]))).date()
+                if china_day.isoformat() > schedule["holiday_calendar_through"]:
+                    return PriceResult("calendar_unknown")
+                now_minute = moment.hour * 60 + moment.minute
+                peak = (
+                    moment.weekday() in schedule["weekdays_utc"]
+                    and china_day.isoformat() not in schedule["china_holidays"]
+                    and any(_minutes(start) <= now_minute < _minutes(end) for start, end in schedule["windows_utc"])
+                )
+                tier = "peak" if peak else "off_peak"
+                rates = rule[tier]
             if counts["cacheWrite"] and "cache_write" not in rates:
                 return PriceResult("missing_rule")
             components = {
@@ -110,10 +119,10 @@ class PricingCatalog:
             ):
                 raise ValueError("无效价格或计价单位")
             amount = sum(components.values()) / denominator
-            stale = moment >= _parse_time(config["review_after"])
+            stale = moment >= _parse_time(provider_cfg["review_after"])
             snapshot = json.dumps({
-                "revision": config["revision"], "source_url": config["source_url"],
-                "checked_at": config["checked_at"], "model": model_id, "tier": tier,
+                "revision": provider_cfg["revision"], "source_url": provider_cfg["source_url"],
+                "checked_at": provider_cfg["checked_at"], "model": model_id, "tier": tier,
                 "rates_per_million": rates, "per_tokens": config["per_tokens"],
             }, ensure_ascii=False, sort_keys=True)
             return PriceResult("stale_price" if stale else "priced", str(amount), tier, snapshot)

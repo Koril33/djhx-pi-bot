@@ -36,6 +36,10 @@ MAX_RECORD_BYTES = 32 * 1024 * 1024
 MAX_QUEUED_EVENTS = 256
 MAX_DELTA_CHARS = 8192
 
+# 扩展 UI 的对话方法（select/confirm/input/editor）必须由客户端应答；
+# 其余（notify/setStatus/setWidget 等）是 fire-and-forget，忽略即可。
+EXTENSION_UI_DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
+
 
 class PiError(Exception):
     pass
@@ -181,6 +185,29 @@ class PiRpcClient:
             await self.start(self._session_file)
 
     # ---------- 内部 IO ----------
+    async def _handle_extension_ui(self, proc: asyncio.subprocess.Process, event: dict) -> None:
+        """应答扩展 UI 请求，避免对话方法永久阻塞整轮。
+
+        本客户端不渲染对话框，所以对 select/confirm/input/editor 一律回
+        cancelled（confirm 等价于 false），让扩展走「用户取消」分支；
+        notify/setStatus/setWidget 等 fire-and-forget 请求直接忽略。
+        """
+        if proc is not self.proc:
+            return
+        request_id = event.get("id")
+        method = event.get("method")
+        if not isinstance(request_id, str) or not request_id:
+            return
+        if method not in EXTENSION_UI_DIALOG_METHODS:
+            return
+        logger.warning("自动取消 pi 扩展对话框", extra={
+            "method": str(method)[:32], "title": str(event.get("title") or "")[:120],
+        })
+        try:
+            await self._send({"type": "extension_ui_response", "id": request_id, "cancelled": True})
+        except Exception as exc:
+            logger.warning("回复 pi 扩展对话框失败", extra={"err": f"{type(exc).__name__}: {exc}"[:200]})
+
     async def _route_event(self, proc: asyncio.subprocess.Process, event: dict) -> None:
         """仅保留界面所需的轻量事件，满队列时对 stdout 施加背压。"""
         if proc is not self.proc or not self.busy or self._transport_error:
@@ -268,6 +295,8 @@ class PiRpcClient:
                             future.set_result(event)
                         else:
                             logger.warning("pi RPC 未匹配的回复", extra={"cmd_id": cmd_id, "command": event.get("command")})
+                    elif event.get("type") == "extension_ui_request":
+                        await self._handle_extension_ui(proc, event)
                     else:
                         await self._route_event(proc, event)
                 if len(pending) > MAX_RECORD_BYTES:

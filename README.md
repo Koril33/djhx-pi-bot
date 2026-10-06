@@ -73,9 +73,9 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<域名>/webhoo
 - 每次 pi 模型回复及会话压缩结束后，保存 pi 报告的输入未命中、缓存命中、缓存写入、输出和推理 token。推理 token 属于输出 token，不重复计费。一次 Telegram 回复如果包含多次模型调用，账本会逐次记录。
 - `/cost` 查询最近一轮，`/cost today` 按北京时间查询当天。默认每轮结束自动发送用量摘要；设置 `COST_AUTO_REPORT=false` 可关闭自动消息，保留账本和查询。`COST_TRACKING_ENABLED=false` 可完全关闭记录。
 - `/cost` 中“各回合准备的记忆上下文”是每轮一次的大小快照，不是多次模型调用的累计注入量，也不能单独换算记忆 token 或费用；整轮 token 与费用仍来自逐次用量事件。
-- 金额用 [DeepSeek 官方价格页](https://api-docs.deepseek.com/quick_start/pricing/) 的公开费率估算，不代表官方实扣。pi 的会话统计仅用于核对漏记，不能代替逐次调用用量；如果缺少模型价格、费率已过复核日或账本与 pi 统计不符，查询会明确提示。
-- 费率和峰谷时段维护在 [pricing.json](pricing.json)。官方变价后更新该文件的 `revision`、`checked_at`、`review_after`、生效区间、模型费率及中国节假日日历，再推送部署；服务每次计算都重新读取，无须修改 Python 代码。每次记录同时保存费率快照，后续更新价格不会改写历史账单。超过已配置的生效区间或节假日日历时停止估价，保留 token 数。可通过 `PRICING_FILE` 指定其他价格文件。
-- 目前仅为 DeepSeek 模型估价；其他提供商照样记录 token，但显示未计价。要迁移用量账本，拷贝配置的 SQLite 数据库文件即可；它不是跨会话记忆功能。
+- 金额用 [DeepSeek 官方价格页](https://api-docs.deepseek.com/quick_start/pricing/) 和 [小米 MiMo 官方价格页](https://mimo.mi.com/docs/zh-CN/price/pay-as-you-go) 的公开费率估算，不代表官方实扣。pi 的会话统计仅用于核对漏记，不能代替逐次调用用量；如果缺少模型价格、费率已过复核日或账本与 pi 统计不符，查询会明确提示。
+- 费率和峰谷时段维护在 [pricing.json](pricing.json)。文件按 `providers.<provider>` 分块（目前含 `deepseek`、`xiaomi`），每块自带 `revision`、`checked_at`、`review_after`、生效区间、`aliases`、可选 `peak_schedule` 和 `models`，共享顶层 `currency`/`per_tokens`。DeepSeek 有峰谷分时，MiMo 全天单一费率（`tier` 为空）；官方变价后更新对应块的字段、模型费率及中国节假日日历，再推送部署；服务每次计算都重新读取，无须修改 Python 代码。每次记录同时保存费率快照，后续更新价格不会改写历史账单。超过已配置的生效区间或节假日日历时停止估价，保留 token 数。可通过 `PRICING_FILE` 指定其他价格文件。
+- 目前为 DeepSeek 和小米 MiMo 模型估价；其他提供商照样记录 token，但显示未计价。要迁移用量账本，拷贝配置的 SQLite 数据库文件即可；它不是跨会话记忆功能。
 
 ## 部署（Gitea 驱动）
 
