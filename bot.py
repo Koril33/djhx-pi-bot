@@ -1741,11 +1741,18 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
     incomplete_usage = False
     has_events = False
     tiers: set[str] = set()
+    models: list[str] = []   # 按首次出现顺序去重，单轮通常只有一个
+    providers: set[str] = set()
     for run in runs:
         prepared_context_bytes += run["memory_context_bytes"]
         run_counts = {key: 0 for key in counts}
         for event in storage.get_usage_events(run["id"]):
             has_events = True
+            label = f'{event["provider"]}/{event["model"]}'
+            if label not in models:
+                models.append(label)
+            if event["provider"]:
+                providers.add(event["provider"])
             for key in counts:
                 counts[key] += event[key]
                 run_counts[key] += event[key]
@@ -1774,8 +1781,11 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
         return f"{title}：暂无用量记录"
     tier_name = {"peak": "峰时", "off_peak": "谷时"}
     tier_label = "、".join(tier_name.get(tier, tier) for tier in sorted(tiers))
-    lines = [
-        title,
+    lines = [title]
+    # 未收到任何用量事件时无从得知模型，该行直接跳过。
+    if models:
+        lines.append(f"模型：{'、'.join(models)}")
+    lines += [
         f"输入：未命中 {counts['input_tokens']:,} · 缓存命中 {counts['cache_read_tokens']:,}"
         + (f" · 缓存写入 {counts['cache_write_tokens']:,}" if counts["cache_write_tokens"] else ""),
         f"输出：{counts['output_tokens']:,} tokens",
@@ -1793,7 +1803,9 @@ def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
             "（每回合记一次；多次模型调用可能重复注入，不能据此计算记忆费用）"
         )
     if stale:
-        lines.append("⚠️ 费率文件已到复核日期，请核对 DeepSeek 官方价格")
+        # 已支持多 provider，不能写死 DeepSeek。
+        source = f" {'、'.join(sorted(providers))} " if providers else " "
+        lines.append(f"⚠️ 费率文件已到复核日期，请核对{source}官方价格")
     if incomplete_usage:
         lines.append("⚠️ pi 会话统计高于已记录事件；可能包含工具或摘要调用，金额可能偏低")
     if any(run["status"] != "complete" for run in runs):

@@ -78,6 +78,75 @@ class PricingTests(unittest.TestCase):
                                            utc("2026-09-24T02:00:00")).status, "invalid_config")
 
 
+class CostReportModelLineTests(unittest.TestCase):
+    """报告中的模型行：单模型、跨轮多模型拼接、无用量时跳过、过期文案指向实际 provider。"""
+
+    def _run(self, storage: Storage, events, price: PriceResult | None = None):
+        run_id = storage.start_usage_run(42, None, 123, None)
+        for seq, (provider, model) in enumerate(events, 1):
+            storage.record_usage_event(run_id, seq, {
+                "kind": "assistant", "occurred_at": utc("2026-09-24T02:00:00"),
+                "provider": provider, "model": model,
+                "usage": {"input": 2, "cacheRead": 3, "output": 4, "reasoning": 1},
+            }, price or PriceResult("priced", "0.0005", "peak"))
+        storage.finish_usage_run(run_id, "complete", None)
+        return storage.get_last_usage_run(42)
+
+    def test_single_model_line_sits_between_title_and_input(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(str(Path(folder) / "bot.db"))
+            with closing(storage._conn):
+                run = self._run(storage, [("deepseek", "deepseek-flash")])
+                lines = _cost_report(storage, [run], title="📊 本轮用量").splitlines()
+                self.assertEqual(lines[0], "📊 本轮用量")
+                self.assertEqual(lines[1], "模型：deepseek/deepseek-flash")
+                self.assertTrue(lines[2].startswith("输入："))
+
+    def test_same_run_duplicates_are_deduped_in_first_seen_order(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(str(Path(folder) / "bot.db"))
+            with closing(storage._conn):
+                run = self._run(storage, [
+                    ("xiaomi", "mimo-v2.6-flash"),
+                    ("deepseek", "deepseek-flash"),
+                    ("xiaomi", "mimo-v2.6-flash"),
+                ])
+                report = _cost_report(storage, [run], title="test")
+                self.assertIn("模型：xiaomi/mimo-v2.6-flash、deepseek/deepseek-flash", report)
+
+    def test_several_runs_are_joined_for_date_range_report(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(str(Path(folder) / "bot.db"))
+            with closing(storage._conn):
+                first = self._run(storage, [("deepseek", "deepseek-flash")])
+                second = self._run(storage, [("xiaomi", "mimo-v2.6-flash")])
+                report = _cost_report(storage, [first, second], title="test")
+                self.assertIn("模型：deepseek/deepseek-flash、xiaomi/mimo-v2.6-flash", report)
+
+    def test_model_line_is_skipped_when_no_usage_event_arrived(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(str(Path(folder) / "bot.db"))
+            with closing(storage._conn):
+                run_id = storage.start_usage_run(42, None, None, None)
+                storage.finish_usage_run(run_id, "complete", None)
+                report = _cost_report(storage, [storage.get_last_usage_run(42)], title="test")
+                self.assertNotIn("模型：", report)
+                self.assertIn("尚未收到模型用量", report)
+
+    def test_stale_warning_names_real_providers_instead_of_deepseek(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            storage = Storage(str(Path(folder) / "bot.db"))
+            with closing(storage._conn):
+                run = self._run(
+                    storage, [("xiaomi", "mimo-v2.6-flash")],
+                    price=PriceResult("stale_price", "0.001", "peak", '{"revision":"r"}'),
+                )
+                report = _cost_report(storage, [run], title="test")
+                self.assertIn("费率文件已到复核日期", report)
+                self.assertIn("请核对 xiaomi 官方价格", report)
+                self.assertNotIn("DeepSeek", report)
+
+
 class UsageLedgerTests(unittest.TestCase):
     def test_persists_price_snapshot_and_flags_unaccounted_stats(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
