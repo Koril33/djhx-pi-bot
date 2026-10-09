@@ -29,10 +29,12 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
         storage.count_user_queue.return_value = 3
         update = SimpleNamespace(effective_user=SimpleNamespace(id=7))
         context = SimpleNamespace(bot_data={"manager": manager, "storage": storage})
+        message = SimpleNamespace(edit_text=AsyncMock())
         with patch.object(bot.time, "monotonic", return_value=125.0):
-            with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
+            with patch.object(bot, "reply_text", new_callable=AsyncMock, return_value=message) as reply:
                 await bot.cmd_status(update, context)
-        text = reply.await_args.args[1]
+        self.assertIn("未实时确认", reply.await_args.args[1])
+        text = message.edit_text.await_args.args[0]
         self.assertIn("当前模型: new/actual-id", text)
         self.assertIn("当前任务耗时: 0 分 25 秒", text)
         self.assertIn("排队: 3 条", text)

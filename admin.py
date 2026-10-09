@@ -26,6 +26,7 @@ from costs import PricingCatalog, format_usd
 from logging_conf import get_logger
 from mail_service import MailSendError, email_address, send_email, smtp_settings as validate_smtp_settings
 from memory import looks_secret
+from ops import backup_status
 from persona import FIELDS as PERSONA_FIELDS, render_persona, validate_persona, write_prompt
 from pi_bridge import PiBusyError, PiError, PiRpcClient
 from storage import Storage
@@ -67,6 +68,11 @@ _FIELD_KEYS = {row[0] for row in _FIELDS}
 
 def _e(value: object) -> str:
     return escape(str(value if value is not None else ""), quote=True)
+
+
+def _same_secret(value: str, expected: str) -> bool:
+    """compare_digest 的 str 仅支持 ASCII；表单和配置允许 Unicode。"""
+    return hmac.compare_digest(value.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _memory_values(data: dict[str, object], *, from_form: bool) -> dict[str, int | bool]:
@@ -137,7 +143,7 @@ def _unseal(settings: Settings, token: str | None, kind: str) -> str | None:
     try:
         body, signature = token.rsplit(".", 1)
         expected = hmac.new(_key(settings), body.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(signature, expected):
+        if not _same_secret(signature, expected):
             return None
         payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
         age = time.time() - payload["iat"]
@@ -210,7 +216,7 @@ async def _form(request: Request) -> dict[str, str]:
 async def _authorized_form(request: Request) -> tuple[str, dict[str, str]]:
     csrf = _require_session(request)
     form = await _form(request)
-    if not hmac.compare_digest(form.get("csrf", ""), csrf):
+    if not _same_secret(form.get("csrf", ""), csrf):
         raise HTTPException(status_code=403, detail="页面已过期，请刷新后重试")
     return csrf, form
 
@@ -318,14 +324,20 @@ def _overview_page(request: Request, csrf: str, user_id: int | None) -> HTMLResp
     picker = _user_picker(storage, settings, user_id, "overview")
     stats = storage.update_stats()
     worker = getattr(request.app.state, "update_worker", None)
-    service = "正常" if worker is not None and not worker.done() else ("未读取" if worker is None else "异常")
+    service = "正常" if worker is not None and not worker.done() and getattr(request.app.state, "worker_ready", True) else ("未读取" if worker is None else "异常")
     agent = request.app.state.manager._agents.get(user_id) if user_id is not None else None
     proc = agent.client.proc if agent is not None else None
     pi_state = ("运行中" if proc is not None and proc.returncode is None else
                 ("待重连" if proc is not None else "按需启动"))
     busy = bool(agent and (agent.client.busy or agent.prompt_pending))
     active = storage.get_active_session(user_id) if user_id is not None else None
-    model = (agent.client.model if agent is not None else None) or settings.pi_model
+    selected_model = (storage.get_effective_model_selection(user_id, active["id"] if active else None)
+                      if user_id is not None else None)
+    model_id = ((agent.client.model if agent is not None else None)
+                or (selected_model["model_id"] if selected_model else settings.pi_model))
+    provider = ((getattr(agent.client, "provider", None) if agent is not None else None)
+                or (selected_model["provider"] if selected_model else settings.pi_provider))
+    model = f"{provider}/{model_id}"
     session_name = active["name"] if active else "暂无会话"
     cards = (
         ("BOT", service), ("PI", "处理中" if busy else pi_state),
@@ -366,6 +378,16 @@ def _overview_page(request: Request, csrf: str, user_id: int | None) -> HTMLResp
             f'<button class="text-button" type="submit">标记已处理</button></form></article>'
         )
     failure_html = "".join(failed) or '<p class="empty small">没有失败更新</p>'
+    backup = backup_status(settings)
+    backup_time = _time_label(backup.get("timestamp"))
+    backup_label = ("未启用" if not backup["enabled"] else
+                    "尚无成功备份" if not backup.get("archive") else
+                    "已超过备份周期" if backup.get("stale") else "正常")
+    backup_html = (f'<section class="section-block"><div class="section-head"><h2>数据备份</h2>'
+                   f'<span class="muted">{_e(backup_label)}</span></div><div class="simple-list">'
+                   f'<div class="list-row"><span>最近成功备份</span><strong>{_e(backup_time)}</strong></div>'
+                   f'<div class="list-row"><span>完整会话文件</span><strong>{_e(backup.get("session_files", "—"))}</strong></div>'
+                   '<p class="muted">每日备份数据库与完整会话，保留最近 7 份及 4 周副本。</p></div></section>')
     refreshed_at = datetime.now(_CST)
     refresh = (f'<form method="get" action="/admin/overview" class="overview-refresh">'
                + (f'<input type="hidden" name="user_id" value="{user_id}">' if user_id is not None else "")
@@ -374,7 +396,7 @@ def _overview_page(request: Request, csrf: str, user_id: int | None) -> HTMLResp
             f'<div class="overview-actions">{picker}{refresh}</div></div>'
             f'<p class="overview-timestamp">数据读取于 <time datetime="{refreshed_at.isoformat()}">'
             f'{refreshed_at.strftime("%Y-%m-%d %H:%M:%S")} 北京时间</time></p>'
-            f'<div class="metric-grid">{cards_html}</div>'
+            f'<div class="metric-grid">{cards_html}</div>{backup_html}'
             f'<section class="section-block"><div class="section-head"><h2>最近失败更新</h2>'
             f'<span class="muted">仅展示故障类型，不自动重放</span></div><div class="simple-list">{failure_html}</div></section>')
     return _html(_layout("概览", "overview", body, csrf, user_id, settings))
@@ -632,6 +654,7 @@ def _memory_page(request: Request, csrf: str, user_id: int | None, error: str = 
         contents = '<p class="empty">暂无用户</p>'
     else:
         memories = storage.list_memories(user_id)
+        capacity = storage.memory_capacity_status(user_id, settings.memory_active_limit)
         shown, search, pager, matched = _admin_list_page(
             request, memories, "memories", user_id,
             lambda row, q: q in row["text"].casefold() or q in row["source"].casefold(),
@@ -644,9 +667,34 @@ def _memory_page(request: Request, csrf: str, user_id: int | None, error: str = 
             source = "手动" if row["source"] == "manual" else "自动"
             cards.append(f'''<article class="memory-card"><div class="card-meta"><span>{source}</span>{badge}<span class="mono">{ident}</span></div><p class="memory-text">{_e(row["text"])}</p><div class="card-actions"><form method="post" action="/admin/memories/{ident}/pin"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><input type="hidden" name="pinned" value="{0 if row["pinned"] else 1}"><button class="text-button" type="submit">{'取消置顶' if row['pinned'] else '置顶'}</button></form><details><summary>编辑</summary><form method="post" action="/admin/memories/{ident}/edit" class="inline-edit"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><textarea name="text" maxlength="{settings.memory_item_max_chars}" rows="3" required>{_e((edit_values or {}).get(row["id"], row["text"]))}</textarea><button class="button primary" type="submit">保存</button></form></details><details class="danger-details"><summary>删除</summary><form method="post" action="/admin/memories/{ident}/delete"><input type="hidden" name="csrf" value="{_e(csrf)}"><input type="hidden" name="user_id" value="{user_id}"><button class="button danger" type="submit">确认删除</button></form></details></div></article>''')
         cards_html = "".join(cards) if cards else '<p class="empty">暂无记忆</p>'
+        capacity_notice = ('<p class="memory-capacity" role="status">记忆容量已满，'
+                           '新记忆会暂时跳过。请核对并合并重复或冲突的内容；置顶条目会保留。</p>'
+                           if capacity["full"] else '')
+        organize_link = f'/admin/memories?{urlencode({"user_id": user_id, "organize": "1"})}'
+        organize = (f'<section class="section-block"><div class="section-head"><h2>记忆整理</h2>'
+                    f'<a class="button subtle" href="{_e(organize_link)}">查找重复与冲突</a></div>'
+                    '<p class="muted">建议仅供核对，确认合并前不会修改或删除任何记忆。</p>')
+        if request.query_params.get("organize") == "1":
+            candidates = storage.memory_organization_candidates(user_id)
+            for candidate in candidates:
+                before = "".join(f'<p class="memory-text">{_e(row["text"])}</p>' for row in candidate["rows"])
+                label = "可能冲突" if candidate["kind"] == "possible_conflict" else "表达相近"
+                organize += (f'<article class="memory-card"><span class="badge">{label}</span>'
+                             f'{before}<p class="muted">{_e(candidate["reason"])}</p>'
+                             f'<form method="post" action="/admin/memories/merge" class="inline-edit">'
+                             f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
+                             f'<input type="hidden" name="user_id" value="{user_id}">'
+                             f'<input type="hidden" name="ids" value="{_e(",".join(candidate["ids"]))}">'
+                             f'<input type="hidden" name="version" value="{_e(candidate["version"])}">'
+                             f'<label>核对后的记忆<textarea name="text" maxlength="{settings.memory_item_max_chars}" required>'
+                             f'{_e(candidate["suggested_text"])}</textarea></label>'
+                             '<button class="button primary" type="submit">确认合并以上条目</button></form></article>')
+            if not candidates:
+                organize += '<p class="empty small">没有找到明显重复或冲突；可在列表中手动编辑、删除。</p>'
+        organize += '</section>'
         contents = (f'<div class="toolbar"><span class="count">{matched} 条匹配 · '
                     f'{len(memories)} / {settings.memory_active_limit}</span>{search}</div>'
-                    f'{add}<div class="card-list">{cards_html}</div>{pager}')
+                    f'{capacity_notice}{add}<div class="card-list">{cards_html}</div>{pager}{organize}')
     alert = f'<p class="form-error" role="alert">{_e(error)}</p>' if error else _notice(request)
     body = f'<div class="page-heading"><div><p class="eyebrow">MEMORY</p><h1>长期记忆</h1></div>{picker}</div>{alert}{contents}'
     return _html(_layout("长期记忆", "memories", body, csrf, user_id, settings), status_code=400 if error else 200)
@@ -893,15 +941,15 @@ async def login(request: Request):
         raise HTTPException(status_code=503, detail="后台未配置")
     form = await _form(request)
     expected = _unseal(settings, request.cookies.get(_PRELOGIN_COOKIE), "pre")
-    if not expected or not hmac.compare_digest(form.get("csrf", ""), expected):
+    if not expected or not _same_secret(form.get("csrf", ""), expected):
         raise HTTPException(status_code=403, detail="页面已过期，请刷新后重试")
     ip = _client_ip(request)
     now = time.monotonic()
     failures = [value for value in _LOGIN_FAILURES.get(ip, []) if now - value < 900]
     if len(failures) >= 8:
         raise HTTPException(status_code=429, detail="请稍后再试")
-    valid_user = hmac.compare_digest(form.get("username", ""), settings.admin_username)
-    valid_password = hmac.compare_digest(form.get("password", ""), settings.admin_password)
+    valid_user = _same_secret(form.get("username", ""), settings.admin_username)
+    valid_password = _same_secret(form.get("password", ""), settings.admin_password)
     if not (valid_user and valid_password):
         _LOGIN_FAILURES[ip] = failures + [now]
         csrf = secrets.token_urlsafe(24)
@@ -1082,6 +1130,23 @@ async def add_memory(request: Request):
     _refresh_memory(request, user_id)
     logger.info("后台添加记忆", extra={"user_id": user_id, "memory_id": memory_id})
     return _redirect(f"/admin/memories?{urlencode({'user_id': user_id, 'status': 'saved'})}")
+
+
+@router.post("/memories/merge")
+async def merge_memories(request: Request):
+    csrf, form = await _authorized_form(request)
+    storage, settings = _storage(request), _settings(request)
+    user_id = _form_user(form, storage, settings)
+    try:
+        memory_id = storage.merge_memories(
+            user_id, form.get("ids", "").split(","), form.get("text", ""),
+            form.get("version", ""), max_chars=settings.memory_item_max_chars,
+        )
+    except ValueError as exc:
+        return _memory_page(request, csrf, user_id, str(exc))
+    _refresh_memory(request, user_id)
+    logger.info("后台确认合并记忆", extra={"user_id": user_id, "memory_id": memory_id})
+    return _redirect(f"/admin/memories?{urlencode({'user_id': user_id, 'organize': '1', 'status': 'saved'})}")
 
 
 @router.post("/memories/{memory_id}/edit")

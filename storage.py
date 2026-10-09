@@ -13,8 +13,11 @@ import time
 import uuid
 from pathlib import Path
 
+from dotenv import dotenv_values, set_key
+
 from costs import PriceResult, normalize_usage
 from persona import DEFAULT_PERSONA, FIELDS, validate_persona
+from memory_organize import memory_version, organization_candidates, validate_merge_text
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -29,6 +32,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     name           TEXT NOT NULL,
     status         TEXT NOT NULL DEFAULT 'archived',  -- active | archived
     pi_session_file TEXT,
+    pi_session_empty INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -115,6 +119,14 @@ CREATE TABLE IF NOT EXISTS memory_items (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_user ON memory_items(user_id, pinned DESC, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS memory_maintenance_status (
+    user_id INTEGER PRIMARY KEY,
+    added INTEGER NOT NULL DEFAULT 0,
+    refreshed INTEGER NOT NULL DEFAULT 0,
+    skipped_full INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session_recovery (
     session_id     TEXT PRIMARY KEY,
     pi_session_file TEXT NOT NULL,
@@ -178,6 +190,14 @@ CREATE TABLE IF NOT EXISTS user_model_selection (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_preferences (
+    session_id TEXT PRIMARY KEY,
+    provider TEXT,
+    model_id TEXT,
+    persona_id TEXT,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_memory_preferences (
     user_id              INTEGER PRIMARY KEY,
     auto_extract_enabled INTEGER NOT NULL CHECK (auto_extract_enabled IN (0, 1)),
@@ -217,8 +237,9 @@ class UpdateQueueFull(Exception):
 
 
 class Storage:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, secret_file: str | None = None):
         self.db_path = db_path
+        self.secret_file = Path(secret_file).absolute() if secret_file is not None else None
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         # inbox 暂存 Telegram 消息正文，不能让同机其他用户读取数据库文件。
@@ -227,7 +248,12 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         with self._lock:
+            if self.secret_file is not None:
+                self._conn.execute("PRAGMA secure_delete=ON")
             self._conn.executescript(_SCHEMA)
+            session_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+            if "pi_session_empty" not in session_columns:
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN pi_session_empty INTEGER NOT NULL DEFAULT 0")
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(usage_runs)")}
             if "origin" not in columns:
                 self._conn.execute("ALTER TABLE usage_runs ADD COLUMN origin TEXT NOT NULL DEFAULT 'chat'")
@@ -298,20 +324,71 @@ class Storage:
             self._conn.executemany("DELETE FROM runtime_settings WHERE key = ?",
                                    ((key,) for key in keys))
 
-    def get_smtp_settings(self) -> sqlite3.Row | None:
+    def _smtp_password(self) -> str:
+        if self.secret_file is None or not self.secret_file.is_file():
+            return ""
+        # 直接读取文件，不使用环境变量或 dotenv 的 ${...} 插值，避免旧 Pi 进程缓存旧密码。
+        return dotenv_values(self.secret_file, interpolate=False).get("SMTP_PASSWORD") or ""
+
+    def _save_smtp_password(self, password: str) -> None:
+        if self.secret_file is None:
+            raise ValueError("未配置 SMTP 密钥文件")
+        if not isinstance(password, str) or not password or any(ord(char) < 32 or ord(char) == 127 for char in password):
+            raise ValueError("SMTP 密码或授权码无效")
+        if self.secret_file.is_symlink():
+            raise ValueError("SMTP 密钥文件不能是符号链接")
+        self.secret_file.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix" and self.secret_file.exists():
+            self.secret_file.chmod(0o600)
+        # set_key 保留其他键和注释，写同目录临时文件再原子替换；值始终加引号并转义。
+        set_key(self.secret_file, "SMTP_PASSWORD", password, quote_mode="always")
+        if os.name == "posix":
+            self.secret_file.chmod(0o600)
+
+    def migrate_smtp_secret(self) -> bool:
+        """生产启动时先把旧 DB 密码保存到 .env，再擦除数据库中的明文。"""
+        if self.secret_file is None:
+            return False
+        with self._lock:
+            row = self._conn.execute("SELECT password FROM smtp_settings WHERE id = 1").fetchone()
+            if row is None or not row["password"] or row["password"] == "env:SMTP_PASSWORD":
+                return False
+            self._save_smtp_password(row["password"])
+            self._conn.execute("UPDATE smtp_settings SET password = ?, updated_at = ? WHERE id = 1",
+                               ("env:SMTP_PASSWORD", time.time()))
+            self._conn.commit()
+            # legacy DB 可能在空闲页中残留旧值，启动时压实并清除，后续更新 secure_delete 保护。
+            self._conn.execute("VACUUM")
+            return True
+
+    def get_smtp_settings(self) -> sqlite3.Row | dict | None:
         rows = self._query("SELECT host, port, username, password, from_address, updated_at "
                            "FROM smtp_settings WHERE id = 1")
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        if rows[0]["password"] == "env:SMTP_PASSWORD":
+            values = dict(rows[0])
+            values["password"] = self._smtp_password()
+            return values
+        return rows[0]
 
     def save_smtp_settings(self, host: str, port: int, username: str,
                            password: str, from_address: str) -> None:
-        self._exec(
-            "INSERT INTO smtp_settings (id, host, port, username, password, from_address, updated_at) "
-            "VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
-            "host=excluded.host, port=excluded.port, username=excluded.username, "
-            "password=excluded.password, from_address=excluded.from_address, updated_at=excluded.updated_at",
-            (host, port, username, password, from_address, time.time()),
-        )
+        with self._lock, self._conn:
+            if not password:
+                row = self._conn.execute("SELECT password FROM smtp_settings WHERE id = 1").fetchone()
+                password = (self._smtp_password() if row and row["password"] == "env:SMTP_PASSWORD"
+                            else row["password"] if row else "")
+            if self.secret_file is not None:
+                self._save_smtp_password(password)
+                password = "env:SMTP_PASSWORD"
+            self._conn.execute(
+                "INSERT INTO smtp_settings (id, host, port, username, password, from_address, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                "host=excluded.host, port=excluded.port, username=excluded.username, "
+                "password=excluded.password, from_address=excluded.from_address, updated_at=excluded.updated_at",
+                (host, port, username, password, from_address, time.time()),
+            )
 
     # ---------- 人格 ----------
     def list_personas(self) -> list[sqlite3.Row]:
@@ -362,6 +439,8 @@ class Storage:
             )
             if cur.rowcount and not enabled:
                 self._conn.execute("DELETE FROM user_persona_selection WHERE persona_id = ?", (persona_id,))
+                self._conn.execute("UPDATE session_preferences SET persona_id = NULL, updated_at = ? "
+                                   "WHERE persona_id = ?", (time.time(), persona_id))
             return cur.rowcount == 1
 
     def delete_persona(self, persona_id: str) -> bool:
@@ -371,6 +450,8 @@ class Storage:
             cur = self._conn.execute("DELETE FROM personas WHERE id = ?", (persona_id,))
             if cur.rowcount:
                 self._conn.execute("DELETE FROM user_persona_selection WHERE persona_id = ?", (persona_id,))
+                self._conn.execute("UPDATE session_preferences SET persona_id = NULL, updated_at = ? "
+                                   "WHERE persona_id = ?", (time.time(), persona_id))
             return cur.rowcount == 1
 
     def set_active_persona(self, user_id: int, persona_id: str) -> None:
@@ -429,6 +510,27 @@ class Storage:
         )
         return rows[0] if rows else None
 
+    def list_mail_drafts(self, user_id: int, limit: int = 20,
+                         states: list[str] | None = None) -> list[sqlite3.Row]:
+        allowed = {"pending", "sending", "sent", "failed", "uncertain", "cancelled"}
+        if states is not None and (not states or not set(states) <= allowed):
+            raise ValueError("邮件状态无效")
+        condition = " AND state IN (" + ",".join("?" for _ in states) + ")" if states else ""
+        return self._query(
+            "SELECT * FROM mail_drafts WHERE user_id = ?" + condition
+            + " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (user_id, *(states or []), max(1, min(int(limit), 100))),
+        )
+
+    def recover_interrupted_mail_drafts(self) -> int:
+        """只在服务启动时调用，不能由短生命周期邮件CLI或其他Storage连接触发。"""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE mail_drafts SET state = 'uncertain', finished_at = ? WHERE state = 'sending'",
+                (time.time(),),
+            )
+            return cursor.rowcount
+
     def mark_mail_previewed(self, user_id: int, draft_id: str) -> None:
         self._exec(
             "UPDATE mail_drafts SET previewed_at = ? "
@@ -445,11 +547,14 @@ class Storage:
             )
             return cursor.rowcount == 1
 
-    def finish_mail_draft(self, user_id: int, draft_id: str, *, sent: bool) -> None:
+    def finish_mail_draft(self, user_id: int, draft_id: str, *, sent: bool,
+                          uncertain: bool = False) -> None:
+        if sent and uncertain:
+            raise ValueError("已提交邮件不能同时标记结果不确定")
         self._exec(
             "UPDATE mail_drafts SET state = ?, finished_at = ? "
             "WHERE user_id = ? AND id = ? AND state = 'sending'",
-            ("sent" if sent else "failed", time.time(), user_id, draft_id),
+            ("sent" if sent else "uncertain" if uncertain else "failed", time.time(), user_id, draft_id),
         )
 
     def cancel_mail_draft(self, user_id: int, draft_id: str) -> bool:
@@ -460,6 +565,72 @@ class Storage:
                 (time.time(), user_id, draft_id),
             )
             return cursor.rowcount == 1
+
+    def get_session_preferences(self, user_id: int, session_id: str) -> dict:
+        session = self.get_session(session_id)
+        if session is None or session["user_id"] != user_id:
+            raise ValueError("会话不存在或不属于当前用户")
+        rows = self._query("SELECT provider, model_id, persona_id, updated_at FROM session_preferences "
+                           "WHERE session_id = ?", (session_id,))
+        return dict(rows[0]) if rows else {
+            "provider": None, "model_id": None, "persona_id": None, "updated_at": None,
+        }
+
+    def set_session_model(self, user_id: int, session_id: str,
+                          provider: str | None, model_id: str | None) -> None:
+        if (provider is None) != (model_id is None) or (provider is not None and (
+                not provider.strip() or not model_id.strip()
+                or any(ord(char) < 33 for char in provider + model_id))):
+            raise ValueError("模型须同时指定提供商和ID，或同时恢复继承")
+        with self._lock, self._conn:
+            self._check_session_owner(user_id, session_id)
+            self._conn.execute(
+                "INSERT INTO session_preferences (session_id, provider, model_id, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
+                "provider=excluded.provider, model_id=excluded.model_id, updated_at=excluded.updated_at",
+                (session_id, provider, model_id, time.time()),
+            )
+
+    def _check_session_owner(self, user_id: int, session_id: str) -> None:
+        row = self._conn.execute("SELECT user_id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None or row["user_id"] != user_id:
+            raise ValueError("会话不存在或不属于当前用户")
+
+    def set_session_persona(self, user_id: int, session_id: str, persona_id: str | None) -> None:
+        with self._lock, self._conn:
+            self._check_session_owner(user_id, session_id)
+            if persona_id not in (None, "none"):
+                row = self._conn.execute("SELECT enabled FROM personas WHERE id = ?", (persona_id,)).fetchone()
+                if row is None or not row["enabled"]:
+                    raise ValueError("人格不存在或已停用")
+            self._conn.execute(
+                "INSERT INTO session_preferences (session_id, persona_id, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET persona_id=excluded.persona_id, updated_at=excluded.updated_at",
+                (session_id, persona_id, time.time()),
+            )
+
+    def clear_session_preferences(self, user_id: int, session_id: str) -> None:
+        with self._lock, self._conn:
+            self._check_session_owner(user_id, session_id)
+            self._conn.execute("DELETE FROM session_preferences WHERE session_id = ?", (session_id,))
+
+    def get_effective_persona(self, user_id: int, session_id: str | None = None):
+        if session_id is not None:
+            selected = self.get_session_preferences(user_id, session_id)["persona_id"]
+            if selected == "none":
+                return None
+            if selected is not None:
+                row = self.get_persona(selected)
+                if row is not None and row["enabled"]:
+                    return row
+        return self.get_active_persona(user_id)
+
+    def get_effective_model_selection(self, user_id: int, session_id: str | None = None):
+        if session_id is not None:
+            preferences = self.get_session_preferences(user_id, session_id)
+            if preferences["provider"] is not None:
+                return preferences
+        return self.get_user_model(user_id)
 
     def get_user_model(self, user_id: int) -> sqlite3.Row | None:
         rows = self._query(
@@ -523,14 +694,14 @@ class Storage:
         return sid
 
     def create_session_with_file_and_activate(
-        self, user_id: int, name: str, pi_session_file: str
+        self, user_id: int, name: str, pi_session_file: str, *, known_empty: bool = False
     ) -> str:
         """新建并切换会话；数据库发生错误时不留下半写入的会话。"""
         sid = uuid.uuid4().hex[:12]
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO sessions (id, user_id, name, pi_session_file) VALUES (?, ?, ?, ?)",
-                (sid, user_id, name, pi_session_file),
+                "INSERT INTO sessions (id, user_id, name, pi_session_file, pi_session_empty) VALUES (?, ?, ?, ?, ?)",
+                (sid, user_id, name, pi_session_file, int(known_empty)),
             )
             self._conn.execute(
                 "UPDATE sessions SET status = 'archived', updated_at = datetime('now') "
@@ -575,11 +746,15 @@ class Storage:
                 (sid,),
             )
 
-    def set_pi_session_file(self, sid: str, pi_session_file: str) -> None:
+    def set_pi_session_file(self, sid: str, pi_session_file: str, *, known_empty: bool = False) -> None:
         self._exec(
-            "UPDATE sessions SET pi_session_file = ?, updated_at = datetime('now') WHERE id = ?",
-            (pi_session_file, sid),
+            "UPDATE sessions SET pi_session_file = ?, pi_session_empty = ?, updated_at = datetime('now') WHERE id = ?",
+            (pi_session_file, int(known_empty), sid),
         )
+
+    def mark_session_nonempty(self, sid: str) -> None:
+        """提交 prompt 前落盘，崩溃后不把已开始执行的会话误当空会话。"""
+        self._exec("UPDATE sessions SET pi_session_empty = 0 WHERE id = ?", (sid,))
 
     def rename_session(self, sid: str, name: str) -> None:
         self._exec(
@@ -721,8 +896,9 @@ class Storage:
 
     def apply_summary(self, user_id: int, session_id: str, previous_covered_id: int,
                       covered_id: int, summary: str, candidates: list[str],
-                      *, memory_limit: int, turn_retention: int) -> None:
+                      *, memory_limit: int, turn_retention: int) -> dict:
         now = time.time()
+        result = {"added": 0, "refreshed": 0, "skipped_full": 0}
         with self._lock, self._conn:
             old = self._conn.execute(
                 "SELECT covered_turn_id FROM session_summaries WHERE session_id = ?", (session_id,)
@@ -746,10 +922,24 @@ class Storage:
             count = self._conn.execute(
                 "SELECT count(*) FROM memory_items WHERE user_id = ?", (user_id,)
             ).fetchone()[0]
+            seen = set()
             for item in candidates:
-                if count >= memory_limit:
-                    break
                 digest = hashlib.sha256(item.casefold().strip().encode("utf-8")).hexdigest()
+                if digest in seen:
+                    continue
+                seen.add(digest)
+                existing = self._conn.execute(
+                    "SELECT id FROM memory_items WHERE user_id = ? AND content_hash = ?", (user_id, digest),
+                ).fetchone()
+                if existing:
+                    # 精确重复只刷新日期，保留人工文本、来源和置顶。
+                    self._conn.execute("UPDATE memory_items SET updated_at = ? WHERE id = ?",
+                                       (now, existing["id"]))
+                    result["refreshed"] += 1
+                    continue
+                if count >= memory_limit:
+                    result["skipped_full"] += 1
+                    continue
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO memory_items "
                     "(id, user_id, text, content_hash, source, created_at, updated_at) "
@@ -757,12 +947,21 @@ class Storage:
                     (uuid.uuid4().hex[:12], user_id, item, digest, now, now),
                 )
                 count += cur.rowcount
+                result["added"] += cur.rowcount
+            self._conn.execute(
+                "INSERT INTO memory_maintenance_status (user_id, added, refreshed, skipped_full, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "added=excluded.added, refreshed=excluded.refreshed, skipped_full=excluded.skipped_full, "
+                "updated_at=excluded.updated_at",
+                (user_id, result["added"], result["refreshed"], result["skipped_full"], now),
+            )
             self._conn.execute(
                 "DELETE FROM conversation_turns WHERE session_id = ? AND id <= ? "
                 "AND id NOT IN (SELECT id FROM conversation_turns WHERE session_id = ? "
                 "ORDER BY id DESC LIMIT ?)",
                 (session_id, covered_id, session_id, turn_retention),
             )
+        return result
 
     def clear_summary_if_unchanged(self, session_id: str, updated_at: float) -> bool:
         """确认后仅清空预览时的版本，且同步清除对应恢复上下文。"""
@@ -790,6 +989,59 @@ class Storage:
         return self._query(
             "SELECT * FROM memory_items WHERE user_id = ? ORDER BY pinned DESC, updated_at DESC", (user_id,),
         )
+
+    def memory_capacity_status(self, user_id: int, limit: int) -> dict:
+        row = self._query("SELECT count(*) AS total, COALESCE(sum(pinned), 0) AS pinned "
+                          "FROM memory_items WHERE user_id = ?", (user_id,))[0]
+        recent = self._query("SELECT added, refreshed, skipped_full, updated_at "
+                             "FROM memory_maintenance_status WHERE user_id = ?", (user_id,))
+        return {"count": row["total"], "limit": limit, "remaining": max(0, limit - row["total"]),
+                "full": row["total"] >= limit, "pinned": row["pinned"],
+                "last_auto": dict(recent[0]) if recent else None}
+
+    def memory_organization_candidates(self, user_id: int, limit: int = 10) -> list[dict]:
+        return organization_candidates(self.list_memories(user_id), limit)
+
+    def preview_memory_merge(self, user_id: int, memory_ids: list[str], text: str | None = None,
+                             *, max_chars: int = 240) -> dict:
+        if not 2 <= len(memory_ids) <= 10 or len(set(memory_ids)) != len(memory_ids):
+            raise ValueError("请选择2至10条不同的记忆")
+        rows = [self.get_memory(user_id, item_id) for item_id in memory_ids]
+        if any(row is None for row in rows):
+            raise ValueError("记忆不存在或不属于当前用户")
+        newest = max(rows, key=lambda row: (row["updated_at"], row["id"]))
+        proposed = validate_merge_text(newest["text"] if text is None else text, max_chars)
+        return {"ids": list(memory_ids), "rows": [dict(row) for row in rows],
+                "text": proposed, "version": memory_version(rows),
+                "pinned": any(row["pinned"] for row in rows)}
+
+    def merge_memories(self, user_id: int, memory_ids: list[str], text: str,
+                       expected_version: str, *, max_chars: int = 240) -> str:
+        text = validate_merge_text(text, max_chars)
+        if not 2 <= len(memory_ids) <= 10 or len(set(memory_ids)) != len(memory_ids):
+            raise ValueError("请选择2至10条不同的记忆")
+        digest = hashlib.sha256(text.casefold().strip().encode("utf-8")).hexdigest()
+        with self._lock, self._conn:
+            rows = [self._conn.execute("SELECT * FROM memory_items WHERE user_id = ? AND id = ?",
+                                      (user_id, item_id)).fetchone() for item_id in memory_ids]
+            if any(row is None for row in rows):
+                raise ValueError("记忆不存在或不属于当前用户")
+            if memory_version(rows) != expected_version:
+                raise ValueError("整理预览已过期，请重新预览")
+            duplicate = self._conn.execute("SELECT id FROM memory_items WHERE user_id = ? AND content_hash = ?",
+                                           (user_id, digest)).fetchone()
+            if duplicate and duplicate["id"] not in memory_ids:
+                raise ValueError("整理后的内容与另一条记忆重复，请将该条也加入整理")
+            kept = max(rows, key=lambda row: (row["pinned"], row["updated_at"], row["id"]))
+            removed = [row["id"] for row in rows if row["id"] != kept["id"]]
+            self._conn.executemany("DELETE FROM memory_items WHERE user_id = ? AND id = ?",
+                                   ((user_id, item_id) for item_id in removed))
+            self._conn.execute(
+                "UPDATE memory_items SET text = ?, content_hash = ?, source = 'manual', pinned = ?, "
+                "updated_at = ? WHERE user_id = ? AND id = ?",
+                (text, digest, int(any(row["pinned"] for row in rows)), time.time(), user_id, kept["id"]),
+            )
+            return kept["id"]
 
     def get_memory(self, user_id: int, memory_id: str) -> sqlite3.Row | None:
         rows = self._query("SELECT * FROM memory_items WHERE user_id = ? AND id = ?", (user_id, memory_id))
@@ -847,7 +1099,7 @@ class Storage:
 
     def set_session_recovery(self, session_id: str, pi_session_file: str, context_text: str) -> None:
         with self._lock, self._conn:
-            self._conn.execute("UPDATE sessions SET pi_session_file = ? WHERE id = ?",
+            self._conn.execute("UPDATE sessions SET pi_session_file = ?, pi_session_empty = 0 WHERE id = ?",
                                (pi_session_file, session_id))
             self._conn.execute(
                 "INSERT INTO session_recovery (session_id, pi_session_file, context_text, updated_at) "

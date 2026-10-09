@@ -8,9 +8,10 @@ import bot
 
 
 class UnsupportedMessageTests(unittest.IsolatedAsyncioTestCase):
-    async def test_voice_update_reaches_fallback_and_gets_clear_reply(self):
+    async def test_voice_update_reaches_dedicated_handler_through_auth_guard(self):
         settings = SimpleNamespace(bot_token="123:ABC", allowed_ids={7})
-        app = bot.build_application(settings, Mock(), Mock())
+        with patch("bot_interactions.handle_voice", new_callable=AsyncMock) as handle_voice:
+            app = bot.build_application(settings, Mock(), Mock())
         payload = {
             "update_id": 1,
             "message": {
@@ -22,10 +23,10 @@ class UnsupportedMessageTests(unittest.IsolatedAsyncioTestCase):
         }
         update = Update.de_json(payload, app.bot)
         matching = next(h for h in app.handlers[0] if h.check_update(update))
-        self.assertIs(matching, app.handlers[0][-1])
-        with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
-            await matching.callback(update, SimpleNamespace())
-        self.assertIn("语音或音频", reply.await_args.args[1])
+        self.assertIs(matching, app.handlers[0][-4])
+        context = SimpleNamespace()
+        await matching.callback(update, context)
+        handle_voice.assert_awaited_once_with(update, context)
 
     async def test_known_text_still_reaches_text_handler_first(self):
         settings = SimpleNamespace(bot_token="123:ABC", allowed_ids={7})

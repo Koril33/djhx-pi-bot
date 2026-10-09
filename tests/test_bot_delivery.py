@@ -12,12 +12,12 @@ from persona import DEFAULT_PERSONA
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_network_error_is_retried_then_raised(self) -> None:
+    async def test_unknown_send_failure_is_not_blindly_retried(self) -> None:
         sender = AsyncMock(side_effect=NetworkError("connection lost"))
         with patch.object(bot.asyncio, "sleep", new_callable=AsyncMock):
-            with self.assertRaises(NetworkError):
+            with self.assertRaises(bot.DeliveryUncertainError):
                 await bot._send(sender, "hello")
-        self.assertEqual(sender.await_count, 3)
+        self.assertEqual(sender.await_count, 1)
 
     async def test_bad_html_falls_back_to_plain_text(self) -> None:
         sender = AsyncMock(side_effect=[BadRequest("can't parse entities"), "message"])
@@ -85,7 +85,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
         storage.set_active.assert_not_called()
 
     async def test_read_only_commands_wait_for_session_change_before_syncing_client(self) -> None:
-        for command, args in ((bot.cmd_model, ["list"]), (bot.cmd_status, [])):
+        for command, args in ((bot.cmd_model, ["list"]),):
             with self.subTest(command=command.__name__):
                 lock = asyncio.Lock()
                 await lock.acquire()
@@ -213,7 +213,7 @@ class SessionCommandTests(unittest.IsolatedAsyncioTestCase):
         update = SimpleNamespace(effective_user=SimpleNamespace(id=1))
         with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:
             await bot.cmd_session(update, context)
-        storage.create_session_with_file_and_activate.assert_called_once_with(1, "next", "/new.jsonl")
+        storage.create_session_with_file_and_activate.assert_called_once_with(1, "next", "/new.jsonl", known_empty=False)
         client.switch_session.assert_not_awaited()
         self.assertIn("已新建会话", reply.await_args.args[1])
 

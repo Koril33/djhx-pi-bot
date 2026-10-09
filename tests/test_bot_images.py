@@ -221,8 +221,8 @@ class ImageMessageTests(unittest.IsolatedAsyncioTestCase):
         self.client.get_state.assert_not_awaited()
 
     async def test_unsupported_document_is_explained_before_download(self):
-        self.media.file_name = "report.pdf"
-        self.media.mime_type = "application/pdf"
+        self.media.file_name = "report.docx"
+        self.media.mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         self.message.photo = []
         self.message.document = self.media
         with patch.object(bot, "reply_text", new_callable=AsyncMock) as reply:

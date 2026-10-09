@@ -257,6 +257,15 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(valid.status_code, 202)
             spawn.assert_called_once()
 
+    async def test_unicode_secrets_and_signature_are_rejected_without_server_error(self):
+        webhook = await self.client.post("/webhook/错误", json={"update_id": 42})
+        deploy = await self.client.post("/deploy-webhook/错误", json={"ref": "refs/heads/main"})
+        signature = await self.client.post(
+            "/deploy-webhook/deploy-secret", json={"ref": "refs/heads/main"},
+            headers={"X-Gitea-Event": "push", "X-Gitea-Signature": "错误".encode()},
+        )
+        self.assertEqual([webhook.status_code, deploy.status_code, signature.status_code], [403, 403, 403])
+
     async def test_stop_dispatches_while_prompt_is_running(self):
         prompt_started = asyncio.Event()
         release_prompt = asyncio.Event()

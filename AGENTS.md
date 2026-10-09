@@ -17,7 +17,11 @@
 | `app.py` | FastAPI 入口：webhook / healthz / deploy-webhook / 生命周期 |
 | `bot.py` | Telegram 处理器 + Agent 会话编排（AgentManager / AgentSession） |
 | `pi_bridge.py` | pi RPC 常驻子进程管理（JSONL 协议、流式、崩溃重启） |
-| `storage.py` | SQLite 用户/会话映射 |
+| `storage.py` | SQLite 用户、会话偏好、记忆、邮件草稿与更新队列 |
+| `delivery.py` | 已生成回复、分段送达状态与安全补发 |
+| `media.py` / `media_worker.py` | 有限额的 PDF 提取与本地语音转写 |
+| `interactions.py` / `bot_interactions.py` | 用户隔离的待确认请求与 Pi 输入框 |
+| `ops.py` | 数据库与完整 JSONL 备份、校验及离线恢复 |
 | `config.py` | pydantic-settings 配置（环境变量 + .env） |
 | `logging_conf.py` | dictConfig + JSON 日志 |
 
@@ -29,6 +33,10 @@
 - pi RPC 子进程 stdin 必须保持打开，禁止 close
 - 修改后本地 `uv lock` + `python -m py_compile *.py` 自检，`git push gitea main` 触发 Gitea webhook 自动部署
 - 部署链路：Gitea Push webhook → `app.py /deploy-webhook` → `deploy/deploy.sh`（pull+sync+restart）
+
+SMTP 授权码由后台安全保存到项目 `.env` 的 `SMTP_PASSWORD`，数据库只存 `env:SMTP_PASSWORD` 引用；启动迁移旧明文凭据。POSIX 上 `.env` 权限为 `0600`，不得入库。旧版本数据库与备份可能仍含密码，应限制读取权限。授权码不回显、不进入工具参数或结果；服务账号和以其身份运行的 Pi 文件/命令工具拥有相同文件权限，不能把邮件工具接口当成操作系统级隔离。
+
+Telegram 发送失败后只补发 `delivery.py` 已保存的文字，禁止为补发重跑模型或工具。发送超时且没有消息 ID 时须保留“可能已送达”的状态，用户确认后才能补发。语音转写、缓存图片请求及 Pi 输入框均按用户校验并消费确认；不要绕过确认直接提交任务。自动记忆满额时只提示与提出整理候选，合并必须经过预览确认并保留置顶。
 
 ## ⚠️ 工作流警示（在服务器部署目录里改代码时必读）
 
@@ -47,5 +55,5 @@
 | stdin 不能 EOF | RPC 子进程 stdin 一旦关闭，pi 会提前退出、掐断进行中的推理 |
 | PTB 手动启动 | `initialize()+start()` 手动模式**不触发 `post_init`**，命令菜单等需显式调用 `register_command_menu(bot)` |
 | 日志 extra 保留键 | LogRecord 保留字段（如 `args`）不能用作 `extra` 键，会抛 "Attempt to overwrite" |
-| 服务器→Telegram API 不稳 | `tg_app.start()`/请求偶发 `httpx.ReadError`，启动已加重试（lifespan 内 5 次×3s），勿删 |
+| 服务器→Telegram API 不稳 | `initialize/getMe`、`start` 与命令注册均支持网络退避重试，运行中另有探活；勿删现有重试。错误 token 立即失败 |
 | 换行符 | 仓库有 `.gitattributes` 统一 LF，Windows 提交勿手动改行尾 |

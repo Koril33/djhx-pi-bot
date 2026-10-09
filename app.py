@@ -16,17 +16,26 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, Response, status
 from telegram import Update
+from telegram.error import InvalidToken, NetworkError, RetryAfter
 
 from admin import apply_runtime_settings, router as admin_router
-from bot import AgentManager, build_application, failure_notice_text, register_command_menu
+from bot import AgentManager, COMMAND_MENU, build_application, failure_notice_text
 from config import get_settings
 from logging_conf import get_logger, setup_logging
+from ops import backup_status, create_backup
 from storage import Storage, UpdateQueueFull
 
 logger = get_logger("app")
 
 settings = get_settings()
 setup_logging()
+try:
+    RUNNING_REVISION = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent,
+        stderr=subprocess.DEVNULL, text=True,
+    ).strip()
+except (OSError, subprocess.SubprocessError):
+    RUNNING_REVISION = None
 
 
 def register_update_error_handler(tg_app, update_errors: dict[int, Exception]) -> None:
@@ -53,6 +62,8 @@ async def process_queued_updates(
     wake: asyncio.Event,
     stopping: asyncio.Event,
     update_errors: dict[int, Exception],
+    paused: asyncio.Event | None = None,
+    idle: asyncio.Event | None = None,
 ) -> None:
     """有界并发分发；普通消息按 update_id 排队，为控制命令保留容量。"""
 
@@ -106,11 +117,16 @@ async def process_queued_updates(
                 # 同一批中先启动普通消息，再启动随后到达的 stop/steer，
                 # 避免刚提交的 prompt 尚未标记 busy 时 /stop 抢先执行。
                 for priority in (0, 1, 2):
+                    if priority == 0 and paused is not None and paused.is_set():
+                        continue
                     available = limits[priority] - sum(p == priority for p in in_flight.values())
                     for row in storage.claim_updates(available, priority=priority):
                         task = asyncio.create_task(process_one(row), name=f"telegram-update-{row['update_id']}")
                         in_flight[task] = priority
                         claimed = True
+
+            if idle is not None:
+                idle.clear() if in_flight else idle.set()
 
             if stopping.is_set() and not in_flight and not claimed:
                 return
@@ -146,7 +162,9 @@ def _update_priority(update: Update, manager: AgentManager | None) -> int:
     command = text.split(maxsplit=1)[0].split("@", 1)[0] if text.strip() else ""
     if command == "/stop" or (callback is not None and callback.data == "cmd:stop"):
         return 2
-    if command in {"/steer", "/queue"}:
+    if command in {"/steer", "/queue", "/answer"} or (
+        callback is not None and str(callback.data or "").startswith("piui:")
+    ):
         return 1
     return 0
 
@@ -169,18 +187,127 @@ def _spawn_deploy(*, catch_up: bool = False) -> subprocess.Popen:
         )
 
 
-def _report_update_worker_exit(task: asyncio.Task) -> None:
-    if task.cancelled():
-        return
-    try:
-        task.result()
-    except Exception:
-        logger.exception("Telegram 更新 worker 异常退出")
+async def start_telegram(tg_app, runtime_settings) -> None:
+    """initialize 的 getMe、启动和菜单注册均支持长断网后的恢复。"""
+    initialized = started = False
+    attempt = 0
+    while True:
+        try:
+            if not initialized:
+                await tg_app.initialize()
+                initialized = True
+            if not started:
+                await tg_app.start()
+                started = True
+            # bot.py 的兼容辅助方法吞掉错误，这里需要保留网络异常以重试。
+            await tg_app.bot.set_my_commands(COMMAND_MENU)
+            return
+        except InvalidToken:
+            raise
+        except (NetworkError, RetryAfter, TimeoutError) as exc:
+            delay = min(runtime_settings.telegram_retry_max_seconds,
+                        runtime_settings.telegram_retry_initial_seconds * 2 ** min(attempt, 8))
+            if isinstance(exc, RetryAfter):
+                retry = exc.retry_after
+                delay = max(delay, retry.total_seconds() if hasattr(retry, "total_seconds") else float(retry))
+            attempt += 1
+            logger.warning("Telegram 启动网络不可用，稍后重试", extra={
+                "attempt": attempt, "retry_seconds": delay, "err_type": type(exc).__name__,
+            })
+            await asyncio.sleep(delay)
+
+
+async def supervise_update_worker(app: FastAPI, update_errors: dict[int, Exception]) -> None:
+    """worker 崩溃后恢复消费者，避免 systemd active 但无人处理更新。"""
+    while not app.state.update_stopping.is_set():
+        app.state.worker_ready = True
+        try:
+            await process_queued_updates(
+                app.state.storage, app.state.tg_app, app.state.update_wake,
+                app.state.update_stopping, update_errors, app.state.backup_paused, app.state.update_idle,
+            )
+            if not app.state.update_stopping.is_set():
+                raise RuntimeError("更新 worker 意外返回")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            app.state.worker_ready = False
+            app.state.worker_restarts += 1
+            logger.exception("Telegram 更新 worker 异常退出，将重新启动")
+            await asyncio.sleep(settings.update_worker_retry_seconds)
+        finally:
+            app.state.worker_ready = False
+
+
+async def monitor_telegram(app: FastAPI) -> None:
+    last_prune = time.monotonic() - 3600
+    while True:
+        await asyncio.sleep(settings.telegram_probe_interval_seconds)
+        if time.monotonic() - last_prune >= 3600:
+            try:
+                app.state.manager.actions.prune()
+                app.state.storage.prune_updates()
+            except Exception as exc:
+                logger.warning("过期运行记录清理暂时失败", extra={"err_type": type(exc).__name__})
+            else:
+                last_prune = time.monotonic()
+        activity = app.state.telegram_activity
+        activity["last_probe_at"] = time.time()
+        try:
+            await asyncio.wait_for(app.state.tg_app.bot.get_me(), timeout=20)
+        except InvalidToken:
+            activity.update(reachable=False, error="InvalidToken")
+            logger.error("Telegram token 已失效，请更新配置")
+            return
+        except Exception as exc:
+            activity.update(reachable=False, error=type(exc).__name__)
+            logger.warning("Telegram 探活暂时失败", extra={"err_type": type(exc).__name__})
+        else:
+            activity.update(reachable=True, last_success_at=time.time(), error=None)
+
+
+async def periodic_backup(app: FastAPI) -> None:
+    while True:
+        previous = backup_status(settings)
+        if previous.get("archive") and previous.get("age_seconds", 0) < settings.backup_interval_seconds:
+            await asyncio.sleep(min(60, settings.backup_interval_seconds - previous["age_seconds"]))
+            continue
+        app.state.backup_paused.set()
+        try:
+            await asyncio.wait_for(app.state.update_idle.wait(), timeout=settings.backup_idle_timeout_seconds)
+            if any(agent.client.busy or agent.prompt_pending or (
+                getattr(agent, "turn_task", None) is not None and not agent.turn_task.done()
+            ) for agent in app.state.manager._agents.values()):
+                raise TimeoutError("会话仍在处理，延后备份")
+            memory = getattr(app.state.manager, "memory", None)
+            if any(not task.done() for task in getattr(memory, "_tasks", ())):
+                raise TimeoutError("摘要维护仍在处理，延后备份")
+            result = await asyncio.to_thread(
+                create_backup, settings.db_path, settings.pi_session_dir, settings.backup_root,
+                reason="scheduled",
+            )
+            app.state.backup_error = None
+            logger.info("每日完整备份成功", extra={"archive": result["archive"], "session_files": result["session_files"]})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            app.state.backup_error = type(exc).__name__
+            logger.warning("每日备份延后", extra={"err_type": type(exc).__name__})
+        finally:
+            app.state.backup_paused.clear()
+            app.state.update_wake.set()
+        await asyncio.sleep(60)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    storage = Storage(settings.db_path)
+    storage = Storage(settings.db_path, secret_file=".env")
+    try:
+        if storage.migrate_smtp_secret():
+            logger.info("已把旧 SMTP 授权码迁移到 .env，数据库只保留引用")
+    except BaseException:
+        storage._conn.close()
+        raise
     apply_runtime_settings(settings, storage)
     app.state.settings = settings
     storage.prune_updates()
@@ -195,31 +322,34 @@ async def lifespan(app: FastAPI):
     tg_app = build_application(settings, storage, manager)
     update_errors: dict[int, Exception] = {}
     register_update_error_handler(tg_app, update_errors)
-    await tg_app.initialize()
-    # start() 内部会调 getMe；服务器→api.telegram.org 偶发网络错误会导致整个服务退出，加重试
-    for attempt in range(5):
-        try:
-            await tg_app.start()
-            break
-        except Exception as e:
-            logger.warning("tg_app.start 失败，重试", extra={"attempt": attempt + 1, "err": str(e)[:200]})
-            await asyncio.sleep(3)
-    else:
-        raise RuntimeError("tg_app.start 多次失败")
-    # 手动启动模式不会触发 post_init，需显式注册命令菜单
-    await register_command_menu(tg_app.bot)
+    try:
+        await start_telegram(tg_app, settings)
+    except BaseException:
+        if getattr(tg_app, "running", False):
+            await tg_app.stop()
+        await tg_app.shutdown()
+        storage._conn.close()
+        raise
     app.state.storage = storage
     app.state.manager = manager
     app.state.tg_app = tg_app
     app.state.update_wake = asyncio.Event()
     app.state.update_stopping = asyncio.Event()
+    app.state.backup_paused = asyncio.Event()
+    app.state.update_idle = asyncio.Event()
+    app.state.update_idle.set()
+    app.state.worker_ready = True
+    app.state.worker_restarts = 0
+    app.state.backup_error = None
+    app.state.telegram_activity = {"reachable": True, "last_probe_at": time.time(),
+                                   "last_success_at": time.time(), "error": None}
     app.state.update_worker = asyncio.create_task(
-        process_queued_updates(
-            storage, tg_app, app.state.update_wake, app.state.update_stopping, update_errors
-        ),
+        supervise_update_worker(app, update_errors),
         name="telegram-update-worker",
     )
-    app.state.update_worker.add_done_callback(_report_update_worker_exit)
+    maintenance = [asyncio.create_task(monitor_telegram(app), name="telegram-probe")]
+    if settings.backup_enabled:
+        maintenance.append(asyncio.create_task(periodic_backup(app), name="daily-backup"))
     try:
         _spawn_deploy(catch_up=True)
     except OSError:
@@ -236,6 +366,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         app.state.update_stopping.set()
+        for task in maintenance:
+            task.cancel()
+        await asyncio.gather(*maintenance, return_exceptions=True)
         app.state.update_wake.set()
         try:
             await asyncio.wait_for(app.state.update_worker, timeout=settings.shutdown_drain_seconds)
@@ -248,6 +381,7 @@ async def lifespan(app: FastAPI):
         await manager.shutdown()
         await tg_app.stop()
         await tg_app.shutdown()
+        storage._conn.close()
 
 
 app = FastAPI(title="djhx-pi-bot", lifespan=lifespan)
@@ -257,14 +391,35 @@ app.include_router(admin_router)
 @app.get("/healthz")
 async def healthz(request: Request):
     worker = getattr(request.app.state, "update_worker", None)
-    ok = worker is not None and not worker.done()
+    state = request.app.state
+    worker_ok = worker is not None and not worker.done() and getattr(state, "worker_ready", True)
     stats = request.app.state.storage.update_stats() if hasattr(request.app.state, "storage") else None
+    telegram = getattr(state, "telegram_activity", {})
+    telegram_ok = telegram.get("reachable", True)
+    queue_ok = not (stats and stats["pending"] and not stats["processing"]
+                    and (stats["oldest_pending_seconds"] or 0) > 120)
+    ok = bool(worker_ok and telegram_ok and queue_ok)
+    agents = getattr(getattr(state, "manager", None), "_agents", {})
+    active = sum(bool(agent.client.busy or agent.prompt_pending or (
+        getattr(agent, "turn_task", None) is not None and not agent.turn_task.done()
+    )) for agent in agents.values())
+    memory = getattr(getattr(state, "manager", None), "memory", None)
+    summary_tasks = sum(not task.done() for task in getattr(memory, "_tasks", ()))
+    backup = backup_status(settings)
+    backup["error"] = getattr(state, "backup_error", None) or backup.get("error")
     return Response(
         content=json.dumps({
             "ok": ok,
-            "degraded": not ok or bool(stats and stats["failed"]),
+            "degraded": not ok,
             "service": "djhx-pi-bot",
+            "revision": RUNNING_REVISION,
             "updates": stats,
+            "incidents": {"unacknowledged": stats["failed"] if stats else 0},
+            "readiness": {"worker": worker_ok, "telegram": telegram_ok, "queue": queue_ok},
+            "activity": {"active_sessions": active, "summary_tasks": summary_tasks,
+                         "worker_restarts": getattr(state, "worker_restarts", 0)},
+            "telegram": telegram,
+            "backup": backup,
         }),
         media_type="application/json",
         status_code=status.HTTP_200_OK if ok else status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -273,7 +428,7 @@ async def healthz(request: Request):
 
 @app.post("/webhook/{secret}")
 async def webhook(secret: str, request: Request) -> Response:
-    if not settings.webhook_secret or not hmac.compare_digest(secret, settings.webhook_secret):
+    if not settings.webhook_secret or not hmac.compare_digest(secret.encode(), settings.webhook_secret.encode()):
         logger.warning("webhook 密钥不匹配")
         return Response(status_code=status.HTTP_403_FORBIDDEN)
     try:
@@ -294,7 +449,7 @@ async def webhook(secret: str, request: Request) -> Response:
         message_text = (message.text or message.caption or "") if message is not None else ""
         is_plain_message = bool(
             message is not None
-            and (message_text or message.photo or message.document)
+            and (message_text or message.photo or message.document or message.voice or message.audio)
             and not message_text.lstrip().startswith("/")
         )
         user_id = update.effective_user.id if update.effective_user is not None else None
@@ -323,9 +478,10 @@ async def webhook(secret: str, request: Request) -> Response:
 async def deploy_webhook(secret: str, request: Request) -> Response:
     """Gitea main push 入口；路径密钥与可选 HMAC 验证后触发部署。
 
-    部署子进程会随 systemd 服务重启被结束；服务下次启动会补查远端提交。
+    部署脚本把执行移交给独立 systemd unit，重启 bot 后继续验证并记录结果。
+    服务启动时补查遗漏的远端提交；失败提交会保留标记，避免反复自动部署。
     """
-    if not settings.deploy_secret or not hmac.compare_digest(secret, settings.deploy_secret):
+    if not settings.deploy_secret or not hmac.compare_digest(secret.encode(), settings.deploy_secret.encode()):
         logger.warning("deploy webhook 密钥不匹配")
         return Response(status_code=status.HTTP_403_FORBIDDEN)
 
@@ -337,7 +493,7 @@ async def deploy_webhook(secret: str, request: Request) -> Response:
     signature = request.headers.get("X-Gitea-Signature", "")
     if signature:
         expected = hmac.new(settings.deploy_secret.encode(), body, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(signature, expected):
+        if not hmac.compare_digest(signature.encode(), expected.encode()):
             logger.warning("deploy webhook 签名不匹配")
             return Response(status_code=status.HTTP_403_FORBIDDEN)
     elif settings.deploy_require_signature:

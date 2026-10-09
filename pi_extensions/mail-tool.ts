@@ -1,4 +1,4 @@
-/** Model-callable mail tool. SMTP credentials stay in the Python process and SQLite. */
+/** Model-callable draft tool. SMTP credentials are resolved server-side from .env. */
 import { spawn } from "node:child_process";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";

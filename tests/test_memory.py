@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import sqlite3
 import sys
 import tempfile
@@ -56,7 +57,7 @@ class MemoryStorageTests(unittest.TestCase):
                 7, f"记忆内容 {index} " + "甲" * 30, limit=4,
             )
         used = []
-        body = self.memory.build_context(7, self.sid, None, "", used)
+        body = self.memory.build_context(7, self.sid, None, "记忆内容", used)
         self.assertEqual(len(used), 1)
         self.assertIn("- " + used[0]["text"], body)
         self.assertNotIn("记忆内容 1 " + "甲" * 30, body)
@@ -116,6 +117,28 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertTrue(self.storage.delete_memory(7, item_id))
         self.memory.refresh_context(7, self.sid, None, "请用中文回答")
         self.assertNotIn("我喜欢用中文回答", json.loads(path.read_text(encoding="utf-8"))["text"])
+
+    def test_unrelated_memories_are_not_injected_but_pins_remain(self):
+        self.storage.add_memory(7, "我喜欢喝咖啡", limit=4)
+        pinned = self.storage.add_memory(7, "回答使用中文", limit=4)
+        self.storage.pin_memory(7, pinned, True)
+        body = self.memory.build_context(7, self.sid, None, "排查异步取消")
+        self.assertNotIn("咖啡", body)
+        self.assertIn("回答使用中文", body)
+
+    def test_saturated_old_summary_cannot_displace_latest_user_and_assistant_tail(self):
+        self.settings.memory_summary_max_bytes = 1536
+        self.storage.apply_summary(7, self.sid, 0, 0, "旧" * 512, [], memory_limit=4, turn_retention=2)
+        turn = self.storage.start_turn(7, self.sid, 2345, "问" * 4000 + "最新用户决定_MARKER", False)
+        self.storage.append_turn_steer(turn, "补充要求_MARKER")
+        self.storage.finish_turn(turn, "答" * 8000 + "最新助手结论_MARKER", complete=True)
+        body = self.memory.build_recovery(self.sid)
+        self.assertLessEqual(len(body.encode("utf-8")), 1536)
+        self.assertIn("旧摘要", body)
+        self.assertIn("最新用户决定_MARKER", body)
+        self.assertIn("补充要求_MARKER", body)
+        self.assertIn("最新助手结论_MARKER", body)
+        self.assertIn("中间省略", body)
 
     def test_summary_progress_and_recovery_without_jsonl(self):
         for update_id in (10, 11, 12):
@@ -350,6 +373,70 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run["origin"], "memory_maintenance")
         self.assertEqual(len(self.storage.get_usage_events(run["id"])), 1)
 
+    async def test_long_chinese_turn_is_fully_read_before_covering_and_each_call_is_isolated(self):
+        self.settings.memory_summary_input_max_bytes = 16000
+        self.settings.memory_summary_max_bytes = 1536
+        self.settings.memory_summary_response_max_bytes = 8192
+        pending = self.storage.pending_summary_turns(self.sid)
+        self.storage._exec("UPDATE conversation_turns SET user_text = ?, assistant_text = ? WHERE id = ?",
+                           ("问" * 4000, "答" * 8000 + "末尾关键决定_MARKER", pending[0]["id"]))
+        before = self.storage.pending_summary_turns(self.sid)
+        instructions, clients = [], []
+
+        class FakePi:
+            def __init__(self, *args, **kwargs):
+                self.stopped = False
+                clients.append(self)
+
+            async def prompt(self, instruction, **kwargs):
+                instructions.append(instruction)
+                yield json.dumps({"summary": "最新决定已保存" if "末尾关键决定_MARKER" in instruction else "中间摘要",
+                                  "memories": []}, ensure_ascii=False)
+
+            async def stop(self):
+                self.stopped = True
+
+        with patch("memory.PiRpcClient", FakePi):
+            await self.memory._summarize(7, self.sid)
+        self.assertGreater(len(instructions), 1)
+        self.assertTrue(all(len(text.encode("utf-8")) <= 16000 for text in instructions))
+        raw = "".join(re.split(r"\n片段\d+/\d+（按时间先后，尚未结束则保留待续事项）：\n", text)[1]
+                      for text in instructions)
+        self.assertIn("问" * 4000, raw)
+        self.assertIn("答" * 8000 + "末尾关键决定_MARKER", raw)
+        self.assertTrue(all(client.stopped for client in clients))
+        self.assertEqual(len(clients), len(instructions))
+        self.assertEqual(self.storage.get_summary(self.sid)["covered_turn_id"], before[-1]["id"])
+        self.assertEqual(self.storage.get_summary(self.sid)["summary_text"], "最新决定已保存")
+
+    async def test_failed_middle_fragment_leaves_entire_turn_pending_for_retry(self):
+        pending = self.storage.pending_summary_turns(self.sid)
+        self.storage._exec("UPDATE conversation_turns SET assistant_text = ? WHERE id = ?",
+                           ("长" * 2000 + "最终决定", pending[0]["id"]))
+        calls = []
+
+        class FailingSecondPi:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def prompt(self, instruction, **kwargs):
+                calls.append(instruction)
+                if len(calls) == 2:
+                    raise RuntimeError("模拟第二片失败")
+                yield '{"summary":"中间结果","memories":["仅第一片候选"]}'
+
+            async def stop(self):
+                pass
+
+        with patch("memory.PiRpcClient", FailingSecondPi):
+            with self.assertLogs("memory", level="ERROR"):
+                await self.memory._summarize(7, self.sid)
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(self.storage.get_summary(self.sid))
+        self.assertEqual(len(self.storage.pending_summary_turns(self.sid)), 2)
+        self.assertEqual(self.storage.list_memories(7), [])
+        self.assertEqual(self.storage.get_last_usage_run(7)["status"], "incomplete")
+
     async def test_summary_failure_is_saved_without_internal_error_text(self):
         class FailingPi:
             def __init__(self, *args, **kwargs):
@@ -408,7 +495,9 @@ class AutomaticSummaryTests(unittest.IsolatedAsyncioTestCase):
                                    "旧会话已讨论问候", [], memory_limit=4, turn_retention=2)
         with patch("bot.PiRpcClient") as client_type:
             client = client_type.return_value
-            client.reset_session = AsyncMock(return_value={"sessionFile": "/new/history.jsonl"})
+            client.reset_session = AsyncMock(return_value={"sessionFile": "/new/history.jsonl", "messageCount": 0})
+            client.ensure_running = AsyncMock()
+            client.stop = AsyncMock()
             client.has_live_session.return_value = False
             client.busy = False
             agent = AgentSession(7, self.settings, self.storage, self.memory)

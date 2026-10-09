@@ -1,4 +1,4 @@
-"""SMTP 配置校验与纯文本邮件发送。凭据只从服务端 SQLite 读取。"""
+"""SMTP 配置校验与纯文本邮件发送。凭据由服务端解析 .env 引用。"""
 
 from email.message import EmailMessage
 from email.utils import parseaddr

@@ -26,7 +26,7 @@ def main() -> int:
         recipient, subject, body = validate_email_request(
             request["to"], request["subject"], request["body"],
         )
-        storage = Storage(str(db_path))
+        storage = Storage(str(db_path), secret_file=str(Path(__file__).resolve().with_name(".env")))
         try:
             if storage.get_smtp_settings() is None:
                 raise MailSendError("请先在管理后台配置 SMTP")

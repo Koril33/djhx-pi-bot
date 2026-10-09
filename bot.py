@@ -17,6 +17,7 @@ from sqlite3 import Row
 from pathlib import Path
 import re
 import sys
+import smtplib
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -38,10 +39,13 @@ from telegram.ext import (
 
 from config import Settings
 from costs import PricingCatalog, format_usd
+from delivery import DeliveryStore
+from interactions import PendingActions
 from memory import MemoryService, looks_secret, memory_match, safe_turn_text
 from persona import persona_prompt_path, render_persona, write_prompt
 from logging_conf import get_logger
 from mail_service import send_email
+from media import extract_pdf
 from pi_bridge import PiBusyError, PiError, PiRpcClient
 from storage import Storage
 
@@ -55,6 +59,8 @@ MAX_ALBUM_BYTES = 20 * 1024 * 1024
 ALBUM_QUIET_SECONDS = 1.5
 MAX_TEXT_FILE_BYTES = 64 * 1024
 MAX_TEXT_FILE_CHARS = 30_000
+STATUS_RPC_TIMEOUT = 1.5
+_NO_EXPECTED_SESSION = object()
 TEXT_FILE_SUFFIXES = frozenset({
     ".txt", ".md", ".log", ".py", ".js", ".jsx", ".ts", ".tsx", ".json",
     ".yaml", ".yml", ".toml", ".csv", ".sh", ".html", ".css", ".sql",
@@ -74,6 +80,35 @@ class SessionRecoveryRequired(PiError):
     def __init__(self, session_id: str):
         self.session_id = session_id
         super().__init__("会话文件缺失，请先预览并确认恢复")
+
+
+class DeliveryUncertainError(NetworkError):
+    """Telegram may have accepted a non-idempotent send without returning its ID."""
+
+
+def _safe_send_retry(exc: BaseException) -> bool:
+    """Only retry new messages when connection/pool acquisition failed before sending."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def split_plain_text(text: str, max_units: int = 3900) -> list[str]:
+    """Preserve exact plain text while respecting Telegram's UTF-16 limit."""
+    chunks, start, units = [], 0, 0
+    for index, char in enumerate(text):
+        width = 2 if ord(char) > 0xffff else 1
+        if units + width > max_units:
+            chunks.append(text[start:index])
+            start, units = index, 0
+        units += width
+    if start < len(text):
+        chunks.append(text[start:])
+    return chunks or [text]
 
 
 # ================= Markdown → Telegram HTML =================
@@ -446,22 +481,23 @@ async def _send(
     edit: bool = False,
     msg=None,
     reply_markup=None,
+    as_plain: bool = False,
 ):
     """发送/编辑消息；格式错误降级纯文本，网络错误重试，失败向调用者抛出。"""
     html = md_to_html(text)
-    plain = strip_markdown(text)
-    use_html = True
+    plain = text if as_plain else strip_markdown(text)
+    use_html = not as_plain
     for attempt in range(3):
         try:
             if edit:
                 if use_html:
                     await msg.edit_text(html, parse_mode=ParseMode.HTML)
                 else:
-                    await msg.edit_text(plain)
+                    await msg.edit_text(plain, parse_mode=None)
                 return True
             if use_html:
                 return await send_fn(html, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-            return await send_fn(plain, reply_markup=reply_markup)
+            return await send_fn(plain, parse_mode=None, reply_markup=reply_markup)
         except BadRequest as e:
             if edit and "Message is not modified" in str(e):
                 # 内容未变化（流式中途停顿），无需更新，视为成功
@@ -478,6 +514,8 @@ async def _send(
             delay = e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds") else float(e.retry_after)
             await asyncio.sleep(max(0.5, delay))
         except _TG_NET_EXC as e:
+            if not edit and not _safe_send_retry(e):
+                raise DeliveryUncertainError("消息送达状态未确认；请勿重复执行原任务") from e
             if attempt == 2:
                 logger.error("Telegram API 网络异常，重试耗尽", extra={"err": str(e)[:300], "edit": edit})
                 raise
@@ -486,6 +524,28 @@ async def _send(
             logger.exception("Telegram 消息发送失败", extra={"edit": edit})
             raise
     raise RuntimeError("Telegram 消息发送失败：重试次数耗尽")
+
+
+def _effective_persona(storage, user_id: int):
+    active = storage.get_active_session(user_id)
+    sid = active["id"] if isinstance(active, (dict, Row)) and "id" in active.keys() else None
+    getter = getattr(storage, "get_effective_persona", None)
+    if getter is not None:
+        selected = getter(user_id, sid)
+        if selected is None or isinstance(selected, (dict, Row)):
+            return selected
+    return storage.get_active_persona(user_id)
+
+
+def _effective_model(storage, user_id: int):
+    active = storage.get_active_session(user_id)
+    sid = active["id"] if isinstance(active, (dict, Row)) and "id" in active.keys() else None
+    getter = getattr(storage, "get_effective_model_selection", None)
+    if getter is not None:
+        selected = getter(user_id, sid)
+        if selected is None or isinstance(selected, (dict, Row)):
+            return selected
+    return storage.get_user_model(user_id)
 
 
 class AgentSession:
@@ -500,14 +560,18 @@ class AgentSession:
         self.turn_started_at: float | None = None
         self.active_turn_id: int | None = None
         self.recovery_notice: str | None = None
+        self._empty_session_files: set[str] = set()
         self.control_lock = asyncio.Lock()
         self.turn_tail: asyncio.Future[None] | None = None
+        self.turn_task: asyncio.Task | None = None
+        self.cancel_requested: asyncio.Event | None = None
+        self.execution_phase: str | None = None
         self.memory = memory
         memory_enabled = getattr(settings, "memory_enabled", False) and memory is not None
         if memory_enabled:
             memory.clear_context(user_id)
         self.persona_file = persona_prompt_path(storage.db_path, user_id)
-        active_persona = storage.get_active_persona(user_id)
+        active_persona = _effective_persona(storage, user_id)
         self._persona_digest = (write_prompt(self.persona_file, render_persona(active_persona))
                                 if active_persona is not None else None)
         extra_args = (["--append-system-prompt", str(self.persona_file)]
@@ -524,7 +588,7 @@ class AgentSession:
         }
         if memory_enabled:
             extra_env["DJHX_MEMORY_CONTEXT_FILE"] = str(memory.context_path(user_id))
-        selected_model = storage.get_user_model(user_id)
+        selected_model = _effective_model(storage, user_id)
         if isinstance(selected_model, (dict, Row)):
             provider, model = selected_model["provider"], selected_model["model_id"]
         else:
@@ -550,9 +614,26 @@ class AgentSession:
         await self.ensure_default_session()
         active = self.storage.get_active_session(self.user_id)
         session_file = active["pi_session_file"] if active else None
+        if session_file and Path(session_file).is_file():
+            self._empty_session_files.discard(session_file)
+            if "pi_session_empty" in active.keys() and active["pi_session_empty"]:
+                self.storage.mark_session_nonempty(active["id"])
         if (active and session_file and not Path(session_file).is_file()
+                and session_file not in self._empty_session_files
+                and not ("pi_session_empty" in active.keys() and active["pi_session_empty"])
                 and not self.client.has_live_session(session_file)):
             raise SessionRecoveryRequired(active["id"])
+        selected = _effective_model(self.storage, self.user_id)
+        desired = ((selected["provider"], selected["model_id"]) if isinstance(selected, (dict, Row))
+                   else (getattr(self.settings, "pi_provider", None), getattr(self.settings, "pi_model", None)))
+        if (getattr(self.client, "provider", None), getattr(self.client, "model", None)) != desired:
+            if getattr(self.client, "busy", False) or self.prompt_pending:
+                raise PiBusyError("当前任务仍在运行，暂不能应用会话模型")
+            proc = getattr(self.client, "proc", None)
+            if proc is not None and proc.returncode is None and all(desired):
+                await self.client.set_model(f"{desired[0]}/{desired[1]}")
+            else:
+                self.client.provider, self.client.model = desired
         # 进程仍存活但 stdout reader 已失效时，也必须按当前会话文件重启。
         await self.client.ensure_running(session_file)
         # 首次同步 pi 侧会话文件路径
@@ -560,13 +641,16 @@ class AgentSession:
             try:
                 state = await self.client.get_state()
                 if state.get("sessionFile"):
-                    self.storage.set_pi_session_file(active["id"], state["sessionFile"])
+                    known_empty = state.get("messageCount") == 0 and not Path(state["sessionFile"]).is_file()
+                    self.storage.set_pi_session_file(active["id"], state["sessionFile"], known_empty=known_empty)
+                    if known_empty:
+                        self._empty_session_files.add(state["sessionFile"])
             except Exception as e:
                 logger.warning("同步会话文件失败", extra={"err": str(e)})
 
     async def refresh_persona(self) -> None:
         """SQLite 人格变更后重启空闲 RPC，使下一轮读取新的追加提示词。"""
-        active_persona = self.storage.get_active_persona(self.user_id)
+        active_persona = _effective_persona(self.storage, self.user_id)
         text = render_persona(active_persona) if active_persona is not None else None
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None
         if digest == self._persona_digest:
@@ -591,6 +675,9 @@ class AgentManager:
         self.settings = settings
         self.storage = storage
         self.memory = MemoryService(settings, storage) if getattr(settings, "memory_enabled", False) else None
+        self.delivery = DeliveryStore(storage.db_path)
+        self.delivery.recover_interrupted()
+        self.actions = PendingActions(storage.db_path)
         self._agents: dict[int, AgentSession] = {}
 
     def get(self, user_id: int) -> AgentSession:
@@ -608,6 +695,8 @@ class AgentManager:
                 await agent.client.stop()
             except Exception:
                 pass
+        self.delivery.close()
+        self.actions.close()
 
 
 # ================= 工具函数 =================
@@ -623,19 +712,23 @@ def authorized(update: Update, settings: Settings) -> bool:
     )
 
 
-async def reply_text(update: Update, text: str, reply_markup=None) -> None:
+async def reply_text(update: Update, text: str, reply_markup=None):
     """按 Telegram 上限分段回复（基于 HTML 长度、不切断代码块）；reply_markup 仅首段。"""
     if not text:
         text = "(无内容)"
     chunks = split_markdown(text)
+    first_message = None
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == 0 else None
         if update.callback_query is not None:
-            await _send(update.callback_query.message.reply_text, chunk, reply_markup=markup)
+            sent = await _send(update.callback_query.message.reply_text, chunk, reply_markup=markup)
         elif update.message is not None:
-            await _send(update.message.reply_text, chunk, reply_markup=markup)
+            sent = await _send(update.message.reply_text, chunk, reply_markup=markup)
         else:
-            await _send(update.effective_chat.send_message, chunk, reply_markup=markup)
+            sent = await _send(update.effective_chat.send_message, chunk, reply_markup=markup)
+        if first_message is None:
+            first_message = sent
+    return first_message
 
 
 def failure_notice_text(notice) -> str:
@@ -675,6 +768,137 @@ async def notify_interrupted_turns(update: Update, storage: Storage, user_id: in
     storage.acknowledge_interruption_notice(user_id)
 
 
+def _get_delivery(context) -> DeliveryStore | None:
+    value = context.bot_data.get("delivery")
+    if not isinstance(value, DeliveryStore):
+        value = getattr(context.bot_data.get("manager"), "delivery", None)
+    return value if isinstance(value, DeliveryStore) else None
+
+
+def _resend_markup(reply_id: str, *, confirm: bool = False) -> InlineKeyboardMarkup:
+    callback = f"reply_resend_confirm:{reply_id}" if confirm else f"reply_resend:{reply_id}"
+    label = "确认补发（可能重复）" if confirm else "📥 补发保存的结果"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=callback)]])
+
+
+class _MessageEditor:
+    def __init__(self, bot, chat_id: int, message_id: int):
+        self.bot, self.chat_id, self.message_id = bot, chat_id, message_id
+
+    async def edit_text(self, text: str, **kwargs):
+        return await self.bot.edit_message_text(
+            text=text, chat_id=self.chat_id, message_id=self.message_id, **kwargs,
+        )
+
+
+async def cmd_resend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send only persisted reply chunks; never call the agent or its tools."""
+    store = _get_delivery(context)
+    if store is None:
+        await reply_text(update, "当前没有可补发的缓存结果")
+        return
+    user_id = update.effective_user.id
+    args = context.args or []
+    if len(args) > 2 or (len(args) == 2 and args[1] != "confirm"):
+        await reply_text(update, "用法：/resend [结果 ID]；发送状态不确定时请先阅读确认提示。")
+        return
+    async with store.user_lock(user_id):
+        pending = store.pending(user_id)
+        reply_id = args[0] if args else (pending[0]["id"] if pending else None)
+        row = store.get(user_id, reply_id)
+        if row is None:
+            await reply_text(update, "找不到属于你的缓存结果")
+            return
+        if row["execution_state"] == "generating":
+            await reply_text(update, "当前结果仍在生成；请等任务结束后再补发")
+            return
+        if not row["full_text"]:
+            await reply_text(update, "该任务尚未生成可补发的文字；不会重新执行任务")
+            return
+        reply_id = row["id"]
+        chunks = store.chunks(reply_id)
+        if not chunks:
+            store.plan(reply_id, split_markdown(row["full_text"]))
+            chunks = store.chunks(reply_id)
+        uncertain = any(chunk["status"] == "uncertain" and chunk["message_id"] is None for chunk in chunks)
+        if uncertain and not (len(args) == 2 and args[1] == "confirm"):
+            await reply_text(
+                update, "⚠️ 上次发送可能已经到达 Telegram，但没有返回消息 ID。"
+                "补发可能出现重复消息；只会发送保存的结果，不会重新执行任务。\n"
+                f"结果 ID：{reply_id}", reply_markup=_resend_markup(reply_id, confirm=True),
+            )
+            return
+        if row["execution_state"] != "complete":
+            await reply_text(update, "⚠️ 这是未完成任务保存的部分结果；补发不会继续执行原任务。")
+        target = update.message or update.callback_query.message
+        for chunk in chunks:
+            ordinal, text = chunk["ordinal"], chunk["text"]
+            message_id = chunk["message_id"]
+            store.sending(reply_id, ordinal)
+            try:
+                if message_id is not None:
+                    editor = _MessageEditor(context.bot, row["chat_id"], message_id)
+                    try:
+                        await _send(None, text, edit=True, msg=editor)
+                    except BadRequest as exc:
+                        if "message to edit not found" not in str(exc).lower():
+                            raise
+                        store.forget_message(reply_id, ordinal)
+                        message_id = None
+                    else:
+                        store.sent(reply_id, ordinal, message_id, text)
+                        continue
+                sent = await _send(target.reply_text, text)
+                message_id = getattr(sent, "message_id", None)
+                store.sent(reply_id, ordinal, message_id if isinstance(message_id, int) else None, text)
+            except Exception as exc:
+                store.failed(reply_id, ordinal, uncertain=isinstance(exc, DeliveryUncertainError),
+                             error_kind=type(exc).__name__)
+                logger.warning("缓存回复补发暂未完成", extra={"reply_id": reply_id, "err_type": type(exc).__name__})
+                try:
+                    await reply_text(update, "补发未完成，结果仍已保存；稍后使用 /resend。"
+                                     + ("本次发送可能已送达，再次补发前请核对。" if isinstance(exc, DeliveryUncertainError) else ""))
+                except (*_TG_NET_EXC, RetryAfter):
+                    pass
+                return
+
+
+async def run_preparation(update: Update, context, prepare):
+    """FIFO preparation for media that requires confirmation before any agent run."""
+    agent = context.bot_data["manager"].get(update.effective_user.id)
+    storage = context.bot_data["storage"]
+    previous = agent.turn_tail
+    finished = asyncio.get_running_loop().create_future()
+    agent.turn_tail = finished
+    owns_turn = False
+    cancel_requested = asyncio.Event()
+    task = asyncio.current_task()
+    try:
+        if previous is not None:
+            await asyncio.shield(previous)
+        update_id = getattr(update, "update_id", None)
+        if isinstance(update_id, int) and not storage.begin_update(update_id):
+            return None
+        owns_turn = True
+        agent.turn_task, agent.cancel_requested = task, cancel_requested
+        agent.execution_phase, agent.turn_started_at = "preparing", time.monotonic()
+        return await prepare(agent, cancel_requested)
+    except asyncio.CancelledError:
+        if not cancel_requested.is_set():
+            raise
+        return None
+    finally:
+        if owns_turn and getattr(agent, "turn_task", None) is task:
+            agent.turn_task = None
+            agent.cancel_requested = None
+            agent.execution_phase = None
+            agent.turn_started_at = None
+        if not finished.done():
+            finished.set_result(None)
+        if agent.turn_tail is finished:
+            agent.turn_tail = None
+
+
 async def stream_reply(
     update: Update,
     text_iter,
@@ -684,7 +908,9 @@ async def stream_reply(
     initial_delay: float = 0.25,
     initial_chars: int = 16,
     idle_interval: float = 12.0,
-) -> None:
+    delivery_store: DeliveryStore | None = None,
+    delivery_id: str | None = None,
+) -> dict:
     """流式回复：合并增量后定时编辑，按 HTML 长度分段，不切断代码块。
 
     placeholder：{"msg": Message|None}，思考占位消息 holder（流式期间异步产生，动态读取）。
@@ -705,6 +931,48 @@ async def stream_reply(
     last_edit = 0.0
     started_at = last_event_at = last_idle_emit = time.monotonic()
     idle_status: str | None = None
+    finalized_chunks: list[str] = []
+    delivery_failed = False
+    delivery_uncertain = False
+
+    async def publish(text: str, rendered: str, ordinal: int):
+        """A Telegram outage suspends delivery while the model consumer keeps running."""
+        nonlocal msg, delivery_failed, delivery_uncertain
+        message_id = getattr(msg, "message_id", None) if msg is not None else None
+        if not isinstance(message_id, int):
+            message_id = None
+        if delivery_store is not None and delivery_id:
+            delivery_store.stage(delivery_id, ordinal, text, message_id)
+        if delivery_failed:
+            return
+        if delivery_store is not None and delivery_id:
+            delivery_store.sending(delivery_id, ordinal)
+        try:
+            if msg is None:
+                msg = await _send(target.reply_text, rendered)
+            else:
+                try:
+                    await _send(None, rendered, edit=True, msg=msg)
+                except BadRequest as exc:
+                    if "message to edit not found" not in str(exc).lower():
+                        raise
+                    # A deleted placeholder does not cancel the task.
+                    if delivery_store is not None and delivery_id:
+                        delivery_store.forget_message(delivery_id, ordinal)
+                    msg = await _send(target.reply_text, rendered)
+            message_id = getattr(msg, "message_id", None)
+            if delivery_store is not None and delivery_id:
+                delivery_store.sent(delivery_id, ordinal,
+                                    message_id if isinstance(message_id, int) else None, rendered)
+        except Exception as exc:
+            delivery_failed = True
+            delivery_uncertain = isinstance(exc, DeliveryUncertainError)
+            if delivery_store is not None and delivery_id:
+                delivery_store.failed(delivery_id, ordinal, uncertain=delivery_uncertain,
+                                      error_kind=type(exc).__name__)
+            logger.warning("Telegram 回复送达暂停，继续保存模型结果",
+                           extra={"reply_id": delivery_id, "uncertain": delivery_uncertain,
+                                  "err_type": type(exc).__name__})
 
     events: asyncio.Queue[tuple[str, object | None]] = asyncio.Queue()
     if activity_holder is not None:
@@ -729,6 +997,8 @@ async def stream_reply(
             last_event_at = time.monotonic()
             idle_status = None
         if kind == "delta":
+            if activity_holder and activity_holder.get("current") == "🤔 深度思考中…":
+                activity_holder["current"] = None
             if first_delta_at is None:
                 first_delta_at = time.monotonic()
             buf += str(value or "")
@@ -763,21 +1033,16 @@ async def stream_reply(
             # 已闭合的段落地后从 buf 移除，后续只重新解析未完成的尾段。
             for chunk in chunks[:-1]:
                 rendered = _render(chunk, activity_holder)
-                if msg is None:
-                    msg = await _send(target.reply_text, rendered)
-                else:
-                    await _send(None, rendered, edit=True, msg=msg)
-                msg = await _send(target.reply_text, "…")
+                await publish(chunk, rendered, len(finalized_chunks))
+                finalized_chunks.append(chunk)
+                msg = None
             buf = chunks[-1]
 
         rendered = _render(buf, activity_holder)
         if idle_status:
             rendered = f"{rendered}\n\n{idle_status}" if rendered else idle_status
         rendered = rendered or "🤔 正在处理…"
-        if msg is None:
-            msg = await _send(target.reply_text, rendered)
-        else:
-            await _send(None, rendered, edit=True, msg=msg)
+        await publish(buf, rendered, len(finalized_chunks))
 
         dirty = False
         first_text_rendered = True
@@ -822,7 +1087,8 @@ async def stream_reply(
                 if now >= next_idle and events.empty():
                     elapsed = max(0, int(now - started_at))
                     phase = (
-                        "等待工具完成" if activity_holder and activity_holder.get("current")
+                        "模型思考中" if activity_holder and activity_holder.get("current") == "🤔 深度思考中…"
+                        else "等待工具完成" if activity_holder and activity_holder.get("current")
                         else "等待模型响应" if not buf else "继续生成回复"
                     )
                     idle_status = f"⏳ {phase} · 已进行 {elapsed // 60}分{elapsed % 60}秒"
@@ -860,9 +1126,15 @@ async def stream_reply(
             if msg is None and placeholder is not None:
                 msg = placeholder.get("msg")
             if msg is not None and not buf:
-                await _send(None, interrupted, edit=True, msg=msg)
+                await publish(interrupted, interrupted, len(finalized_chunks))
             else:
-                await _send(target.reply_text, interrupted)
+                # Keep partial answer and execution error in the cached result.
+                if buf:
+                    finalized_chunks.append(buf)
+                    buf = ""
+                msg = None
+                await publish(interrupted, interrupted, len(finalized_chunks))
+            buf = interrupted
         elif not buf:
             # 空文本回合也要给明确结果，避免思考/工具状态一直留在聊天中。
             completed_tools = int(activity_holder.get("completed", 0)) if activity_holder else 0
@@ -875,10 +1147,8 @@ async def stream_reply(
                 result = "⚠️ 本轮没有文字回复，请重试或换个说法。"
             if msg is None and placeholder is not None:
                 msg = placeholder.get("msg")
-            if msg is not None:
-                await _send(None, result, edit=True, msg=msg)
-            else:
-                await _send(target.reply_text, result)
+            await publish(result, result, len(finalized_chunks))
+            buf = result
     except Exception as e:
         logger.exception("流式回复发送异常", extra={"err_type": type(e).__name__, "err": str(e)[:200]})
         if isinstance(e, (*_TG_NET_EXC, RetryAfter)):
@@ -902,6 +1172,11 @@ async def stream_reply(
             await producer
         except asyncio.CancelledError:
             pass
+    chunks = finalized_chunks + ([buf] if buf else [])
+    if delivery_store is not None and delivery_id:
+        delivery_store.plan(delivery_id, chunks)
+    return {"chunks": chunks, "delivery_failed": delivery_failed,
+            "delivery_uncertain": delivery_uncertain}
 
 
 # ================= 快捷菜单 =================
@@ -909,14 +1184,18 @@ async def stream_reply(
 HELP_SECTIONS = {
     "chat": (
         "💬 对话与任务\n"
-        "直接发送文字、图片或 UTF-8 文本附件；可附说明文字。\n"
+        "直接发送文字、图片、PDF 或 UTF-8 文本附件；可附说明文字。\n"
         "图片支持 JPEG、PNG、GIF、WebP，每张最大 10 MiB；相册最多 4 张、合计 20 MiB。"
-        "文本附件最多 64 KiB / 30000 字符。\n\n"
+        "文本附件最多 64 KiB / 30000 字符。PDF 提取文本并注明读取范围；扫描件请先 OCR。\n"
+        "语音/音频先在本机转写，核对预览并确认后才交给 Pi。\n\n"
         "/stop — 中止运行任务并取消待启动消息\n"
         "/steer <内容> — 插入正在运行的任务\n"
         "/queue [clear] — 查看或取消排队消息\n"
+        "/resend [结果 ID] — 补发保存的回复，不重新执行任务\n"
         "/status — 查看运行状态\n"
-        "/mail — 预览并确认待发邮件"
+        "/answer <确认ID> <内容> — 回答任务中的输入对话框\n"
+        "/mail — 预览并确认待发邮件\n"
+        "/mail status <ID> | history — 查询邮件状态与历史"
     ),
     "sessions": (
         "📁 会话、模型与环境\n"
@@ -925,6 +1204,7 @@ HELP_SECTIONS = {
         "/session search <关键词> — 搜索会话\n"
         "/session rename <id> <名称> — 重命名\n"
         "/session use <id> — 切换会话\n"
+        "/session config show|model <provider/id>|persona <id|none>|inherit — 会话偏好\n"
         "/model list — 列出可用模型\n"
         "/model use <model_id> — 切换模型\n"
         "/env list — 查看可用环境"
@@ -937,6 +1217,8 @@ HELP_SECTIONS = {
         "/memory add <内容> — 保存记忆\n"
         "/memory list — 分页列出记忆\n"
         "/memory used [list|回合ID] — 查询本轮注入的记忆\n"
+        "/memory capacity|tidy — 查看容量、整理重复记忆\n"
+        "/memory merge <ID1> <ID2> [内容] — 预览并确认合并\n"
         "/memory edit <id> <内容> — 编辑记忆\n"
         "/memory delete <id> — 删除记忆\n"
         "/summary [show|status|clear] — 查看摘要进度或清空摘要"
@@ -993,7 +1275,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_text(
         update,
         "🤖 djhx-pi-bot\n"
-        "直接发送文字、图片或文本附件与 pi 对话。\n"
+        "直接发送文字、图片、PDF 或文本附件与 pi 对话；语音先转写并确认。\n"
         "运行中用 /steer 插入指令；用 /stop 中止并取消排队消息。\n"
         "点击分类查看完整命令，或输入 /help chat|sessions|memory|other。",
         reply_markup=quick_menu(),
@@ -1038,7 +1320,11 @@ async def create_user_session(agent: AgentSession, storage: Storage, user_id: in
         session_file = state.get("sessionFile")
         if not session_file:
             raise PiError("pi 未返回新会话文件")
-        return storage.create_session_with_file_and_activate(user_id, name, session_file)
+        known_empty = state.get("messageCount") == 0 and not Path(session_file).is_file()
+        if isinstance(agent, AgentSession) and known_empty:
+            agent._empty_session_files.add(session_file)
+        return storage.create_session_with_file_and_activate(user_id, name, session_file,
+                                                            known_empty=known_empty)
     except Exception:
         try:
             await agent.client.switch_session(previous_file)
@@ -1054,7 +1340,8 @@ def session_recovery_preview(agent: AgentSession, storage: Storage, user_id: int
     if row is None or row["user_id"] != user_id:
         raise ValueError("会话不存在")
     session_file = row["pi_session_file"]
-    if session_file and (Path(session_file).is_file() or agent.client.has_live_session(session_file)):
+    if session_file and (Path(session_file).is_file() or agent.client.has_live_session(session_file)
+                         or ("pi_session_empty" in row.keys() and row["pi_session_empty"])):
         return None
     memory = getattr(agent, "memory", None)
     if memory is None:
@@ -1094,7 +1381,7 @@ async def switch_user_session(agent: AgentSession, storage: Storage, user_id: in
     preview = session_recovery_preview(agent, storage, user_id, sid)
     if preview and recovery_version != preview["version"]:
         raise SessionRecoveryRequired(sid)
-    if previous is not None and "id" in previous and previous["id"] == sid and preview is None:
+    if previous is not None and "id" in previous.keys() and previous["id"] == sid and preview is None:
         await agent.ensure_client()
         notice = getattr(agent, "recovery_notice", None)
         agent.recovery_notice = None
@@ -1120,17 +1407,29 @@ async def switch_user_session(agent: AgentSession, storage: Storage, user_id: in
             new_file = state.get("sessionFile")
             if not new_file:
                 raise PiError("pi 未返回新会话文件")
+            known_empty = state.get("messageCount") == 0 and not Path(new_file).is_file()
+            if isinstance(agent, AgentSession) and known_empty:
+                agent._empty_session_files.add(new_file)
             storage.set_session_recovery(sid, new_file, recovery)
+            storage.set_pi_session_file(sid, new_file, known_empty=known_empty)
             notice = ("已按预览创建新会话并注入 SQLite 上下文；原始对话无法逐字恢复"
                       if recovery else "已按预览创建空白会话；没有可恢复的 SQLite 上下文")
-        elif not previous_available:
+        elif (not previous_available or (row["pi_session_file"]
+              and not Path(row["pi_session_file"]).is_file()
+              and "pi_session_empty" in row.keys() and row["pi_session_empty"])):
             await agent.client.ensure_running(row["pi_session_file"])
             notice = None
         else:
             await agent.client.switch_session(row["pi_session_file"])
             notice = None
         storage.set_active(sid)
+        await agent.ensure_client()
     except Exception:
+        if previous is not None and "id" in previous.keys():
+            try:
+                storage.set_active(previous["id"])
+            except Exception:
+                logger.exception("恢复SQLite当前会话失败", extra={"user_id": user_id})
         if switch_attempted:
             try:
                 if not previous_available:
@@ -1192,6 +1491,56 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
     agent = manager.get(user.id)
     args = context.args
     sub = args[0] if args else ""
+
+    if sub == "config":
+        await agent.ensure_default_session()
+        active = storage.get_active_session(user.id)
+        sid = active["id"]
+        preferences = storage.get_session_preferences(user.id, sid)
+        action = args[1] if len(args) > 1 else "show"
+        if action == "show" and len(args) <= 2:
+            selected = _effective_model(storage, user.id)
+            model = (f"{selected['provider']}/{selected['model_id']}" if selected is not None
+                     else f"{settings.pi_provider}/{settings.pi_model}")
+            persona = _effective_persona(storage, user.id)
+            await reply_text(update, f"📁 会话「{active['name']}」偏好\n"
+                             f"模型：{model}（{'会话独立' if preferences['provider'] is not None else '继承个人默认'}）\n"
+                             f"人格：{persona['name'] if persona is not None else '无人格'}"
+                             f"（{'会话独立' if preferences['persona_id'] is not None else '继承个人默认'}）\n"
+                             "/session config model <provider/id> | persona <id|none> | inherit")
+            return
+        if (action not in {"model", "persona", "inherit"}
+                or len(args) != (2 if action == "inherit" else 3)):
+            await reply_text(update, "用法：/session config show | model <provider/id> | persona <id|none> | inherit")
+            return
+        if agent.client.busy or agent.prompt_pending or storage.count_user_queue(user.id):
+            await reply_text(update, "⏳ 请等待当前任务完成，或用 /stop 与 /queue clear 后修改会话偏好")
+            return
+        try:
+            await agent.ensure_client()
+            if action == "model":
+                provider, separator, model_id = args[2].partition("/")
+                if not separator or not provider or not model_id:
+                    raise ValueError("请使用完整的 provider/model_id")
+                await agent.client.set_model(args[2])
+                storage.set_session_model(user.id, sid, provider, model_id)
+            elif action == "persona":
+                storage.set_session_persona(user.id, sid, args[2])
+            else:
+                storage.clear_session_preferences(user.id, sid)
+            await agent.ensure_client()
+        except Exception as exc:
+            storage.set_session_model(user.id, sid, preferences["provider"], preferences["model_id"])
+            storage.set_session_persona(user.id, sid, preferences["persona_id"])
+            try:
+                await agent.ensure_client()
+            except Exception:
+                logger.exception("恢复会话偏好失败", extra={"user_id": user.id, "session_id": sid})
+            await reply_text(update, f"修改会话偏好失败：{_friendly_error(exc)}")
+            return
+        await reply_text(update, "✅ 当前会话已恢复继承个人默认模型与人格。" if action == "inherit"
+                         else "✅ 已保存当前会话的独立偏好；切回来会恢复，其他会话不受影响。")
+        return
 
     if sub in {"new", "use", "recover"} and (agent.client.busy or agent.prompt_pending or storage.count_user_queue(user.id)):
         await reply_text(update, "⏳ 仍有运行或排队的消息；请等待完成，或用 /stop 和 /queue clear 后再切换会话")
@@ -1291,7 +1640,7 @@ async def _cmd_session_unlocked(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sub = context.args[0] if context.args else ""
-    if sub not in {"new", "use", "recover"}:
+    if sub not in {"new", "use", "recover", "config"}:
         await _cmd_session_unlocked(update, context)
         return
     agent = context.bot_data["manager"].get(update.effective_user.id)
@@ -1377,6 +1726,17 @@ async def _cmd_model_unlocked(update: Update, context: ContextTypes.DEFAULT_TYPE
                     except Exception:
                         logger.exception("模型持久化失败后回滚模型失败", extra={"user_id": user.id})
                 raise
+            selected = f"{agent.client.provider}/{agent.client.model}"
+            storage = context.bot_data["storage"]
+            active = storage.get_active_session(user.id)
+            if isinstance(active, (dict, Row)):
+                preferences = storage.get_session_preferences(user.id, active["id"])
+                if preferences["provider"] is not None:
+                    await agent.ensure_client()
+                    await reply_text(update, f"✅ 已更新个人默认模型：{selected}。当前会话仍沿用独立模型 "
+                        f"{preferences['provider']}/{preferences['model_id']}；"
+                        "用 /session config inherit 恢复继承个人默认。")
+                    return
             await reply_text(update, f"✅ 已切换模型: {agent.client.provider}/{agent.client.model}（重启后保持）")
         except Exception as e:
             logger.error("切换模型失败", extra={"err": str(e)[:300]})
@@ -1402,7 +1762,7 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = context.args or []
     sub = args[0] if args else "current"
     if sub in {"current", "list"}:
-        active = storage.get_active_persona(user.id)
+        active = _effective_persona(storage, user.id)
         if sub == "current":
             current = f"{active['name']} ({active['id']})" if active is not None else "无人格（Pi 默认）"
             await reply_text(update, f"当前人格：{current}\n用法：/persona list | /persona use <id|none> [new]")
@@ -1463,6 +1823,13 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "长期记忆仍可能作为背景。",
             )
             return
+        active_session = storage.get_active_session(user.id)
+        if isinstance(active_session, (dict, Row)):
+            preferences = storage.get_session_preferences(user.id, active_session["id"])
+            if preferences["persona_id"] is not None:
+                await reply_text(update, f"已更新个人默认人格：{name}。当前会话仍沿用独立人格设置；"
+                    "用 /session config inherit 恢复继承，或用 /session config persona <id|none> 修改当前会话。")
+                return
         await reply_text(
             update,
             f"已切换人格：{name}。下一条消息起生效；当前会话的旧对话历史仍会保留，"
@@ -1477,6 +1844,15 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     storage = context.bot_data["storage"]
     agent = manager.get(user.id)
     cancelled = storage.cancel_user_queue(user.id)
+    turn_task = getattr(agent, "turn_task", None)
+    cancel_requested = getattr(agent, "cancel_requested", None)
+    if (turn_task is not None and not turn_task.done() and not agent.client.busy
+            and getattr(agent, "execution_phase", None) in {"preparing", "running", "voice"}):
+        if cancel_requested is not None:
+            cancel_requested.set()
+        turn_task.cancel()
+        await reply_text(update, f"⏹ 已取消 {cancelled} 条待启动消息；正在取消当前任务的下载或启动。")
+        return
     if agent.prompt_pending and not agent.client.busy:
         for _ in range(100):
             if agent.client.busy or not agent.prompt_pending:
@@ -1494,6 +1870,8 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await reply_text(update, "当前没有正在运行或排队的任务")
         return
     try:
+        if cancel_requested is not None:
+            cancel_requested.set()
         await agent.client.abort()
     except Exception as e:
         logger.exception("中止任务失败", extra={"user_id": user.id})
@@ -1533,8 +1911,12 @@ async def cmd_steer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
         elif message and message.document:
             try:
-                content = await _download_text_document(message.document, user_id=user.id)
-                instruction = _with_text_document(instruction, message.document, content)
+                if _is_pdf_document(message.document):
+                    result = await _download_pdf_document(message.document, context.bot_data["settings"], user_id=user.id)
+                    instruction = _with_pdf_document(instruction, message.document, result)
+                else:
+                    content = await _download_text_document(message.document, user_id=user.id)
+                    instruction = _with_text_document(instruction, message.document, content)
             except ValueError as exc:
                 await reply_text(update, f"⚠️ {exc}")
                 return
@@ -1593,22 +1975,10 @@ async def _mail_preview(update: Update, storage: Storage, draft) -> None:
     )
     target = update.callback_query.message if update.callback_query is not None else update.message
     send_fn = target.reply_text if target is not None else update.effective_chat.send_message
-    chunks = [text[offset:offset + 3500] for offset in range(0, len(text), 3500)]
+    chunks = split_plain_text(text)
     for index, chunk in enumerate(chunks):
         markup = _mail_buttons(draft["id"]) if index == len(chunks) - 1 else None
-        for attempt in range(3):
-            try:
-                await send_fn(chunk, parse_mode=None, reply_markup=markup)
-                break
-            except RetryAfter as exc:
-                if attempt == 2:
-                    raise
-                delay = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
-                await asyncio.sleep(max(0.5, delay))
-            except _TG_NET_EXC:
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(0.5 * (attempt + 1))
+        await _send(send_fn, chunk, as_plain=True, reply_markup=markup)
     storage.mark_mail_previewed(update.effective_user.id, draft["id"])
 
 
@@ -1623,6 +1993,30 @@ async def cmd_mail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     args = context.args or []
     action = args[0] if args else "list"
+    labels = {"pending": "待确认", "sending": "发送中", "sent": "已提交 SMTP",
+              "uncertain": "发送状态未确认", "failed": "明确发送失败", "cancelled": "已取消"}
+    if action == "history" and len(args) == 1:
+        drafts = storage.list_mail_drafts(user_id, limit=10)
+        lines = ["📧 最近邮件记录"]
+        for item in drafts:
+            state = labels.get(item["state"], item["state"])
+            if item["state"] == "pending" and item["created_at"] < time.time() - 86400:
+                state = "已过期"
+            lines.append(f"{item['id']} · {state}\n{item['recipient']} · {item['subject']}")
+        lines.append("/mail status <草稿 ID> 查看状态；未确认的邮件不会自动重发。")
+        await reply_text(update, "\n".join(lines) if drafts else "暂无邮件记录")
+        return
+    if action == "status" and len(args) == 2:
+        draft = storage.get_mail_draft(user_id, args[1])
+        if draft is None:
+            await reply_text(update, "找不到属于你的邮件草稿")
+            return
+        state = labels.get(draft["state"], draft["state"])
+        if draft["state"] == "pending" and draft["created_at"] < time.time() - 86400:
+            state = "已过期"
+        await reply_text(update, f"📧 {draft['id']} · {state}\n收件人：{draft['recipient']}\n主题：{draft['subject']}"
+                         + ("\n请先核对收件箱；不会自动重发这封邮件。" if draft["state"] in {"uncertain", "sending"} else ""))
+        return
     if action == "list" and len(args) <= 1:
         drafts = storage.list_pending_mail_drafts(user_id)
         if not drafts:
@@ -1632,7 +2026,7 @@ async def cmd_mail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _mail_preview(update, storage, draft)
         return
     if action not in {"confirm", "cancel"} or len(args) != 2 or not re.fullmatch(r"[0-9a-f]{12}", args[1]):
-        await reply_text(update, "用法：/mail [list|confirm <草稿 ID>|cancel <草稿 ID>]")
+        await reply_text(update, "用法：/mail [list|history|status <草稿 ID>|confirm <草稿 ID>|cancel <草稿 ID>]")
         return
     draft_id = args[1]
     draft = storage.get_mail_draft(user_id, draft_id)
@@ -1660,10 +2054,20 @@ async def cmd_mail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             send_email, config, draft["recipient"], draft["subject"], draft["body"],
         )
     except Exception as exc:
-        storage.finish_mail_draft(user_id, draft_id, sent=False)
+        cause = exc
+        uncertain = True
+        while cause is not None:
+            if isinstance(cause, (smtplib.SMTPResponseException, smtplib.SMTPRecipientsRefused, ValueError)):
+                uncertain = False
+                break
+            cause = cause.__cause__
+        if str(exc) == "收件服务器拒收邮件":
+            uncertain = False
+        storage.finish_mail_draft(user_id, draft_id, sent=False, uncertain=uncertain)
         logger.warning("邮件发送未确认", extra={"user_id": user_id, "draft_id": draft_id,
                                              "err_type": type(exc).__name__})
-        await reply_text(update, "⚠️ 发送状态未确认。为避免重复发送，请先检查收件箱，再重新创建草稿。")
+        await reply_text(update, "⚠️ 发送状态未确认。为避免重复发送，请先检查收件箱，再重新创建草稿。"
+                         if uncertain else "⚠️ SMTP 明确拒绝了这封邮件，请检查配置或收件地址后重新创建草稿。")
         return
     storage.finish_mail_draft(user_id, draft_id, sent=True)
     await reply_text(update, f"✅ 邮件已提交给 SMTP 服务器：{draft['recipient']}")
@@ -1678,7 +2082,7 @@ async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYP
     proc_state = "运行中" if (proc and proc.returncode is None) else "未运行"
     active = storage.get_active_session(user.id)
     active_name = active["name"] if active else "-"
-    active_persona = storage.get_active_persona(user.id)
+    active_persona = _effective_persona(storage, user.id)
     persona_name = active_persona["name"] if active_persona is not None else "无人格（Pi 默认）"
     started_at = getattr(agent, "turn_started_at", None)
     busy = bool(agent.client.busy or getattr(agent, "prompt_pending", False) or started_at is not None)
@@ -1698,12 +2102,18 @@ async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYP
         f"  当前人格: {persona_name}",
         f"  当前模型: {configured_model}（{model_detail}）",
     ]
-    # 追加 pi 会话详情（消息数 / 压缩状态），拿不到不阻塞主状态展示
+    delivery = _get_delivery(context)
+    pending_replies = delivery.pending(user.id) if delivery is not None else []
+    if pending_replies:
+        lines.append(f"  待补发结果: {len(pending_replies)} 条（/resend）")
+    # Local status is useful even while downloads or RPC operations hold the control lock.
+    status_message = await reply_text(update, "\n".join(lines),
+                                      reply_markup=_resend_markup(pending_replies[0]["id"]) if pending_replies else None)
+    if not proc or proc.returncode is not None or agent.control_lock.locked():
+        return
+    # This read-only request must not start/reconfigure Pi or wait behind a control operation.
     try:
-        if not proc or proc.returncode is not None:
-            raise PiError("pi 进程未运行")
-        await agent.ensure_client()
-        state = await agent.client.get_state()
+        state = await asyncio.wait_for(agent.client.get_state(), timeout=STATUS_RPC_TIMEOUT)
         actual = state.get("model")
         if isinstance(actual, dict):
             actual_provider = actual.get("provider") or provider
@@ -1719,15 +2129,14 @@ async def _cmd_status_unlocked(update: Update, context: ContextTypes.DEFAULT_TYP
         sid = state.get("sessionId")
         if sid:
             lines.append(f"  session: {sid[:12]}")
+        if status_message is not None:
+            await _send(None, "\n".join(lines), edit=True, msg=status_message)
     except Exception:
         pass
-    await reply_text(update, "\n".join(lines))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    agent = context.bot_data["manager"].get(update.effective_user.id)
-    async with agent.control_lock:
-        await _cmd_status_unlocked(update, context)
+    await _cmd_status_unlocked(update, context)
 
 
 def _cost_report(storage: Storage, runs: list, *, title: str) -> str:
@@ -1897,6 +2306,10 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user_id = update.effective_user.id
     args = context.args or []
     sub = args[0] if args else "list"
+    if sub in {"manage", "capacity", "tidy", "merge"}:
+        from memory_commands import handle_memory_management
+        await handle_memory_management(update, context, reply_text)
+        return
     if sub == "list":
         try:
             page = max(1, int(args[1])) if len(args) > 1 else 1
@@ -2186,7 +2599,10 @@ async def _read_usage_stats(client: PiRpcClient) -> dict | None:
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """内联键盘按钮点击：映射到对应命令处理器。"""
     query = update.callback_query
-    await query.answer()
+    try:
+        await asyncio.wait_for(query.answer(), timeout=2)
+    except (NetworkError, BadRequest, TimeoutError) as exc:
+        logger.info("回调加载提示已失效", extra={"err_type": type(exc).__name__})
     actions = {
         "cmd:session_list": (cmd_session, ["list"]),
         "cmd:model_list": (cmd_model, ["list"]),
@@ -2194,9 +2610,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "cmd:stop": (cmd_stop, []),
     }
     data = query.data or ""
+    if data.startswith(("image_continue:", "image_cancel:")):
+        await _handle_image_continuation(update, context)
+        return
+    if data.startswith(("voice_confirm:", "voice_cancel:", "piui:")):
+        from bot_interactions import handle_interaction_callback
+        if await handle_interaction_callback(update, context):
+            return
+    if data.startswith(("mm_preview:", "mm_confirm:", "mm_cancel:")):
+        from memory_commands import handle_memory_merge_callback
+        await handle_memory_merge_callback(update, context, reply_text)
+        return
     if data.startswith("help:"):
         context.args = [data.split(":", 1)[1]]
         await cmd_help(update, context)
+        return
+    if data.startswith("reply_resend_confirm:"):
+        context.args = [data.split(":", 1)[1], "confirm"]
+        await cmd_resend(update, context)
+        return
+    if data.startswith("reply_resend:"):
+        context.args = [data.split(":", 1)[1]]
+        await cmd_resend(update, context)
         return
     # 会话分页与搜索
     if data.startswith("session_page:"):
@@ -2257,7 +2692,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     entry = actions.get(data)
     if entry is None:
-        await query.answer("未知操作", show_alert=False)
+        await reply_text(update, "未知操作，请重新打开菜单。")
         return
     handler, args = entry
     context.args = args
@@ -2334,6 +2769,50 @@ def _is_image_document(document) -> bool:
 
 def _is_text_document(document) -> bool:
     return document is not None and Path((document.file_name or "").lower()).suffix in TEXT_FILE_SUFFIXES
+
+
+def _is_pdf_document(document) -> bool:
+    return document is not None and (
+        (document.mime_type or "").lower() == "application/pdf"
+        or Path((document.file_name or "").lower()).suffix == ".pdf"
+    )
+
+
+def _with_pdf_document(instruction: str, document, result: dict) -> str:
+    request = instruction.strip() or "请阅读并分析这个 PDF。"
+    coverage = f"已提取 {result['read_pages']}/{result['pages']} 页"
+    if result.get("truncated"):
+        coverage += "；达到页数或文本上限，仅分析以下可见内容"
+    return (f"{request}\n\n[PDF 附件：{_safe_document_name(document)}；{coverage}]\n"
+            f"{result['text']}\n[附件结束]")
+
+
+async def _download_pdf_document(document, settings, *, user_id: int | None = None) -> dict:
+    limit = settings.pdf_max_bytes
+    if document.file_size is not None and document.file_size > limit:
+        raise ValueError(f"PDF 超过 {limit // (1024 * 1024)} MiB 限制，请压缩或拆分后重发")
+    for attempt in range(3):
+        try:
+            file = await document.get_file()
+            if file.file_size is not None and file.file_size > limit:
+                raise ValueError("PDF 附件过大，请压缩或拆分后重发")
+            data = bytes(await file.download_as_bytearray(read_timeout=60, connect_timeout=20))
+            break
+        except (NetworkError, RetryAfter) as exc:
+            if attempt == 2:
+                logger.warning("PDF 下载失败", extra={"user_id": user_id, "err_type": type(exc).__name__})
+                raise ValueError("PDF 下载失败，请稍后重发") from None
+            delay = exc.retry_after if isinstance(exc, RetryAfter) else .5 * (attempt + 1)
+            delay = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
+            await asyncio.sleep(min(30, max(.5, delay)))
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("PDF 下载失败", extra={"user_id": user_id, "err_type": type(exc).__name__})
+            raise ValueError("PDF 下载失败，请稍后重发") from None
+    if not data or len(data) > limit:
+        raise ValueError("PDF 附件为空或过大，请压缩或拆分后重发")
+    return await extract_pdf(data, settings)
 
 
 def _safe_document_name(document) -> str:
@@ -2456,6 +2935,94 @@ async def image_model_switch_markup(client: PiRpcClient) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(buttons) if buttons else None
 
 
+async def image_continue_markup(update: Update, context, client, album_updates=None):
+    actions = getattr(context.bot_data["manager"], "actions", None)
+    if not isinstance(actions, PendingActions):
+        return await image_model_switch_markup(client), False
+    try:
+        models = await client.get_available_models()
+    except Exception:
+        logger.warning("获取图片模型快捷选择失败")
+        return None, False
+    choices = [f"{item['provider']}/{item['id']}" for item in models
+               if item.get("provider") and item.get("id") and "image" in (item.get("input") or [])][:8]
+    if not choices:
+        return None, False
+    storage = context.bot_data["storage"]
+    active = storage.get_active_session(update.effective_user.id)
+    messages = [json.loads(item.message.to_json()) for item in (album_updates or [update])]
+    ident = actions.create(update.effective_user.id, update.effective_chat.id, "image", {
+        "session_id": active["id"] if active else None,
+        "messages": messages, "models": choices,
+    })
+    buttons = [[InlineKeyboardButton(f"🖼 {choice}"[:60], callback_data=f"image_continue:{ident}:{index}")]
+               for index, choice in enumerate(choices)]
+    buttons.append([InlineKeyboardButton("取消这组图片", callback_data=f"image_cancel:{ident}")])
+    return InlineKeyboardMarkup(buttons), True
+
+
+async def _handle_image_continuation(update: Update, context) -> None:
+    manager, storage = context.bot_data["manager"], context.bot_data["storage"]
+    actions = getattr(manager, "actions", None)
+    if not isinstance(actions, PendingActions):
+        await reply_text(update, "图片确认已失效，请重新发送图片。")
+        return
+    user_id = update.effective_user.id
+    parts = (update.callback_query.data or "").split(":")
+    ident = parts[1] if len(parts) > 1 else ""
+    saved = actions.get(user_id, ident, "image")
+    if saved is None:
+        await reply_text(update, "图片请求已过期、已处理或不属于当前用户，请重新发送。")
+        return
+    if parts[0] == "image_cancel":
+        actions.cancel(user_id, ident)
+        await reply_text(update, "已取消这次图片请求。")
+        return
+    try:
+        index = int(parts[2])
+        if index < 0:
+            raise ValueError
+        selected = saved["payload"]["models"][index]
+    except (ValueError, IndexError, KeyError):
+        await reply_text(update, "模型选择无效，请重新选择。")
+        return
+    agent = manager.get(user_id)
+    async with agent.control_lock:
+        active = storage.get_active_session(user_id)
+        expected = saved["payload"]["session_id"]
+        if expected != (active["id"] if active else None):
+            await reply_text(update, "会话已切换，请返回原会话后确认，或重新发送图片。")
+            return
+        if (agent.client.busy or agent.prompt_pending or storage.count_user_queue(user_id)
+                or (agent.turn_tail is not None and not agent.turn_tail.done())):
+            await reply_text(update, "当前仍有任务或排队消息，请结束后再确认这组图片。")
+            return
+        try:
+            await agent.ensure_client()
+            active = storage.get_active_session(user_id)
+            await agent.client.set_model(selected)
+            provider, model_id = selected.split("/", 1)
+            storage.set_session_model(user_id, active["id"], provider, model_id)
+        except (PiError, ValueError) as exc:
+            await reply_text(update, f"⚠️ 模型切换失败：{_friendly_error(exc)}")
+            return
+        saved = actions.claim(user_id, ident, "image")
+        if saved is None:
+            return
+    originals = [Update.de_json({"update_id": update.update_id, "message": message}, context.bot)
+                 for message in saved["payload"]["messages"]]
+    await process_confirmed_attachment(originals[0], context,
+        album_updates=originals if len(originals) > 1 else None, expected_session_id=expected)
+
+
+async def process_confirmed_attachment(update: Update, context, *, album_updates=None,
+                                       expected_session_id=_NO_EXPECTED_SESSION) -> None:
+    async def prepare(agent, cancel_requested):
+        await _process_text(update, context, album_updates=album_updates,
+                            confirmed_attachment=True, expected_session_id=expected_session_id)
+    await run_preparation(update, context, prepare)
+
+
 async def _model_accepts_images(client: PiRpcClient) -> bool:
     """从 pi 当前模型的能力元数据确认图片支持，避免图片被静默丢弃。"""
     state = await client.get_state()
@@ -2472,7 +3039,8 @@ async def _prepare_images(client: PiRpcClient, message, *, user_id: int | None =
 
 async def _process_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
-    *, album_updates: list[Update] | None = None,
+    *, album_updates: list[Update] | None = None, confirmed_attachment: bool = False,
+    expected_session_id=_NO_EXPECTED_SESSION,
 ) -> None:
     user = update.effective_user
     settings = context.bot_data["settings"]
@@ -2481,7 +3049,8 @@ async def _process_text(
     message = update.message
     album_messages = [item.message for item in album_updates] if album_updates else []
     has_image = bool(album_messages or message.photo or _is_image_document(message.document))
-    has_text_document = bool(message.document and not has_image)
+    has_pdf = bool(message.document and not has_image and _is_pdf_document(message.document))
+    has_text_document = bool(message.document and not has_image and not has_pdf)
     text = next((item.caption for item in album_messages if item.caption), None) if album_messages else None
     text = text or message.text or message.caption or ""
     if album_messages:
@@ -2505,16 +3074,25 @@ async def _process_text(
         text = "请分析这组图片。" if album_messages else "请分析这张图片。"
     if has_text_document:
         if not _is_text_document(message.document):
-            await reply_text(update, "⚠️ 仅支持常见文本、代码或日志文件（UTF-8，最多 64 KiB）；PDF、Office 与二进制附件暂不支持。")
+            await reply_text(update, "⚠️ 支持 PDF 文本提取，以及 UTF-8 文本、代码或日志文件（最多 64 KiB）；Office 和其他二进制附件请先转成 PDF 或文本。")
             return
         if not text.strip():
             text = "请阅读并分析这个文本附件。"
-    naming_text = text if not has_text_document else (message.caption or "分析文本附件")
+    if has_pdf and not text.strip():
+        text = "请阅读并分析这个 PDF。"
+    naming_text = text if not (has_text_document or has_pdf) else (message.caption or ("分析 PDF" if has_pdf else "分析文本附件"))
     chat = update.effective_chat
     owns_prompt = False
     usage_run_id: str | None = None
     usage_seq = 0
     turn_settled = False
+    delivery_store = getattr(manager, "delivery", None)
+    if not isinstance(delivery_store, DeliveryStore):
+        delivery_store = None
+    delivery_id: str | None = None
+    full_response = ""
+    checkpoint_chars = 0
+    checkpoint_at = time.monotonic()
     memory_turn_id: int | None = None
     memory_session_id: str | None = None
     assistant_text = ""
@@ -2523,6 +3101,11 @@ async def _process_text(
     agent = manager.get(user.id)
     storage.ensure_user(user.id, user.username)
     logger.info("收到消息", extra={"user_id": user.id, "chat_id": chat.id, "text_len": len(text), "has_image": has_image})
+    turn_task = asyncio.current_task()
+    cancel_requested = asyncio.Event()
+    agent.turn_task = turn_task
+    agent.cancel_requested = cancel_requested
+    agent.execution_phase = "preparing"
 
     # typing 持续刷新：Telegram 的 typing 约 5 秒过期，深度思考期长时保持反馈
     stop_typing = asyncio.Event()
@@ -2544,8 +3127,13 @@ async def _process_text(
         agent.turn_started_at = time.monotonic()
         # 与 /model、/session 共用锁，保证图片能力检查和下载期间模型、会话不切换。
         async with agent.control_lock:
+            if expected_session_id is not _NO_EXPECTED_SESSION:
+                current = storage.get_active_session(user.id)
+                if expected_session_id != (current["id"] if current else None):
+                    await reply_text(update, "会话已切换，确认内容未执行；请返回原会话或重新发送。")
+                    return
             update_id = getattr(update, "update_id", None)
-            if album_updates:
+            if album_updates and not confirmed_attachment:
                 album_ids = [item.update_id for item in album_updates]
                 if not storage.begin_album_updates(album_ids):
                     return  # /queue clear 已取消整组或其中一条更新
@@ -2570,9 +3158,12 @@ async def _process_text(
                 logger.error("pi 进程启动失败", extra={"err": str(e)[:300]})
                 await reply_text(update, f"⚠️ pi 进程启动失败: {_friendly_error(e)}")
                 return
+            if isinstance(getattr(manager, "actions", None), PendingActions):
+                from bot_interactions import install_extension_ui
+                install_extension_ui(agent, context, chat.id)
             active_session = storage.get_active_session(user.id)
             if active_session is not None:
-                ids = [item.update_id for item in album_updates] if album_updates else [update_id]
+                ids = [item.update_id for item in album_updates] if album_updates and not confirmed_attachment else [update_id]
                 for item_id in ids:
                     if isinstance(item_id, int):
                         storage.set_update_session(item_id, active_session["id"])
@@ -2598,15 +3189,19 @@ async def _process_text(
                         raise ValueError("相册总大小超过 20 MiB，请压缩或拆分后重发")
                 elif has_image:
                     images = await _prepare_images(agent.client, message, user_id=user.id)
+                elif has_pdf:
+                    result = await _download_pdf_document(message.document, settings, user_id=user.id)
+                    text = _with_pdf_document(text, message.document, result)
                 elif has_text_document:
                     content = await _download_text_document(message.document, user_id=user.id)
                     text = _with_text_document(text, message.document, content)
             except ImageModelUnavailable as exc:
-                buttons = await image_model_switch_markup(agent.client)
+                buttons, saved = await image_continue_markup(update, context, agent.client, album_updates)
                 await reply_text(
                     update,
-                    f"⚠️ {exc}请选择支持图片的模型；切换成功后请重新发送刚才的图片"
-                    "（或相册）。可用 /model list 查看全部模型。",
+                    f"⚠️ {exc}" + ("请选择支持图片的模型，随后自动继续这组图片；确认有效期 15 分钟。"
+                    if saved else "请选择支持图片的模型；切换成功后请重新发送刚才的图片（或相册）。")
+                    + "可用 /model list 查看全部模型。",
                     reply_markup=buttons,
                 )
                 return
@@ -2618,6 +3213,8 @@ async def _process_text(
             await _auto_name_session(storage, user.id, naming_text)
 
             # 普通消息按到达顺序独立处理；插入当前任务只由 /steer 执行。
+            if cancel_requested.is_set():
+                return
             if agent.client.busy or agent.prompt_pending:
                 raise PiBusyError("当前任务仍在结束，请稍后重试")
             agent.prompt_pending = True
@@ -2658,6 +3255,11 @@ async def _process_text(
                 logger.exception("创建用量记录失败", extra={"user_id": user.id})
 
         pricing = PricingCatalog(getattr(settings, "pricing_file", "pricing.json"))
+        if delivery_store is not None:
+            active = storage.get_active_session(user.id)
+            delivery_id = delivery_store.create(
+                user.id, chat.id, getattr(update, "update_id", None), active["id"] if active else None,
+            )
 
         def on_usage(event: dict) -> None:
             nonlocal usage_seq
@@ -2674,9 +3276,13 @@ async def _process_text(
         placeholder = {"msg": None}
         activity = {"current": None, "completed": 0, "failed": 0}
 
-        async def on_thinking() -> None:
-            if placeholder["msg"] is None:
-                placeholder["msg"] = await _send(update.message.reply_text, "🤔 深度思考中…")
+        def on_thinking() -> None:
+            # No Telegram I/O inside the RPC event consumer: a slow request must
+            # not block stdout, abort responses, or the model's progress.
+            activity["current"] = "🤔 深度思考中…"
+            notify = activity.get("notify")
+            if notify is not None:
+                notify()
 
         def on_tool(tool_name: str, phase: str, args: dict | None) -> None:
             if phase == "end":
@@ -2688,25 +3294,62 @@ async def _process_text(
                 notify()
 
         async def gen():
-            nonlocal turn_settled, assistant_text
-            async for delta in agent.client.prompt(
-                text,
-                images=images,
-                on_thinking=on_thinking,
-                on_tool=on_tool,
-                on_usage=on_usage,
-            ):
-                if memory_turn_id is not None:
-                    assistant_text = (assistant_text + delta)[:settings.memory_turn_assistant_chars]
-                yield delta
-            turn_settled = True
+            nonlocal turn_settled, assistant_text, full_response, checkpoint_chars, checkpoint_at
+            try:
+                if cancel_requested.is_set():
+                    return
+                agent.execution_phase = "running"
+                active = storage.get_active_session(user.id)
+                if active is not None:
+                    storage.mark_session_nonempty(active["id"])
+                    if isinstance(agent, AgentSession):
+                        agent._empty_session_files.discard(active["pi_session_file"])
+                async for delta in agent.client.prompt(
+                    text, images=images, on_thinking=on_thinking, on_tool=on_tool, on_usage=on_usage,
+                ):
+                    full_response += delta
+                    if delivery_store is not None and delivery_id and (
+                        checkpoint_chars == 0 or len(full_response) - checkpoint_chars >= 1024
+                        or time.monotonic() - checkpoint_at >= 2
+                    ):
+                        delivery_store.checkpoint(delivery_id, full_response)
+                        checkpoint_chars, checkpoint_at = len(full_response), time.monotonic()
+                    if memory_turn_id is not None:
+                        assistant_text = (assistant_text + delta)[:settings.memory_turn_assistant_chars]
+                    yield delta
+                turn_settled = True
+            finally:
+                agent.execution_phase = "finalizing"
+                if delivery_store is not None and delivery_id:
+                    # Full model output is durable before final Telegram delivery;
+                    # keep the row generating until rendering ends so /resend cannot race a send.
+                    delivery_store.checkpoint(delivery_id, full_response)
 
-        await stream_reply(
+        result = await stream_reply(
             update, gen(), settings.stream_edit_interval,
             placeholder=placeholder, activity_holder=activity,
             initial_delay=settings.stream_initial_delay,
             initial_chars=settings.stream_initial_chars,
+            delivery_store=delivery_store, delivery_id=delivery_id,
         )
+        if delivery_store is not None and delivery_id and isinstance(result, dict):
+            if not full_response:
+                full_response = "\n\n".join(result["chunks"])
+                delivery_store.checkpoint(delivery_id, full_response)
+            if result["delivery_failed"]:
+                try:
+                    await reply_text(update, "📥 回复已保存。使用 /resend 补发已有结果；不会重新运行任务。"
+                                     + ("上次发送状态不确定，补发前会提示可能重复。" if result["delivery_uncertain"] else ""),
+                                     reply_markup=_resend_markup(delivery_id))
+                except (*_TG_NET_EXC, RetryAfter):
+                    pass
+    except asyncio.CancelledError:
+        if not cancel_requested.is_set():
+            raise
+        try:
+            await reply_text(update, "⏹ 已取消当前任务的下载或启动；不会继续提交给模型。")
+        except (*_TG_NET_EXC, RetryAfter):
+            pass
     except PiBusyError:
         await reply_text(update, "⏳ 我正在处理上一条消息，请稍等…")
     except PiError as e:
@@ -2715,6 +3358,8 @@ async def _process_text(
         logger.error("处理消息异常", extra={"user_id": user.id, "err": str(e)[:500]})
         await reply_text(update, f"⚠️ 处理出错: {_friendly_error(e)}")
     finally:
+        if delivery_store is not None and delivery_id:
+            delivery_store.finish(delivery_id, full_response, complete=turn_settled)
         if owns_prompt:
             if memory_turn_id is not None:
                 try:
@@ -2756,6 +3401,10 @@ async def _process_text(
                 logger.exception("邮件草稿预览发送失败", extra={"user_id": user.id})
             agent.prompt_pending = False
         agent.turn_started_at = None
+        if getattr(agent, "turn_task", None) is turn_task:
+            agent.turn_task = None
+            agent.cancel_requested = None
+            agent.execution_phase = None
         stop_typing.set()
         keepalive.cancel()
         try:
@@ -2843,7 +3492,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             album_updates = None
         if previous is not None:
-            await previous
+            await asyncio.shield(previous)
         if album_updates is None:
             await _process_text(update, context)
         else:
@@ -2897,7 +3546,9 @@ COMMAND_MENU = [
     ("stop", "中止任务"),
     ("steer", "插入当前任务"),
     ("queue", "查看或取消排队"),
+    ("resend", "补发保存的结果"),
     ("mail", "邮件草稿与确认"),
+    ("answer", "回答当前 Pi 对话框"),
 ]
 
 
@@ -2911,6 +3562,7 @@ async def register_command_menu(bot) -> None:
 
 
 def build_application(settings: Settings, storage: Storage, manager: AgentManager) -> Application:
+    from bot_interactions import cmd_answer, handle_voice
     async def post_init(application: Application) -> None:
         """run_polling / run_webhook 模式下的启动钩子（当前 app.py 手动启动，另行调用）。"""
         await register_command_menu(application.bot)
@@ -2929,6 +3581,7 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
     app.bot_data["settings"] = settings
     app.bot_data["storage"] = storage
     app.bot_data["manager"] = manager
+    app.bot_data["delivery"] = getattr(manager, "delivery", None)
 
     # 统一鉴权包装
     async def auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE, inner) -> None:
@@ -2954,7 +3607,9 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         CommandHandler("stop", cmd_stop),
         CommandHandler("steer", cmd_steer),
         CommandHandler("queue", cmd_queue),
+        CommandHandler("resend", cmd_resend),
         CommandHandler("mail", cmd_mail),
+        CommandHandler("answer", cmd_answer),
         CommandHandler("status", cmd_status),
         CommandHandler("cost", cmd_cost),
         CommandHandler("memory", cmd_memory),
@@ -2971,6 +3626,10 @@ def build_application(settings: Settings, storage: Storage, manager: AgentManage
         await reply_text(update, "未知命令，/help 查看帮助")
 
     app.add_handler(MessageHandler(filters.COMMAND, lambda u, c: auth_guard(u, c, unknown_command)))
+    app.add_handler(MessageHandler(
+        filters.VOICE | filters.AUDIO,
+        lambda u, c: auth_guard(u, c, handle_voice),
+    ))
     app.add_handler(MessageHandler(
         filters.PHOTO | filters.Document.ALL,
         lambda u, c: auth_guard(u, c, on_text),

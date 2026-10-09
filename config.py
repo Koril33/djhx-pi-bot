@@ -62,6 +62,23 @@ class Settings(BaseSettings):
     webhook_steer_concurrency: int = 4
     webhook_max_bytes: int = 2 * 1024 * 1024
     shutdown_drain_seconds: float = 30.0
+    telegram_retry_initial_seconds: float = 3.0
+    telegram_retry_max_seconds: float = 60.0
+    telegram_probe_interval_seconds: float = 60.0
+    update_worker_retry_seconds: float = 3.0
+    backup_enabled: bool = True
+    backup_root: str = "data/backups"
+    backup_interval_seconds: float = 86400.0
+    backup_idle_timeout_seconds: float = 120.0
+    voice_enabled: bool = True
+    voice_model_dir: str = "data/voice-model"
+    voice_max_seconds: int = 60
+    voice_max_bytes: int = 10 * 1024 * 1024
+    voice_transcribe_timeout_seconds: float = 120.0
+    pdf_max_bytes: int = 5 * 1024 * 1024
+    pdf_max_pages: int = 30
+    pdf_max_chars: int = 30000
+    pdf_parse_timeout_seconds: float = 20.0
     deploy_require_signature: bool = False  # 旧 Gitea hook 仅配置 URL 密钥时保持兼容
     deploy_repo_full_name: str = ""         # 可设为 koril/djhx-pi-bot，校验 payload 来源仓库
 
@@ -100,6 +117,16 @@ class Settings(BaseSettings):
             raise ValueError("Webhook 队列容量或请求大小限制无效")
         if self.shutdown_drain_seconds <= 0:
             raise ValueError("SHUTDOWN_DRAIN_SECONDS 必须大于 0")
+        if any(value <= 0 for value in (
+            self.telegram_retry_initial_seconds, self.telegram_retry_max_seconds,
+            self.telegram_probe_interval_seconds, self.update_worker_retry_seconds,
+            self.backup_interval_seconds, self.backup_idle_timeout_seconds,
+            self.voice_max_seconds, self.voice_max_bytes, self.voice_transcribe_timeout_seconds,
+            self.pdf_max_bytes, self.pdf_max_pages, self.pdf_max_chars, self.pdf_parse_timeout_seconds,
+        )):
+            raise ValueError("重试、探活和备份间隔必须大于 0")
+        if self.telegram_retry_max_seconds < self.telegram_retry_initial_seconds:
+            raise ValueError("TELEGRAM_RETRY_MAX_SECONDS 不能小于初始重试间隔")
         if bool(self.admin_username) != bool(self.admin_password):
             raise ValueError("ADMIN_USERNAME 与 ADMIN_PASSWORD 必须同时配置")
         if self.admin_username:

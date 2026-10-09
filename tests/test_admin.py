@@ -54,6 +54,61 @@ class AdminTests(unittest.TestCase):
         }, follow_redirects=False)
         self.assertEqual(response.status_code, 303)
 
+    def test_unicode_password_and_invalid_unicode_inputs(self):
+        self.settings.admin_password = "这是中文密码abcdefgh123"
+        self.settings.validate_runtime()
+        page = self.client.get("/admin/login")
+        response = self.client.post("/admin/login", data={
+            "csrf": self.csrf(page), "username": "中文错误用户名",
+            "password": self.settings.admin_password,
+        }, follow_redirects=False)
+        self.assertEqual(response.status_code, 401)
+        page = self.client.get("/admin/login")
+        self.assertEqual(self.client.post("/admin/login", data={
+            "csrf": "非 ASCII 校验码", "username": "admin",
+            "password": self.settings.admin_password,
+        }).status_code, 403)
+        page = self.client.get("/admin/login")
+        self.assertEqual(self.client.post("/admin/login", data={
+            "csrf": self.csrf(page), "username": "admin",
+            "password": self.settings.admin_password,
+        }, follow_redirects=False).status_code, 303)
+
+    def test_memory_merge_requires_current_owned_preview_and_refreshes_context(self):
+        one = self.storage.add_memory(7, "我喜欢简洁的回答", limit=2)
+        two = self.storage.add_memory(7, "我偏好简短的回复", limit=2)
+        self.settings.memory_active_limit = 2
+        sid = self.storage.create_session(7, "测试")
+        self.storage.set_active(sid)
+        self.manager.memory = SimpleNamespace(refresh_context=Mock())
+        self.manager._agents[7] = SimpleNamespace(client=SimpleNamespace(busy=False))
+        self.login()
+        page = self.client.get("/admin/memories?user_id=7&organize=1")
+        self.assertIn("已满", page.text)
+        self.assertIn("/admin/memories/merge", page.text)
+        preview = self.storage.preview_memory_merge(7, [one, two], "偏好简洁回答")
+        form = {"csrf": self.csrf(page), "user_id": "8", "ids": ",".join(preview["ids"]),
+                "text": preview["text"], "version": preview["version"]}
+        self.assertEqual(self.client.post("/admin/memories/merge", data=form).status_code, 400)
+        self.storage.pin_memory(7, one, True)
+        form["user_id"] = "7"
+        self.assertEqual(self.client.post("/admin/memories/merge", data=form).status_code, 400)
+        self.assertEqual(len(self.storage.list_memories(7)), 2)
+        preview = self.storage.preview_memory_merge(7, [one, two], "偏好简洁回答")
+        form["version"] = preview["version"]
+        self.assertEqual(self.client.post("/admin/memories/merge", data=form, follow_redirects=False).status_code, 303)
+        self.assertEqual(len(self.storage.list_memories(7)), 1)
+        self.assertTrue(self.storage.get_memory(7, one)["pinned"])
+        self.manager.memory.refresh_context.assert_called_once_with(7, sid, None)
+
+    def test_overview_uses_persisted_model_before_agent_creation(self):
+        self.storage.set_user_model(7, "xiaomi", "mimo-v2-pro")
+        self.login()
+        page = self.client.get("/admin/overview?user_id=7")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("xiaomi/mimo-v2-pro", page.text)
+        self.assertNotIn("deepseek/deepseek-flash", page.text)
+
     def test_mail_settings_hide_secret_and_send_test(self):
         self.login()
         page = self.client.get("/admin/mail")

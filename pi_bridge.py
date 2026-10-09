@@ -7,6 +7,7 @@
 """
 import asyncio
 import json
+import math
 import os
 import time
 import uuid
@@ -35,6 +36,7 @@ RESTART_WINDOW = 300
 MAX_RECORD_BYTES = 32 * 1024 * 1024
 MAX_QUEUED_EVENTS = 256
 MAX_DELTA_CHARS = 8192
+EXTENSION_UI_TIMEOUT = 120
 
 # 扩展 UI 的对话方法（select/confirm/input/editor）必须由客户端应答；
 # 其余（notify/setStatus/setWidget 等）是 fire-and-forget，忽略即可。
@@ -71,6 +73,11 @@ class PiRpcClient:
         self._pending: dict[str, asyncio.Future[dict]] = {}
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
+        self._exit_task: asyncio.Task | None = None
+        self._recorded_crash_proc = None
+        self._extension_ui_handler: Callable[..., Any] | None = None
+        self._extension_ui_tasks: set[asyncio.Task] = set()
+        self._extension_ui_pending: set[str] = set()
         self._transport_error: PiError | None = None
         self._thinking_queued = False
         self.busy = False
@@ -116,6 +123,36 @@ class PiRpcClient:
         self._event_queue = asyncio.Queue(maxsize=MAX_QUEUED_EVENTS)
         self._reader_task = asyncio.create_task(self._read_stdout(proc))
         self._stderr_task = asyncio.create_task(self._drain_stderr(proc))
+        self._exit_task = asyncio.create_task(self._watch_exit(proc))
+
+    def set_extension_ui_handler(self, callback: Callable[..., Any] | None) -> None:
+        """callback(event) 可异步；应调用 response_extension_ui 完成 Telegram 交互。"""
+        self._extension_ui_handler = callback
+
+    async def response_extension_ui(self, request_id: str, *, value: Any = None,
+                                    cancelled: bool = False) -> None:
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("扩展请求 ID 无效")
+        body = {"type": "extension_ui_response", "id": request_id}
+        if cancelled:
+            body["cancelled"] = True
+        elif type(value) is bool:
+            body["confirmed"] = value
+        else:
+            if not isinstance(value, str):
+                raise ValueError("选择或输入回答必须是文本")
+            body["value"] = value
+        await self._send(body)
+        self._extension_ui_pending.discard(request_id)
+
+    def _record_abnormal_exit(self, proc) -> None:
+        if proc is self.proc and proc.returncode not in (None, 0) and proc is not self._recorded_crash_proc:
+            self._recorded_crash_proc = proc
+            self._restart_times.append(time.monotonic())
+
+    async def _watch_exit(self, proc) -> None:
+        await proc.wait()
+        self._record_abnormal_exit(proc)
 
     def _fail_transport(self, proc: asyncio.subprocess.Process, error: PiError, *, log: bool = True) -> None:
         """唤醒所有等待者；下一条命令会回收进程并重新连接。"""
@@ -152,13 +189,17 @@ class PiRpcClient:
                     await asyncio.wait_for(proc.wait(), timeout=5)
                 except (OSError, ProcessLookupError, asyncio.TimeoutError):
                     logger.exception("无法结束 pi 子进程")
-        tasks = [task for task in (self._reader_task, self._stderr_task) if task]
+        tasks = [task for task in (self._reader_task, self._stderr_task, self._exit_task) if task]
+        tasks.extend(self._extension_ui_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._reader_task = None
         self._stderr_task = None
+        self._exit_task = None
+        self._extension_ui_tasks.clear()
+        self._extension_ui_pending.clear()
 
     async def ensure_running(self, session_file: str | None = None) -> None:
         async with self._lock:
@@ -174,6 +215,7 @@ class PiRpcClient:
             if healthy and session_file and (self.busy or self._pending):
                 raise PiBusyError("pi 正在处理请求，暂不能切换会话文件")
             if self.proc:
+                self._record_abnormal_exit(self.proc)
                 await self._stop_unlocked()
             if session_file:
                 self._session_file = session_file
@@ -181,7 +223,6 @@ class PiRpcClient:
             self._restart_times = [t for t in self._restart_times if now - t < RESTART_WINDOW]
             if len(self._restart_times) >= MAX_RESTARTS:
                 raise PiError("pi 子进程频繁崩溃，已熔断，请稍后再试")
-            self._restart_times.append(now)
             await self.start(self._session_file)
 
     # ---------- 内部 IO ----------
@@ -200,9 +241,34 @@ class PiRpcClient:
             return
         if method not in EXTENSION_UI_DIALOG_METHODS:
             return
-        logger.warning("自动取消 pi 扩展对话框", extra={
-            "method": str(method)[:32], "title": str(event.get("title") or "")[:120],
-        })
+        if self._extension_ui_handler is not None:
+            if request_id in self._extension_ui_pending:
+                return
+            self._extension_ui_pending.add(request_id)
+            async def handle() -> None:
+                try:
+                    deadline = EXTENSION_UI_TIMEOUT
+                    timeout = event.get("timeout")
+                    if isinstance(timeout, (int, float)) and math.isfinite(timeout) and timeout > 0:
+                        deadline = min(deadline, timeout / 1000)
+                    async with asyncio.timeout(deadline):
+                        await _invoke(self._extension_ui_handler, event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("pi 扩展交互结束或超时", extra={"method": method, "err_type": type(exc).__name__})
+                finally:
+                    if proc is self.proc and request_id in self._extension_ui_pending:
+                        try:
+                            await self.response_extension_ui(request_id, cancelled=True)
+                        except PiError:
+                            self._extension_ui_pending.discard(request_id)
+            # 读取 stdout 不能等待用户，否则无法读取应答及后续 RPC 事件。
+            task = asyncio.create_task(handle(), name="pi-extension-ui")
+            self._extension_ui_tasks.add(task)
+            task.add_done_callback(self._extension_ui_tasks.discard)
+            return
+        logger.info("没有交互界面，取消 pi 扩展对话框", extra={"method": str(method)[:32]})
         try:
             await self._send({"type": "extension_ui_response", "id": request_id, "cancelled": True})
         except Exception as exc:
@@ -303,7 +369,14 @@ class PiRpcClient:
                     raise PiError("pi RPC 输出记录过长")
             if pending:
                 raise PiError("pi RPC stdout 在 JSON 记录中途结束")
-            raise PiError(f"pi RPC stdout 已关闭，退出码: {proc.returncode}")
+            self._record_abnormal_exit(proc)
+            error = PiError(f"pi RPC stdout 已关闭，退出码: {proc.returncode}")
+            if proc is self.proc:
+                if proc.returncode == 0:
+                    logger.info("pi RPC 正常退出")
+                elif proc.returncode is None:
+                    logger.warning("pi RPC stdout 提前关闭")
+                self._fail_transport(proc, error, log=proc.returncode not in (None, 0))
         except asyncio.CancelledError:
             raise
         except Exception as exc:

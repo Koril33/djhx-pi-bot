@@ -23,20 +23,20 @@ class _SentMessage:
 class StreamReplyTests(unittest.IsolatedAsyncioTestCase):
     async def test_initial_deltas_are_coalesced_before_first_send(self) -> None:
         calls: list[tuple[float, str, bool]] = []
+        initial_sent = asyncio.Event()
 
         async def fake_send(send_fn, text, *, edit=False, msg=None, reply_markup=None):
             calls.append((time.monotonic(), text, edit))
+            if not edit:
+                initial_sent.set()
             return True if edit else _SentMessage()
 
         async def deltas():
             yield "你"
-            await asyncio.sleep(0.01)
             yield "好"
-            await asyncio.sleep(0.01)
             yield "！"
-            await asyncio.sleep(0.08)
+            await initial_sent.wait()
             yield "后续"
-            await asyncio.sleep(0.08)
 
         with patch.object(bot, "_send", side_effect=fake_send):
             await bot.stream_reply(

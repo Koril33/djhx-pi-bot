@@ -58,6 +58,67 @@ class PiRpcClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.stop()
         self.tempdir.cleanup()
 
+    async def test_repeated_intentional_stop_does_not_trip_crash_breaker(self):
+        with patch("pi_bridge.asyncio.create_subprocess_exec", side_effect=lambda *a, **k: FakeProc()):
+            for _ in range(8):
+                await self.client.ensure_running()
+                await self.client.stop()
+        self.assertEqual(self.client._restart_times, [])
+
+    async def test_only_abnormal_exits_trip_crash_breaker(self):
+        with patch("pi_bridge.asyncio.create_subprocess_exec", side_effect=lambda *a, **k: FakeProc()):
+            for _ in range(5):
+                await self.client.ensure_running()
+                proc = self.client.proc
+                proc.returncode = 1
+                proc.stdout.feed_eof()
+                proc.stderr.feed_eof()
+                proc._exited.set()
+                await asyncio.sleep(0)
+            with self.assertRaisesRegex(PiError, "熔断"):
+                await self.client.ensure_running()
+        self.assertEqual(len(self.client._restart_times), 5)
+
+    async def test_normal_eof_does_not_emit_error_or_count_as_crash(self):
+        proc = FakeProc()
+        with patch("pi_bridge.asyncio.create_subprocess_exec", return_value=proc):
+            await self.client.ensure_running()
+            with self.assertLogs("pi_bridge", level="INFO") as captured:
+                proc.terminate()
+                await self.client._reader_task
+        self.assertFalse(any("ERROR" in line for line in captured.output))
+        self.assertEqual(self.client._restart_times, [])
+
+    async def test_extension_ui_handler_answers_without_blocking_rpc_reader(self):
+        answered = asyncio.Event()
+        def on_command(command):
+            if command["type"] == "extension_ui_response":
+                answered.set()
+                return
+            proc.emit({"type": "extension_ui_request", "id": "confirm-1", "method": "confirm"})
+            proc.emit({"id": command["id"], "type": "response", "command": "get_state",
+                       "success": True, "data": {"sessionId": "ready"}})
+        proc = FakeProc(on_command)
+        async def handle(event):
+            await self.client.response_extension_ui(event["id"], value=True)
+        self.client.set_extension_ui_handler(handle)
+        with patch("pi_bridge.asyncio.create_subprocess_exec", return_value=proc):
+            state = await self.client.get_state()
+            await asyncio.wait_for(answered.wait(), 1)
+        self.assertEqual(state["sessionId"], "ready")
+        self.assertEqual(proc.commands[-1], {"type": "extension_ui_response", "id": "confirm-1", "confirmed": True})
+
+    async def test_extension_ui_deadline_cancels_unanswered_dialog(self):
+        proc = FakeProc()
+        async def handle(event):
+            await asyncio.Event().wait()
+        self.client.set_extension_ui_handler(handle)
+        with patch("pi_bridge.asyncio.create_subprocess_exec", return_value=proc), patch("pi_bridge.EXTENSION_UI_TIMEOUT", 0.01):
+            await self.client.ensure_running()
+            await self.client._handle_extension_ui(proc, {"type": "extension_ui_request", "id": "wait", "method": "input"})
+            await asyncio.gather(*self.client._extension_ui_tasks)
+        self.assertEqual(proc.commands[-1], {"type": "extension_ui_response", "id": "wait", "cancelled": True})
+
     async def test_collects_each_model_call_and_compaction_usage(self) -> None:
         usage = {"input": 2, "cacheRead": 3, "cacheWrite": 0,
                  "output": 4, "reasoning": 1, "totalTokens": 9}

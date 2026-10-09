@@ -8,7 +8,11 @@
 
 ## 选择与生效
 
-`personas` 保存全局可选人格，`user_persona_selection` 保存每位 Telegram 用户的当前选择。没有选择记录时使用 `default`；显式选择 `none` 时不追加人格提示词。管理员可在列表中为选中的用户切换；对话中可用 `/persona current`、`/persona list`、`/persona use <id>` 或 `/persona use none`。选择对该用户的全部会话有效，不会改写旧消息或 JSONL。停用或删除当前人格时，用户回退到默认人格；默认人格可编辑，不能停用或删除。
+`personas` 保存全局可选人格，`user_persona_selection` 保存每位 Telegram 用户的个人默认选择。没有选择记录时使用 `default`；显式选择 `none` 时不追加人格提示词。管理员可在列表中为选中的用户切换；对话中可用 `/persona current`、`/persona list`、`/persona use <id|none>`。`/persona use <id|none> new` 同时创建新会话，用于隔离旧历史的风格比较。
+
+`session_preferences` 可为每个会话分别覆盖模型和人格。`/session config persona <id|none>` 只影响当前会话；未覆盖的人格继承个人默认值，`none` 表示此会话明确无人格。`/session config model <provider/id>` 保存该会话模型；`/session config show` 查看组合，`inherit` 清除两项覆盖。选择在 SQLite 中跨重启保持，切换会话加载对应组合，不改写旧消息或 JSONL。停用或删除人格时，相关会话覆盖清除并恢复继承，个人选择回退到默认人格；默认人格可编辑，不能停用或删除。
+
+初始默认模板中的称呼是“小丁”，不是根据 Telegram 姓名自动生成。第二位用户可建立并选择专属人格或选择 `none`，两人的长期记忆仍按用户隔离。
 
 选中人格时，聊天 Pi 使用 SQLite 内容生成个人追加提示词文件，通过 `--append-system-prompt` 加载。选择 `none` 时不传该参数，使用 Pi 自身的基础提示词；Pi 的其他上下文文件、工具说明、动态记忆和会话历史仍可影响回答。每条新消息前会比较生成内容；变化时停止空闲的 Pi RPC 进程，再用同一个 JSONL 会话文件启动。进行中的回合不会被后台编辑打断；新设定从下一条消息开始生效。历史对话仍会作为上下文影响回答，若需要完全隔离的风格比较，应新建会话。
 
