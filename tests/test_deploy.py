@@ -93,6 +93,10 @@ class DeployTests(unittest.TestCase):
         self.git("push", "origin", "main")
         # 此临时 fixture 只含本测试创建的文件；恢复初始状态模拟线上落后。
         self.git("reset", "--hard", self.previous)
+        # 模拟已安装 unit，避免依赖测试主机的 /etc 是否存在该服务。
+        previous_unit = self.repo / "data/deploy-state/previous.service"
+        previous_unit.parent.mkdir(parents=True)
+        previous_unit.write_text("[Service]\nExecStart=fixture-old-entry\n")
         response = self.deploy("--apply")
         self.assertNotEqual(response.returncode, 0, response.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.previous)
@@ -100,7 +104,11 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["target_commit"], target)
         self.assertEqual((self.repo / "data/deploy-state/failed-target").read_text().strip(), target)
-        self.assertFalse(self.log.exists())
+        logged = self.log.read_text()
+        self.assertIn("install -m 644", logged)
+        self.assertIn("systemctl daemon-reload", logged)
+        for action in ("stop", "start", "restart"):
+            self.assertNotIn(f"systemctl {action} djhx-pi-bot", logged)
 
     def test_backup_failure_after_stop_restores_revision_and_restarts_service(self):
         self.environment["DJ_DEPLOY_TEST_UV_COUNT"] = (self.root / "uv-count").as_posix()
