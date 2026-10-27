@@ -3,12 +3,17 @@
   "per_tokens": 1000000,
   "providers": {
     "deepseek": {
-      "revision": "deepseek-2026-09-24",
+      "revision": "deepseek-2026-10-27",
       "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
-      "checked_at": "2026-09-24T00:00:00Z",
-      "review_after": "2026-10-24T00:00:00Z",
+      "checked_at": "2026-10-27T00:00:00Z",
+      "review_after": "2026-11-26T00:00:00Z",
       "effective_from": "2026-09-10T04:00:00Z",
       "effective_until": "2027-01-01T00:00:00Z",
+      "notes": [
+        "2026-10-27 复核：token 费率与官方页一致，未变动（flash 谷 0.003/0.15/0.6，峰 0.006/0.3/1.2；pro 谷 0.022/0.66/1.98，峰 0.044/1.32/3.96）。",
+        "模型版本已换代：deepseek-flash 现为 DeepSeek-V4.1-Flash-1017；旧名 deepseek-v4-flash、deepseek-v4-flash-vision-exp 仍受理，按 Flash 价计费，aliases 保持不变。",
+        "官方新增按请求计费项：Search/Fetch 自 2026-10-31T16:00:00Z（北京时间 2026-11-01 00:00）起按每 1000 次成功请求 0.75 USD 计费。本项目联网走 pi-web-access 自带密钥，不经 DeepSeek Server 端工具，故未计入估价；若改为走 DeepSeek 的 Search/Fetch，需给 costs.py 增加按请求计价。"
+      ],
       "aliases": {
         "deepseek-v4-flash": "deepseek-flash",
         "deepseek-v4-flash-vision-exp": "deepseek-flash"
